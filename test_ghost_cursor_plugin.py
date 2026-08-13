@@ -4855,17 +4855,23 @@ def _worker_record(name="test-worker", repo="/w", verified=True):
 
 def _install_fake_rest(monkeypatch, client, worker=None):
     """Route run_cloud at a fake REST client: no network, no git, no
-    worker spawn."""
+    worker spawn. The ensure fake honors the atomic lease contract when
+    the worker record actually exists on disk (lease-lifecycle tests)."""
     monkeypatch.setenv("CURSOR_API_KEY", "key-test")
     monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
     monkeypatch.setattr(
         gc_cloud, "derive_repo_ref",
         lambda path: ("https://github.com/example/repo", "main"),
     )
-    monkeypatch.setattr(
-        gc_workers, "ensure_worker",
-        lambda repo: worker or _worker_record(repo=str(repo)),
-    )
+
+    def fake_ensure(repo, lease_id=None, lease_session=""):
+        record = worker or _worker_record(repo=str(repo))
+        if lease_id and gc_workers._read_record(record.name) is not None:
+            gc_workers.acquire_lease(record.name, lease_id, session=lease_session)
+            record = gc_workers._read_record(record.name)
+        return record
+
+    monkeypatch.setattr(gc_workers, "ensure_worker", fake_ensure)
     monkeypatch.setattr(gc_workers, "mark_verified", lambda name: None)
     # The per-process model-catalog cache must not leak across tests.
     monkeypatch.setattr(gc_cloud, "_catalog_ids", None)
@@ -4996,7 +5002,7 @@ class TestCloudRunner:
         client = _FakeRestClient()
         _install_fake_rest(monkeypatch, client)
 
-        def boom(repo):
+        def boom(repo, lease_id=None, lease_session=""):
             raise gc_workers.WorkerError("the 'agent' CLI is not on PATH")
 
         monkeypatch.setattr(gc_workers, "ensure_worker", boom)
@@ -6580,6 +6586,109 @@ class TestRunLeases:
         )
         gc_supervisor.reconcile_once()
         assert calls, "reconcile_once did not run the worker reaper"
+
+    def test_lease_binds_to_remote_identity_at_the_producer(
+        self, tmp_path, monkeypatch
+    ):
+        record = gc_workers.WorkerRecord(
+            name="bind-w", repo_path=str(tmp_path), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-bind-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        seen = {}
+
+        def capture():
+            rec = gc_workers._read_record("bind-w")
+            seen["lease"] = dict(next(iter(rec.leases.values()))) if rec.leases else None
+            return None
+
+        client = _FakeRestClient(agent_id="bc-bind", run_id="run-bind")
+        client_streams = [[
+            _sse("status", {"status": "RUNNING"}),
+            capture,
+            _sse("result", {"status": "FINISHED"}, id="1"),
+            _sse("done", {}),
+        ]]
+        client.streams = [list(s) for s in client_streams]
+        _install_fake_rest(monkeypatch, client, worker=record)
+        _run_cloud_events(tmp_path)
+
+        assert seen["lease"] is not None
+        assert seen["lease"]["agent_id"] == "bc-bind"
+        assert seen["lease"]["run_id"] == "run-bind"
+
+    def test_lease_survives_an_unconfirmed_executor_exit(
+        self, tmp_path, monkeypatch
+    ):
+        """Exhausted stream reconnects with the remote run still RUNNING:
+        the local executor dies, but the run may be alive — the lease
+        must survive until someone OBSERVES a remote terminal."""
+        record = gc_workers.WorkerRecord(
+            name="keep-w", repo_path=str(tmp_path), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-keep-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        drop = gc_rest.RestNetworkError("stream dropped")
+        client = _FakeRestClient(
+            streams=[[drop]] * 10,
+            statuses=("RUNNING",),   # never terminal — never confirmed
+        )
+        monkeypatch.setattr(gc_cloud, "MAX_STREAM_REATTACHES", 1)
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.01)
+        _install_fake_rest(monkeypatch, client, worker=record)
+        events = _run_cloud_events(tmp_path)
+
+        assert any(k == "cloud.error" for k, _ in events)
+        after = gc_workers._read_record("keep-w")
+        assert after.leases, "lease must survive an unconfirmed executor exit"
+
+    def test_supervisor_settle_releases_the_sessions_leases(
+        self, clean_state, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gc_workers, "_pid_alive", lambda pid: True)
+        record = gc_workers.WorkerRecord(
+            name="settle-w", repo_path=str(tmp_path), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-settle-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        gc_workers.acquire_lease(record.name, "run-s", session="Settle me")
+        gc_workers.bind_lease(record.name, "run-s", "bc-s", "run-s-1")
+        gc_handles.record(
+            "Settle me", repo=str(tmp_path), status="running",
+            cursor_session_id="bc-s", session_key="",
+        )
+        gc_handles.record_supervision(
+            "Settle me", phase="streaming",
+            current_attempt_id="att-x", attempt_n=1,
+        )
+        sup = gc_supervisor.SessionSupervisor("Settle me")
+        sup._settle("completed")
+
+        assert gc_workers._read_record(record.name).leases == {}
+
+    def test_reconciler_probes_and_releases_settled_bound_leases(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A bound lease with no live supervision anywhere (crashed
+        dispatcher, settled remote run) is released by the reconciler's
+        authoritative GET probe."""
+        monkeypatch.setattr(gc_workers, "_pid_alive", lambda pid: True)
+        record = gc_workers.WorkerRecord(
+            name="probe-w", repo_path=str(tmp_path), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-probe-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        gc_workers.acquire_lease(record.name, "run-p", session="Probed session")
+        gc_workers.bind_lease(record.name, "run-p", "bc-p", "run-p-1")
+        client = _FakeRestClient(statuses=("FINISHED",))
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+
+        gc_supervisor.reconcile_once()
+        assert gc_workers._read_record(record.name).leases == {}
 
 
 class TestSupervisorReattach:

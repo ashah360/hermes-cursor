@@ -719,6 +719,13 @@ class SessionSupervisor:
             self.settled.set()
             return
 
+        # This settle OBSERVED the remote terminal (GET authority) — the
+        # session's worker leases may now be released.
+        try:
+            _workers.release_leases_for_session(name)
+        except Exception:
+            logger.warning("lease release for %s failed", name, exc_info=True)
+
         elapsed = time.monotonic() - self._attached_monotonic
         shape = (
             {"death_shape": death_shape(elapsed, self._nonlifecycle_events)}
@@ -1157,6 +1164,40 @@ def _recover_create_intent(
     return False
 
 
+def _reconcile_bound_leases(client_factory: Any) -> None:
+    """Release bound worker leases whose remote run settled while nobody
+    local was watching (crashed dispatcher whose executor exited without
+    observing the terminal). The GET authority decides; a lease whose
+    session has live supervision (in-process job or re-attached
+    supervisor) is left to that owner. Never raises."""
+    for item in _workers.bound_leases():
+        session = str(item.get("session") or "")
+        if session and (_job_is_live(session) or has_live(session)):
+            continue
+        try:
+            client = client_factory()
+        except _cloud.CloudRunnerError:
+            return  # no client this pass — leases stay protected
+        try:
+            remote = str(
+                client.get_run(item["agent_id"], item["run_id"]).get("status")
+                or ""
+            )
+        except RestApiError as exc:
+            if exc.status_code in (404, 410):
+                remote = "ERROR"  # gone — nothing active to protect
+            else:
+                continue
+        except RestClientError:
+            continue
+        if remote.upper() in _REMOTE_TERMINAL:
+            logger.info(
+                "releasing lease %s on worker %s: remote run %s is %s",
+                item["lease_id"], item["worker"], item["run_id"], remote,
+            )
+            _workers.release_lease(item["worker"], item["lease_id"])
+
+
 def reconcile_once() -> List[str]:
     """One reconciler pass: spawn a supervisor for every handle in a
     non-terminal supervision phase with no live supervision in this
@@ -1182,6 +1223,11 @@ def reconcile_once() -> List[str]:
             if probe_client is None:
                 probe_client = _cloud.make_client()
             return probe_client
+
+        try:
+            _reconcile_bound_leases(_probe_client)
+        except Exception:
+            logger.exception("ghost_cursor bound-lease reconcile failed")
 
         for entry in _handles.entries(scope="all", limit=_handles.MAX_ENTRIES):
             name = str(entry.get("session") or "")

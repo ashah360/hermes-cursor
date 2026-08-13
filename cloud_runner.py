@@ -595,11 +595,15 @@ class _CloudWorker:
         self._saw_conversation = False
         self._worker_record: Optional[_workers.WorkerRecord] = None
         self._started_monotonic = time.monotonic()
-        # Per-RUN worker lease (runtime=local): held from dispatch until
-        # this worker thread unwinds — every exit path first observes the
-        # settle authority (final GET) or cancels the remote run.
+        # Per-RUN worker lease (runtime=local): installed atomically by
+        # ensure_worker, bound to agent/run identity at the producer
+        # boundary, and RELEASED only after a remote terminal state was
+        # actually observed (or when no agent was ever established). An
+        # unconfirmed executor exit keeps the lease — the supervisor /
+        # reconciler releases it from the GET authority.
         self._lease_id = f"run-{uuid.uuid4().hex[:12]}"
         self._lease_held = False
+        self._remote_terminal_observed = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -660,7 +664,16 @@ class _CloudWorker:
     # -- agent establishment ---------------------------------------------------
 
     def _notify_created(self, agent_id: str, run_id: str, resumed: bool) -> None:
-        if self._on_created is None or not agent_id:
+        if not agent_id:
+            return
+        # Bind the dispatch lease to the real remote identity FIRST: from
+        # this instant the worker is protected until an observed remote
+        # terminal, across restarts and stream failures.
+        if self._lease_held and self._worker_record is not None:
+            _workers.bind_lease(
+                self._worker_record.name, self._lease_id, agent_id, run_id
+            )
+        if self._on_created is None:
             return
         try:
             self._on_created(agent_id, run_id, resumed)
@@ -862,7 +875,10 @@ class _CloudWorker:
                 logger.debug("mark_verified failed", exc_info=True)
 
     def _run_is_terminal(self, client: CursorRestClient) -> bool:
-        return self._final_status(client) in _TERMINAL_RUN_STATUSES
+        terminal = self._final_status(client) in _TERMINAL_RUN_STATUSES
+        if terminal:
+            self._remote_terminal_observed = True
+        return terminal
 
     def _final_status(self, client: CursorRestClient) -> str:
         """The run's status per GET runs/{id} — the settle authority."""
@@ -885,11 +901,24 @@ class _CloudWorker:
             self._put("cloud.error", {"error": f"cursor cloud worker crashed: {exc}"})
         finally:
             self._settled = True
-            # Release the per-run worker lease: every path to here either
-            # observed the settle authority (final GET) or sent a cancel;
-            # crash safety is the lease's dead-holder grace.
+            # Release the per-run lease ONLY when a remote terminal state
+            # was actually observed, or when no agent was ever
+            # established (nothing remote can be running). An unconfirmed
+            # executor exit (exhausted reconnects, unknown remote status,
+            # unacknowledged cancel) KEEPS the lease — the supervisor /
+            # reconciler releases it from the GET authority.
             if self._lease_held and self._worker_record is not None:
-                _workers.release_lease(self._worker_record.name, self._lease_id)
+                if self._remote_terminal_observed or not self._agent_id:
+                    _workers.release_lease(
+                        self._worker_record.name, self._lease_id
+                    )
+                else:
+                    logger.info(
+                        "worker %s: lease %s retained (remote terminal not "
+                        "observed) — the reconciler settles it from the "
+                        "GET authority",
+                        self._worker_record.name, self._lease_id,
+                    )
             self._put("__done__", {})
 
     def _run_inner(self, watcher: threading.Thread) -> None:
@@ -909,19 +938,21 @@ class _CloudWorker:
             self._put("cloud.fatal", {"error": catalog_error})
             return
 
-        # Worker (runtime=local): reuse-or-spawn, bounded ready wait,
-        # then the per-RUN lease that protects it from the reaper.
+        # Worker (runtime=local): reuse-or-spawn with the per-RUN lease
+        # installed ATOMICALLY under the same ownership lock — a failure
+        # to lease fails the dispatch (fail closed), never yields an
+        # unprotected worker.
         if self._runtime == "local":
             try:
-                self._worker_record = _workers.ensure_worker(self._repo)
+                self._worker_record = _workers.ensure_worker(
+                    self._repo,
+                    lease_id=self._lease_id,
+                    lease_session=self._session_title or "",
+                )
             except _workers.WorkerError as exc:
                 self._put("cloud.fatal", {"error": str(exc)})
                 return
-            self._lease_held = _workers.acquire_lease(
-                self._worker_record.name,
-                self._lease_id,
-                session=self._session_title or "",
-            )
+            self._lease_held = True
 
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)
@@ -1002,6 +1033,10 @@ class _CloudWorker:
         status = _lower_status(self._final_status(client)) or _lower_status(
             (result_data or {}).get("status")
         )
+        if status in ("finished", "cancelled", "expired", "error"):
+            # Remote-emitted terminal state (GET authority or the run's
+            # own result event) — the lease may be released.
+            self._remote_terminal_observed = True
         self._settled = True
         if self.abort_reason == "timeout":
             self._put("cloud.error", self._timeout_error())
