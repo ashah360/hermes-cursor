@@ -120,6 +120,22 @@ def no_systemd(monkeypatch):
     monkeypatch.setattr(workers, "_systemd_available", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def reachable_management(monkeypatch):
+    """Default test-world management endpoint: reachable-and-connected
+    once a generation reached READY, silent while it is still spawning
+    (so readiness tests stay log-driven). Tests that exercise
+    disconnected/unreachable endpoints override this."""
+    monkeypatch.setattr(
+        workers, "_probe_management",
+        lambda record: (
+            {"status": "ok", "connected": True, "claimed": False}
+            if record.state == workers.STATE_READY
+            else None
+        ),
+    )
+
+
 @pytest.fixture
 def fake_systemd(monkeypatch, fake_procs):
     """A fake user systemd manager: records started units, assigns
@@ -617,23 +633,45 @@ class TestSystemdOwnershipVerification:
         assert cmd[-5:] == ["--", "/usr/bin/agent", "worker", "start",
                             "--name", "w"][-5:]
 
-    def test_adoption_mismatch_is_never_adopted(self, tmp_path, fake_systemd):
-        """A unit whose live MainPID/InvocationID no longer matches the
-        persisted record is NOT this record's generation — it must be
-        replaced, never handed out."""
+    def test_identity_mismatch_fails_closed_without_stopping_foreign_unit(
+        self, tmp_path, fake_systemd
+    ):
+        """A live unit whose InvocationID differs from the persisted
+        generation may belong to ANOTHER generation/controller: it is
+        never adopted AND never stopped — the record turns conflict and
+        the dispatch fails closed for operator/reconciler resolution."""
         repo = tmp_path / "repo"
         repo.mkdir()
         first = workers.ensure_worker(str(repo))
-        # The unit was restarted behind our back: same name, new
-        # identity (different MainPID + InvocationID).
         fake_systemd["units"][first.unit] = {
             "ActiveState": "active",
             "MainPID": str(first.pid),        # keep pid: only invocation
             "InvocationID": "inv-imposter",   # identity differs
         }
-        second = workers.ensure_worker(str(repo))
-        assert second.generation != first.generation
-        assert len(fake_systemd["started"]) == 2  # respawned, not adopted
+        stops_before = len(fake_systemd["stopped"])
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "conflict" in str(err.value)
+        assert len(fake_systemd["stopped"]) == stops_before  # NOT stopped
+        retained = workers._read_record(first.name)
+        assert retained is not None
+        assert retained.state == workers.STATE_CONFLICT
+
+    def test_missing_invocation_id_is_not_valid_fencing(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        fake_systemd["units"][first.unit] = {
+            "ActiveState": "active",
+            "MainPID": str(first.pid),
+            "InvocationID": "",               # no identity — no fencing
+        }
+        stops_before = len(fake_systemd["stopped"])
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        assert len(fake_systemd["stopped"]) == stops_before
 
     def test_unverified_stop_fails_closed_and_retains_the_record(
         self, tmp_path, fake_systemd, fake_procs, monkeypatch
@@ -653,6 +691,98 @@ class TestSystemdOwnershipVerification:
         assert retained.state == workers.STATE_DRAINING
         assert "stop unverified" in retained.last_error
         assert len(fake_systemd["started"]) == 1  # no duplicate spawn
+
+
+class TestVerifiedStopEvidence:
+    """_unit_stopped succeeds only on POSITIVE inactive/not-found
+    evidence from the real systemctl seam; unknown show output is
+    UNKNOWN, never 'stopped'."""
+
+    @staticmethod
+    def _proc(rc, stdout="", stderr=""):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
+
+    def test_failed_show_is_unknown_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(1, "", "dbus gone"),
+        )
+        assert workers._unit_stopped("cursor-worker-x.service") is False
+
+    def test_positive_evidence_accepts_inactive_and_not_found(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=inactive\nLoadState=loaded\nMainPID=0\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is True
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=inactive\nLoadState=not-found\nMainPID=0\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is True
+
+    def test_active_show_is_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=active\nLoadState=loaded\nMainPID=42\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is False
+
+    def test_systemd_stop_unconfirmed_on_nonzero_stop_and_unknown_show(
+        self, monkeypatch
+    ):
+        def run(args, timeout=None):
+            if "stop" in args:
+                return self._proc(1, "", "Job for u.service failed")
+            if "show" in args:
+                return self._proc(1, "", "Failed to get properties")
+            return self._proc(0)
+
+        monkeypatch.setattr(workers, "_run_systemctl", run)
+        assert workers._systemd_stop("u.service") is False
+
+
+class TestDeadLeaderTeardown:
+    def test_dead_leader_with_surviving_descendants_fails_closed(
+        self, tmp_path, fake_spawn, fake_procs, monkeypatch
+    ):
+        """A dead detached leader whose process GROUP still has members
+        (tmux/MCP children) must go through full teardown; the record is
+        never deleted over live descendants."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # leader died…
+        # …but descendants keep the process group alive and unkillable.
+        monkeypatch.setattr(workers, "_kill_detached", lambda record: None)
+        monkeypatch.setattr(workers, "_pgid_empty", lambda pgid: False)
+
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        retained = workers._read_record(record.name)
+        assert retained is not None
+        assert retained.state == workers.STATE_DRAINING
+
+    def test_dead_systemd_leader_still_stops_through_the_unit(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        """Even with the leader pid gone, the unit's cgroup may hold
+        descendants — cleanup must route through systemctl stop."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)
+        stops_before = len(fake_systemd["stopped"])
+        assert workers.reconcile() == [record.name]
+        assert record.unit in fake_systemd["stopped"][stops_before:]
 
 
 class TestReadyReuseRevalidation:
@@ -687,6 +817,45 @@ class TestReadyReuseRevalidation:
         second = workers.ensure_worker(str(repo))
         assert second.generation == first.generation  # reused
         assert len(fake_spawn) == 1
+
+    def test_unreachable_endpoint_is_not_proven_connected(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """A READY record whose management endpoint is unreachable is
+        NOT proven connected: the dispatch fails with an actionable
+        retry — the worker is kept, never handed out, never killed."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(workers, "_probe_management", lambda record: None)
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "unreachable" in str(err.value) or "not proven" in str(err.value)
+        retained = workers._read_record(first.name)
+        assert retained is not None
+        assert retained.generation == first.generation  # kept, not killed
+
+    def test_legacy_record_without_endpoint_is_still_adoptable(
+        self, tmp_path, fake_procs, monkeypatch
+    ):
+        """Legacy generation-0 records predate the management endpoint:
+        adoption stands on process liveness (the migration promise)."""
+        monkeypatch.setattr(workers, "_probe_management", lambda record: None)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name, "repo_path": os.path.realpath(str(repo)),
+            "pid": 8899, "log_path": str(directory / f"{name}.log"),
+            "started_at": 1000.0, "verified": True,
+        }))
+        fake_procs.add(8899)
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 8899
+        assert record.supervision == "legacy"
 
 
 class TestDegradedFallback:

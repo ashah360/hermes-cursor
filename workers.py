@@ -116,6 +116,11 @@ STATE_FAILED = "failed"
 # (fail closed — never an untracked remnant or a duplicate spawn) until
 # a later verified stop succeeds.
 STATE_DRAINING = "draining"
+# The deterministic unit's live identity does not match this record's
+# generation — it may belong to another generation/controller. Never
+# adopted, never stopped by us; retained for operator/reconciler
+# resolution (it self-heals once the foreign unit is gone).
+STATE_CONFLICT = "conflict"
 
 
 @dataclass
@@ -400,13 +405,16 @@ def _systemd_start(
 
 
 def _systemd_show(unit: str) -> Dict[str, str]:
-    """{ActiveState, SubState, MainPID, InvocationID} for a unit ({} on
-    failure)."""
+    """{ActiveState, SubState, MainPID, InvocationID, LoadState} for a
+    unit. {} means UNKNOWN (the query itself failed) — callers must
+    treat that as no evidence, never as 'stopped'."""
     try:
         proc = _run_systemctl([
             "systemctl", "--user", "show", unit,
-            "--property=ActiveState,SubState,MainPID,InvocationID",
+            "--property=ActiveState,SubState,MainPID,InvocationID,LoadState",
         ], timeout=10)
+        if proc.returncode != 0:
+            return {}
         out: Dict[str, str] = {}
         for line in (proc.stdout or "").splitlines():
             key, sep, value = line.partition("=")
@@ -448,10 +456,16 @@ def _systemd_stop(unit: str) -> bool:
 
 
 def _unit_stopped(unit: str) -> bool:
-    """Whether a unit is confirmed inactive/gone (its cgroup is empty —
-    systemd only reports inactive/failed once every member exited)."""
-    state = str(_systemd_show(unit).get("ActiveState") or "")
-    return state in ("", "inactive", "failed", "dead", "not-found")
+    """Whether a unit is confirmed stopped on POSITIVE evidence only:
+    a successful ``show`` reporting not-found or inactive/failed/dead
+    (systemd reports those only once every cgroup member exited). An
+    empty/failed show is UNKNOWN — never counted as stopped."""
+    show = _systemd_show(unit)
+    if not show:
+        return False  # UNKNOWN — no positive evidence
+    if str(show.get("LoadState") or "") == "not-found":
+        return True
+    return str(show.get("ActiveState") or "") in ("inactive", "failed", "dead")
 
 
 # ---------------------------------------------------------------------------
@@ -815,10 +829,9 @@ def _cleanup_generation(record: WorkerRecord) -> None:
 
 def _unit_identity_matches(record: WorkerRecord) -> bool:
     """Adoption validation for systemd records: the unit's live
-    ActiveState/MainPID/InvocationID must match the persisted identity.
-    A mismatch means the unit is NOT the generation this record owns —
-    it is never adopted (the caller respawns through the verified-stop
-    path)."""
+    ActiveState, MainPID, AND InvocationID must POSITIVELY match the
+    persisted identity. A missing InvocationID is not valid fencing —
+    identity that cannot be proven is not identity."""
     if record.supervision != "systemd" or not record.unit:
         return True
     show = _systemd_show(record.unit)
@@ -827,39 +840,28 @@ def _unit_identity_matches(record: WorkerRecord) -> bool:
     if str(show.get("MainPID") or "0") != str(record.pid):
         return False
     invocation = str(show.get("InvocationID") or "")
-    if invocation and record.generation and invocation != record.generation:
-        return False
-    return True
+    return bool(invocation) and invocation == record.generation
 
 
 def _validate_for_handout(record: WorkerRecord) -> Optional[WorkerRecord]:
-    """Validate a live generation before handing it to a dispatch.
+    """Validate a live, identity-verified generation before handing it
+    to a dispatch (caller holds the flock; unit identity was already
+    positively matched by the caller).
 
-    Three distinct facts, checked in order (caller holds the flock):
+    Registration is the authority: when the management endpoint
+    answers, its ``connected`` field decides — connected=True hands out
+    (``claimed`` is busy-ness, NOT ill health — preserved distinction);
+    connected=False on a READY record means lost backend registration —
+    None (replace); connected=False on a SPAWNING record is still
+    registering — actionable retry error, not churn.
 
-    * **unit identity** (systemd records): live ActiveState/MainPID/
-      InvocationID must match the persisted record — else None (respawn).
-    * **registration**: when the management endpoint answers, its
-      ``connected`` field is authoritative. connected=True hands out
-      (``claimed`` is busy-ness, NOT ill health — preserved distinction);
-      connected=False on a READY record means the worker lost its
-      backend registration and cannot receive assignments — None
-      (respawn); connected=False on a SPAWNING record is still
-      registering — actionable retry error, not churn.
-    * **fallback evidence** (endpoint silent/absent): a READY record
-      stands on process liveness; a SPAWNING record must show its own
-      generation's log evidence or fail with the retry error.
-
-    Returns the (possibly state-flipped) record to hand out, or None
-    when the generation must be replaced.
+    An UNREACHABLE/missing endpoint is NOT proof of connectivity: a
+    READY v2 record fails the dispatch with an actionable retry (kept,
+    not killed — the outage may be transient); only legacy generation-0
+    records (which predate the endpoint) stand on process liveness. A
+    SPAWNING record may still prove itself with its own generation's
+    fresh log evidence (bootstrap) or fails with the retry error.
     """
-    if not _unit_identity_matches(record):
-        logger.warning(
-            "worker %s: unit identity mismatch (unit %s no longer matches "
-            "pid %d / generation %s) — not adopting",
-            record.name, record.unit or "-", record.pid, record.generation,
-        )
-        return None
     probe = _probe_management(record)
     if probe is not None:
         if probe.get("connected"):
@@ -878,8 +880,16 @@ def _validate_for_handout(record: WorkerRecord) -> Optional[WorkerRecord]:
             )
             return None
     else:
+        if record.supervision == "legacy":
+            return record  # pre-endpoint generation — adoption promise
         if record.state == STATE_READY:
-            return record
+            raise WorkerError(
+                f"worker '{record.name}' is alive but its management "
+                f"endpoint ({record.management_addr or 'none recorded'}) "
+                "is unreachable — not proven connected, not dispatching; "
+                "retry shortly (the worker is kept), or stop it "
+                "(cursor_stop) to force a respawn"
+            )
     if _ready_evidence(record):
         _update_record_locked(
             record.name, record.generation,
@@ -962,8 +972,30 @@ def ensure_worker(
         if record is not None:
             usable: Optional[WorkerRecord] = None
             if _record_alive(record) and record.state not in (
-                STATE_FAILED, STATE_DRAINING,
+                STATE_FAILED, STATE_DRAINING, STATE_CONFLICT,
             ):
+                if not _unit_identity_matches(record):
+                    # The deterministic unit is live under a DIFFERENT
+                    # (or unprovable) identity — it may belong to
+                    # another generation/controller. Never adopt it,
+                    # never stop it: fail closed for operator/reconciler
+                    # resolution (self-heals once the unit is gone).
+                    _update_record_locked(
+                        name, record.generation,
+                        state=STATE_CONFLICT,
+                        last_error=(
+                            f"unit {record.unit} live identity does not "
+                            f"match generation {record.generation}"
+                        ),
+                    )
+                    raise WorkerError(
+                        f"worker '{name}' is in identity conflict: unit "
+                        f"{record.unit} is running with an identity that "
+                        "does not match the persisted generation — not "
+                        "adopting and not stopping a possibly-foreign "
+                        "unit; inspect it with `systemctl --user status "
+                        f"{record.unit}`"
+                    )
                 usable = _validate_for_handout(record)  # may raise (retry)
             if usable is not None:
                 # Bump the idle clock at hand-out: the caller is about
@@ -1156,17 +1188,38 @@ def _spawn_unit(
     while True:
         show = _systemd_show(unit)
         pid = int(show.get("MainPID") or 0)
-        if pid > 0:
-            return pid, str(show.get("InvocationID") or "") or _mint_generation("unit")
+        invocation = str(show.get("InvocationID") or "")
+        if pid > 0 and invocation:
+            # InvocationID is MANDATORY: it is the generation fence every
+            # later adoption/stop decision verifies against — a unit we
+            # cannot fence is a unit we cannot own.
+            return pid, invocation
         if show.get("ActiveState") in ("failed", "inactive") or (
             time.monotonic() >= deadline
         ):
+            # Our own just-started unit — stopping it is safe (no other
+            # controller can have claimed this name inside our locks).
+            _systemd_stop(unit)
             raise WorkerError(
-                f"unit {unit} started but exposed no MainPID "
-                f"(ActiveState={show.get('ActiveState')!r}) — log tail:\n"
+                f"unit {unit} started but exposed no usable identity "
+                f"(MainPID={pid}, InvocationID={invocation!r}, "
+                f"ActiveState={show.get('ActiveState')!r}) — log tail:\n"
                 f"{_log_tail(log_path) or '(empty log)'}"
             )
         time.sleep(0.1)
+
+
+def _pgid_empty(pgid: int) -> bool:
+    """Whether a detached generation's process GROUP has no members left
+    (a dead leader's tmux/MCP descendants keep the group alive)."""
+    try:
+        os.killpg(int(pgid), 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except Exception:
+        # Permission/odd platform: fall back to the leader probe.
+        return not _pid_alive(int(pgid))
 
 
 def _stop_generation(record: WorkerRecord) -> bool:
@@ -1174,36 +1227,53 @@ def _stop_generation(record: WorkerRecord) -> bool:
     (caller holds the flock). Returns False when the teardown could not
     be confirmed — callers fail closed (record retained as draining).
 
-    systemd records ALWAYS stop through the unit — even when the leader
-    pid is already dead, the unit's cgroup may still hold descendants
-    (the observed leaked-tmux-child scope); ``systemctl stop`` empties
-    the cgroup within TimeoutStopSec and the result is verified against
-    the unit's post-stop state. Detached records degrade to a bounded
-    TERM→KILL of the process group verified against the leader pid.
+    systemd records stop through the unit — even when the leader pid is
+    already dead, the unit's cgroup may still hold descendants (the
+    observed leaked-tmux-child scope) — EXCEPT when the unit's live
+    identity proves it belongs to a FOREIGN generation: that unit is
+    never stopped (fail closed; it is not ours to kill). Detached
+    records get a bounded TERM→KILL of the whole process group,
+    verified against the group (not just the leader — a dead leader's
+    descendants keep the pgid alive).
     """
     if record.supervision == "systemd" and record.unit:
+        show = _systemd_show(record.unit)
+        invocation = str(show.get("InvocationID") or "")
+        if (
+            show.get("ActiveState") == "active"
+            and invocation
+            and record.generation
+            and invocation != record.generation
+        ):
+            logger.warning(
+                "unit %s is a FOREIGN generation (%s != %s) — refusing "
+                "to stop it", record.unit, invocation, record.generation,
+            )
+            return False
         return _systemd_stop(record.unit)
-    if not _record_alive(record):
-        return True
     _kill_detached(record)
-    return not _record_alive(record)
+    return _pgid_empty(record.pid)
 
 
 def _kill_detached(record: WorkerRecord) -> None:
-    """Bounded TERM→KILL of a detached generation's process group."""
+    """Bounded TERM→KILL of a detached generation's whole process group
+    (paced on the GROUP emptying — a dead leader's descendants must not
+    short-circuit the escalation)."""
     import signal
 
     for sig, wait_s in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
         try:
             os.killpg(int(record.pid), sig)
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError:
+            return  # group already empty
+        except (PermissionError, OSError):
             try:
                 os.kill(int(record.pid), sig)
             except Exception:
                 return
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
-            if not _pid_alive(record.pid):
+            if _pgid_empty(record.pid):
                 return
             time.sleep(0.1)
 
