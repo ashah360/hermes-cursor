@@ -6461,35 +6461,127 @@ class TestCreateIntentAndRecovery:
             create_intent={"ts": ts, "state": "creating"},
         )
 
-    def test_reconciler_adopts_newest_matching_agent_and_reports_ambiguity(
-        self, clean_state, monkeypatch
-    ):
+    @staticmethod
+    def _iso(t):
         import datetime as _dt
 
-        intent_ts = time.time() - 600
-        iso = lambda t: _dt.datetime.fromtimestamp(
+        return _dt.datetime.fromtimestamp(
             t, _dt.timezone.utc
         ).isoformat().replace("+00:00", "Z")
+
+    def test_reconciler_adopts_a_unique_matching_agent(
+        self, clean_state, monkeypatch
+    ):
+        intent_ts = time.time() - 600
         self._stale_intent_entry("Fix the flux capacitor", intent_ts)
         client = _FakeRestClient()
         client.list_agents = lambda limit=20: {"items": [
-            {"id": "bc-newer", "name": "Fix the flux capacitor",
-             "createdAt": iso(intent_ts + 40), "latestRunId": "run-n"},
-            {"id": "bc-older", "name": "Fix the flux capacitor",
-             "createdAt": iso(intent_ts + 10), "latestRunId": "run-o"},
+            {"id": "bc-match", "name": "Fix the flux capacitor",
+             "createdAt": self._iso(intent_ts + 40), "latestRunId": "run-n"},
             {"id": "bc-unrelated", "name": "Other work",
-             "createdAt": iso(intent_ts + 20)},
+             "createdAt": self._iso(intent_ts + 20)},
         ]}
         monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
         monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
 
         gc_supervisor.reconcile_once()
         entry = gc_handles.get("Fix the flux capacitor")
-        assert entry["cursor_session_id"] == "bc-newer"   # newest match wins
+        assert entry["cursor_session_id"] == "bc-match"
         assert entry["latest_run_id"] == "run-n"
         assert entry["create_intent"]["state"] == "recovered"
-        # Ambiguity is REPORTED (never auto-cancelled).
-        assert "bc-older" in str(entry.get("status_note") or "")
+
+    def test_ambiguous_recovery_stays_unresolved_and_adopts_none(
+        self, clean_state, monkeypatch
+    ):
+        """Several title/time matches: adopting the newest would guess —
+        the intent stays UNRESOLVED for operator review, nothing is
+        attached, nothing is auto-cancelled."""
+        intent_ts = time.time() - 600
+        self._stale_intent_entry("Fix the flux capacitor", intent_ts)
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-newer", "name": "Fix the flux capacitor",
+             "createdAt": self._iso(intent_ts + 40), "latestRunId": "run-n"},
+            {"id": "bc-older", "name": "Fix the flux capacitor",
+             "createdAt": self._iso(intent_ts + 10), "latestRunId": "run-o"},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Fix the flux capacitor")
+        assert not entry.get("cursor_session_id")
+        assert entry["create_intent"]["state"] == "unresolved"
+        note = str(entry.get("status_note") or "")
+        assert "bc-newer" in note and "bc-older" in note
+        assert "cursor.com/agents" in note
+
+    def test_recovery_runs_for_the_real_crash_shape_spawning_phase(
+        self, clean_state, monkeypatch
+    ):
+        """The actual crash shape: begin_attempt left supervision phase
+        'spawning' (LIVE), the intent says 'creating', no agent id was
+        ever recorded. Recovery must run BEFORE ordinary live-phase
+        attachment — a supervisor attached here would settle the session
+        failed ('no remote agent id') and strand the real agent."""
+        intent_ts = time.time() - 600
+        gc_handles.record(
+            "Crashed mid create", repo="/w", status="created",
+            session_key="",
+            create_intent={"ts": intent_ts, "state": "creating"},
+        )
+        gc_handles.record_supervision(
+            "Crashed mid create", phase="spawning",
+            current_attempt_id="att-crash", attempt_n=1,
+        )
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-crashed", "name": "Crashed mid create",
+             "createdAt": self._iso(intent_ts + 30), "latestRunId": "run-c"},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Crashed mid create")
+        assert entry["cursor_session_id"] == "bc-crashed"
+        assert entry["create_intent"]["state"] == "recovered"
+        assert entry["status"] != "failed"
+
+    def test_pending_create_never_attaches_a_false_settling_supervisor(
+        self, clean_state
+    ):
+        """A live-phase handle whose create is still pending (creating
+        intent, no agent id) must not get a supervisor: it would settle
+        'orphaned: no remote agent id' while the create may have landed."""
+        gc_handles.record(
+            "Pending create", repo="/w", status="created", session_key="",
+            create_intent={"ts": time.time(), "state": "creating"},
+        )
+        gc_handles.record_supervision(
+            "Pending create", phase="spawning",
+            current_attempt_id="att-p", attempt_n=1,
+        )
+        assert gc_supervisor.ensure_supervisor("Pending create") is None
+        assert str(gc_handles.get("Pending create").get("status")) != "failed"
+
+    def test_create_is_refused_when_intent_cannot_be_persisted(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The POST is non-idempotent: with no durable intent there is no
+        recovery path, so an unpersistable intent must abort BEFORE the
+        create leaves the box."""
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        monkeypatch.setattr(gc_handles, "_save_locked", lambda: False)
+
+        out = cursor_send_message(name, "build the thing")
+        job = gc_jobs.registry.get_by_name(name)
+        if job is not None:
+            assert job.done_event.wait(10)
+        assert client.create_calls == []   # the POST never left the box
+        assert "intent" in out or "failed" in out
 
     def test_reconciler_reports_unresolved_when_listing_truncates(
         self, clean_state, monkeypatch

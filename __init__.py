@@ -879,11 +879,20 @@ def _run_attempt(
     def _persist_create_intent() -> None:
         # Durable intent BEFORE the non-idempotent create POST: a crash
         # in the window before the identity lands is recovered by the
-        # reconciler's bounded title/time matching (supervisor).
-        _handles.record(
+        # reconciler's bounded title/time matching (supervisor). FAIL
+        # CLOSED: with no durable intent there is no recovery path, so
+        # an unpersistable intent aborts the create before it leaves
+        # the box.
+        if not _handles.record_required(
             handle_name,
             create_intent={"ts": time.time(), "state": "creating"},
-        )
+        ):
+            raise _cloud.CloudRunnerError(
+                "refusing to create a cursor agent: the create intent "
+                "could not be durably persisted (handle store "
+                "unwritable), and the create API is not idempotent — "
+                "fix the state directory and re-send"
+            )
 
     def _persist_created(agent_id: str, run_id: str, resumed: bool) -> None:
         # Producer-boundary identity write: the agent id becomes durable
@@ -891,13 +900,23 @@ def _run_attempt(
         with job._lock:
             job.cursor_session_id = agent_id
             job.resumed = resumed
-        _handles.record(
+        if not _handles.record_required(
             handle_name or agent_id,
             cursor_session_id=agent_id,
             latest_run_id=run_id or None,
             status="running",
             create_intent={"ts": time.time(), "state": "recorded"},
-        )
+        ):
+            # The agent EXISTS but its identity did not land durably.
+            # The intent (persisted pre-POST) stays "creating", so the
+            # reconciler's recovery will re-derive the identity from the
+            # remote listing — say so loudly for the operator meanwhile.
+            logger.critical(
+                "ghost_cursor: agent %s (run %s) for session %r was "
+                "created but its identity could not be persisted — "
+                "intent recovery will re-adopt it; if this recurs, fix "
+                "the handle store", agent_id, run_id, handle_name,
+            )
 
     normalizer = _events.SdkNormalizer()
     try:

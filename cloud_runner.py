@@ -727,12 +727,12 @@ class _CloudWorker:
         # Durable intent BEFORE the non-idempotent POST: the API has no
         # idempotency key, so a crash between this create and the
         # identity write is recovered by bounded title/time matching
-        # (supervisor reconciler) instead of leaking a live agent.
+        # (supervisor reconciler) instead of leaking a live agent. The
+        # callback may RAISE (CloudRunnerError) to refuse the create —
+        # an unpersistable intent has no recovery path, so nothing is
+        # swallowed here (fail closed).
         if self._on_create_intent is not None:
-            try:
-                self._on_create_intent()
-            except Exception:
-                logger.exception("on_create_intent callback failed")
+            self._on_create_intent()
         created = client.create_agent(
             self._task,
             model_id=self._model_id or None,
@@ -956,6 +956,11 @@ class _CloudWorker:
 
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)
+        except CloudRunnerError as exc:
+            # The create was REFUSED before the POST (e.g. the durable
+            # intent could not be persisted) — a clean preflight failure.
+            self._put("cloud.fatal", {"error": str(exc)})
+            return
         except RestClientError as exc:
             model_hint = (
                 f"the requested model {self._model_id!r}"

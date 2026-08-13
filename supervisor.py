@@ -879,16 +879,36 @@ def _job_is_live(session_name: str) -> bool:
     return job is not None and job.status == "running"
 
 
+def _pending_create(entry: Optional[Dict[str, Any]]) -> bool:
+    """A handle whose create is still pending: intent says "creating"
+    and no agent id was ever recorded. Supervision CANNOT safely attach
+    here — it would settle 'orphaned: no remote agent id' while the
+    create may in fact have landed. Only intent recovery (or the
+    dispatcher itself) moves such a handle forward."""
+    entry = entry or {}
+    intent = entry.get("create_intent")
+    return (
+        isinstance(intent, dict)
+        and str(intent.get("state") or "") in ("creating", "unresolved")
+        and not str(entry.get("cursor_session_id") or "")
+    )
+
+
 def ensure_supervisor(session_name: str) -> Optional[SessionSupervisor]:
     """The live supervisor for a session, spawning one if needed.
 
     No-op (returns None) for handles that are not in a live supervision
-    phase, or that a running in-process job already supervises.
+    phase, that a running in-process job already supervises, or whose
+    create is still PENDING (creating intent, no agent id — attaching
+    would false-settle the session; recovery owns it).
     """
     name = str(session_name or "").strip()
     if not name:
         return None
-    if not _handles.supervision_is_live(_handles.get(name)):
+    entry = _handles.get(name)
+    if not _handles.supervision_is_live(entry):
+        return None
+    if _pending_create(entry):
         return None
     if _job_is_live(name):
         return None
@@ -1090,24 +1110,15 @@ def _recover_create_intent(
         and str(agent.get("name") or "") == name
         and _created_at(agent) >= intent_ts - CREATE_MATCH_SKEW_S
     ]
-    if matches:
-        newest = max(matches, key=_created_at)
-        agent_id = str(newest.get("id") or "")
-        others = sorted(
-            str(a.get("id") or "") for a in matches if a is not newest
-        )
-        note = (
-            f"ambiguous create recovery: adopted {agent_id}; other agents "
-            f"titled {name!r} in the window: {', '.join(others)} — review "
-            "at cursor.com/agents (nothing was auto-cancelled)"
-            if others else ""
-        )
+    if len(matches) == 1:
+        match = matches[0]
+        agent_id = str(match.get("id") or "")
         _handles.record(
             name,
             cursor_session_id=agent_id,
-            latest_run_id=str(newest.get("latestRunId") or "") or None,
+            latest_run_id=str(match.get("latestRunId") or "") or None,
             status="running",
-            status_note=note,
+            status_note="",
             create_intent={**intent, "state": "recovered"},
         )
         _handles.record_supervision(
@@ -1119,17 +1130,42 @@ def _recover_create_intent(
         _eventlog.append(name, _events.lifecycle(
             "create.recovered",
             agent_id=agent_id,
-            ambiguous_with=others or None,
             note=(
-                "a crashed create was recovered by newest-title/time "
+                "a crashed create was recovered by unique title/time "
                 "matching; re-attaching supervision"
             ),
         ))
         logger.warning(
-            "ghost_cursor recovered crashed create for %s -> %s%s",
-            name, agent_id, f" (ambiguous: {others})" if others else "",
+            "ghost_cursor recovered crashed create for %s -> %s",
+            name, agent_id,
         )
         return True
+    if len(matches) > 1:
+        # AMBIGUOUS: adopting any of them (even the newest) would be a
+        # guess against a non-idempotent create. Attach to none; leave
+        # the intent unresolved for operator review; cancel nothing.
+        ids = sorted(str(a.get("id") or "") for a in matches)
+        _handles.record(
+            name,
+            create_intent={**intent, "state": "unresolved"},
+            status_note=(
+                "create recovery is AMBIGUOUS: several agents titled "
+                f"{name!r} exist in the intent window: {', '.join(ids)} — "
+                "review at https://cursor.com/agents and continue the "
+                "right one explicitly (its agent id resolves as a "
+                "handle alias); nothing was auto-adopted or cancelled"
+            ),
+        )
+        _eventlog.append(name, _events.lifecycle(
+            "create.unresolved",
+            ambiguous_with=ids,
+            note="multiple title/time matches; operator review required",
+        ))
+        logger.warning(
+            "ghost_cursor create recovery for %s is ambiguous (%s) — "
+            "left unresolved", name, ids,
+        )
+        return False
 
     truncated = bool(response.get("nextCursor")) or len(items) >= 100
     if truncated:
@@ -1158,6 +1194,9 @@ def _recover_create_intent(
             "re-send to retry"
         ),
     )
+    # Settle the supervision phase too: the crash left it live
+    # ("spawning"), and nothing else will move it now.
+    _handles.record_supervision(name, phase="failed")
     _eventlog.append(name, _events.lifecycle(
         "create.failed", note="no matching remote agent; settled failed",
     ))
@@ -1233,10 +1272,21 @@ def reconcile_once() -> List[str]:
             name = str(entry.get("session") or "")
             if not name:
                 continue
+            # Create-intent recovery runs FIRST, regardless of the
+            # supervision phase: the realistic crash shape leaves phase
+            # "spawning" (LIVE — begin_attempt wrote it before the
+            # create), so gating recovery on a non-live phase would
+            # bypass it and a supervisor would false-settle the session.
+            if _recover_create_intent(name, entry, _probe_client):
+                entry = _handles.get(name) or entry
+            elif _pending_create(entry):
+                # Still pending (fresh intent / unresolved listing):
+                # recovery owns this handle — never attach a supervisor
+                # that would settle 'no remote agent id'.
+                continue
             if not _handles.supervision_is_live(entry):
                 if not (
-                    _recover_create_intent(name, entry, _probe_client)
-                    or _adopt_legacy_handle(name, entry)
+                    _adopt_legacy_handle(name, entry)
                     or _repair_false_settle(name, entry, _probe_client)
                 ):
                     continue

@@ -105,17 +105,23 @@ def _load_locked() -> None:
         logger.debug("ghost_cursor handle table load failed", exc_info=True)
 
 
-def _save_locked() -> None:
+def _save_locked() -> bool:
+    """Persist the table. Returns whether the write actually landed —
+    ``record`` ignores this (degrade-to-memory contract) but
+    :func:`record_required` propagates it for writes that MUST be
+    durable (create intents / agent identity)."""
     path = _state_file()
     if path is None:
-        return
+        return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(_table, ensure_ascii=False), "utf-8")
         tmp.replace(path)
+        return True
     except Exception:
         logger.debug("ghost_cursor handle table save failed", exc_info=True)
+        return False
 
 
 def _is_terminal(entry: Dict[str, Any]) -> bool:
@@ -187,6 +193,27 @@ def record(session_id: Optional[str], **fields: Any) -> None:
             _save_locked()
     except Exception:
         logger.debug("ghost_cursor handle record failed", exc_info=True)
+
+
+def record_required(session_id: Optional[str], **fields: Any) -> bool:
+    """Like :func:`record`, but FAIL-CLOSED: returns whether the write is
+    durably on disk. For the narrow set of writes that gate side effects
+    with no recovery path — the pre-POST create intent (the POST is not
+    idempotent) and the returned agent identity. Never raises.
+    """
+    try:
+        if not session_id:
+            return False
+        with _lock:
+            _load_locked()
+            entry = _table.setdefault(str(session_id), {})
+            entry.update({k: v for k, v in fields.items() if v is not None})
+            entry["updated_at"] = time.time()
+            _prune_locked()
+            return _save_locked()
+    except Exception:
+        logger.warning("ghost_cursor required handle write failed", exc_info=True)
+        return False
 
 
 def subscribers_of(entry: Optional[Dict[str, Any]]) -> Dict[str, float]:
