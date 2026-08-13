@@ -67,8 +67,19 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     """Point HERMES_HOME at a per-test temp dir so the handle-table JSON and
     any other persisted state are fresh every test and never touch the real
     ~/.hermes. Mirrors the Hermes-tree autouse fixture the plugin tests assume.
+
+    XDG_STATE_HOME is isolated too: the worker controller's machine-global
+    control directory (records/locks/data roots) lives under it and must
+    never touch the real ~/.local/state during tests.
     """
     home = tmp_path / "hermes_home"
     (home / "state").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    try:
+        from plugins.ghost_cursor import workers as _workers
+
+        _workers._reset_migration_for_tests()
+    except Exception:
+        pass
     yield home

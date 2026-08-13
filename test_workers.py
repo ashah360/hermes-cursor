@@ -276,6 +276,97 @@ class TestEnsureWorker:
         assert "agent" in str(err.value)
 
 
+class TestMachineGlobalControlDir:
+    """Worker records/locks/data roots are MACHINE-global (unit names and
+    the one-worker-per-worktree invariant are machine-global); session
+    handles stay profile-local. Pre-v2 profile-local records migrate by
+    adoption — never by killing live workers."""
+
+    def test_state_dir_is_independent_of_hermes_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+        dir_a = workers.state_dir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+        dir_b = workers.state_dir()
+        assert dir_a == dir_b
+        assert str(tmp_path / "xdg") in str(dir_a)
+
+    def test_profile_local_records_migrate_by_adoption(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        # A pre-v2 record left in the PROFILE-local location.
+        legacy_dir = workers._profile_state_dir()
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 8811,
+            "log_path": str(legacy_dir / f"{name}.log"),
+            "started_at": 1000.0,
+            "verified": True,
+        }))
+        fake_procs.add(8811)
+        workers._reset_migration_for_tests()
+
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 8811          # adopted from the profile dir
+        assert len(fake_spawn) == 0        # never killed, never respawned
+        assert record.supervision == "legacy"
+        # The record now lives in the machine-global control dir.
+        assert (workers.state_dir() / f"{name}.json").exists()
+
+
+class TestLegacyProtection:
+    """A legacy (generation-0) worker may be serving a pre-v2 run this
+    controller cannot see (no leases, possibly another profile) — it is
+    never TTL-reaped and never capacity-reclaimed while alive."""
+
+    def _legacy_record(self, repo, pid, fake_procs):
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": pid,
+            "log_path": str(directory / f"{name}.log"),
+            "started_at": 5.0,  # ancient — far past any TTL
+            "verified": True,
+        }))
+        fake_procs.add(pid)
+        return name
+
+    def test_active_legacy_worker_survives_the_reaper(
+        self, tmp_path, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = self._legacy_record(repo, 8821, fake_procs)
+        assert workers.reconcile() == []
+        assert workers._read_record(name) is not None
+
+    def test_dead_legacy_worker_is_still_cleaned(self, tmp_path, fake_procs):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = self._legacy_record(repo, 8822, fake_procs)
+        fake_procs.discard(8822)
+        assert workers.reconcile() == [name]
+
+    def test_capacity_never_reclaims_a_live_legacy_worker(
+        self, tmp_path, fake_procs, fake_spawn, monkeypatch
+    ):
+        monkeypatch.setattr(workers, "_max_workers", lambda: 1)
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        name_a = self._legacy_record(repo_a, 8823, fake_procs)
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo_b))
+        assert workers._read_record(name_a) is not None
+
+
 class TestRecordV2AndFencing:
     """Durable versioned records: legacy adoption, generation fencing,
     cross-process (flock) spawn serialization."""

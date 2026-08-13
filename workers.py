@@ -152,8 +152,8 @@ class WorkerRecord:
     leases: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
-def state_dir() -> Path:
-    """``<HERMES_HOME>/state/ghost_cursor/workers`` (profile-aware)."""
+def _profile_state_dir() -> Path:
+    """The pre-v2 PROFILE-local worker-state location (migration source)."""
     try:
         from hermes_constants import get_hermes_home
 
@@ -161,6 +161,60 @@ def state_dir() -> Path:
     except Exception:
         home = Path(os.environ.get("HERMES_HOME", "") or (Path.home() / ".hermes"))
     return home / "state" / "ghost_cursor" / "workers"
+
+
+# Migration is idempotent but cheap to skip: one pass per target dir per
+# process (tests re-point XDG_STATE_HOME per test and reset this).
+_migrated_dirs: set = set()
+
+
+def _reset_migration_for_tests() -> None:
+    _migrated_dirs.clear()
+
+
+def state_dir() -> Path:
+    """The MACHINE-global worker control directory.
+
+    Worker identity is machine-global (one worker per worktree per box;
+    systemd unit names are machine-global), so records, locks, and data
+    roots must be shared across Hermes profiles — otherwise profile B
+    reads profile A's live unit as an unmanaged remnant and stops it.
+    Session handles stay profile-local. Pre-v2 profile-local records are
+    migrated here by ADOPTION (copied, never killed) on first use.
+    """
+    base = os.environ.get("XDG_STATE_HOME", "").strip() or str(
+        Path.home() / ".local" / "state"
+    )
+    target = Path(base) / "ghost_cursor" / "workers"
+    key = str(target)
+    if key not in _migrated_dirs:
+        _migrated_dirs.add(key)
+        _migrate_profile_records(target)
+    return target
+
+
+def _migrate_profile_records(target: Path) -> None:
+    """Copy pre-v2 profile-local records into the machine-global control
+    dir (adoption: live workers keep running untouched; the originals are
+    left behind for any old plugin version still reading them). Never
+    raises."""
+    try:
+        source = _profile_state_dir()
+        if not source.is_dir() or source == target:
+            return
+        for path in source.glob("*.json"):
+            dest = target / path.name
+            if dest.exists():
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            dest.write_text(path.read_text("utf-8"), "utf-8")
+            logger.info(
+                "migrated profile-local worker record %s to the "
+                "machine-global control dir (adopted, not respawned)",
+                path.name,
+            )
+    except Exception:
+        logger.warning("worker record migration failed", exc_info=True)
 
 
 def worker_name_for(repo_path: str) -> str:
@@ -1153,6 +1207,12 @@ def reconcile(now: Optional[float] = None) -> List[str]:
                     _evict_locked(record, "process dead")
                     reaped.append(record.name)
                     continue
+                if record.supervision == "legacy":
+                    # A generation-0 worker may be serving a pre-v2 run
+                    # this controller cannot see (no lease protocol,
+                    # possibly another profile's session). Never TTL-reap
+                    # it; it retires at process death or respawn.
+                    continue
                 fresh = _fresh_leases(record, now)
                 if fresh != (record.leases or {}):
                     # Trim expired leases so the map cannot grow forever.
@@ -1212,7 +1272,12 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
     if len(others) < limit:
         return
     idle = sorted(
-        (r for r in others if not _fresh_leases(r, now)),
+        (
+            r for r in others
+            # Legacy workers may serve runs this controller cannot see —
+            # they are never reclaim candidates (they retire at death).
+            if r.supervision != "legacy" and not _fresh_leases(r, now)
+        ),
         key=lambda r: float(r.last_active_at or r.started_at),
     )
     need = len(others) - limit + 1
@@ -1233,17 +1298,21 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
             need -= 1
     if need > 0:
         busy = sorted(
-            f"{r.name} ({r.repo_path})"
+            f"{r.name} ({r.repo_path}"
+            + (", legacy" if r.supervision == "legacy" else "")
+            + ")"
             for r in live_workers()
-            if r.name != spawning_name and _fresh_leases(r, time.time())
+            if r.name != spawning_name
+            and (r.supervision == "legacy" or _fresh_leases(r, time.time()))
         )
         raise WorkerError(
             f"worker capacity exhausted: {len(busy)} of {limit} workers "
-            f"hold active run leases and none can be reclaimed for "
-            f"{real} — busy: {', '.join(busy) or '(none visible)'}. "
-            "Wait for a run to finish, stop one (cursor_stop), or raise "
-            "GHOST_CURSOR_MAX_WORKERS if your Cursor plan allows more "
-            "self-hosted workers."
+            f"are protected (active run lease or legacy) and none can be "
+            f"reclaimed for {real} — busy: "
+            f"{', '.join(busy) or '(none visible)'}. Wait for a run to "
+            "finish, stop one (cursor_stop), or raise "
+            "plugins.ghost_cursor.max_workers in config.yaml if your "
+            "Cursor plan allows more self-hosted workers."
         )
 
 
