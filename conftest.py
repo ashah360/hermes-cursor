@@ -24,12 +24,19 @@ _here = Path(__file__).parent
 def _ensure_plugin_package() -> None:
     try:
         import plugins.ghost_cursor  # noqa: F401  (real package in a Hermes tree)
-        return
+        # A REAL package has __file__; an empty stub directory in a Hermes
+        # tree (e.g. plugins/ghost_cursor/ holding only a .pytest_cache)
+        # imports as a NAMESPACE package (__file__ is None) and would
+        # shadow the shim — fall through and replace it in that case.
+        if getattr(sys.modules["plugins.ghost_cursor"], "__file__", None):
+            return
+        del sys.modules["plugins.ghost_cursor"]
     except ModuleNotFoundError:
-        # Only shim when this conftest actually sits beside the plugin sources
-        # (standalone repo layout), never from a copied spot in a Hermes tree.
-        if not (_here / "cloud_runner.py").is_file():
-            raise
+        pass
+    # Only shim when this conftest actually sits beside the plugin sources
+    # (standalone repo layout), never from a copied spot in a Hermes tree.
+    if not (_here / "cloud_runner.py").is_file():
+        raise ModuleNotFoundError("plugins.ghost_cursor")
     import importlib.util
     import types
 
