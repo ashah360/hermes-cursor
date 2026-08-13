@@ -645,8 +645,10 @@ def _record_alive(record: WorkerRecord) -> bool:
 
 def live_workers() -> List[WorkerRecord]:
     """Every managed worker whose process is still alive. Dead records
-    are cleaned up as they are discovered (lazy cleanup, under the
-    per-worker flock so a spawner is never raced)."""
+    are cleaned up as they are discovered (lazy cleanup, under a
+    NON-BLOCKING per-worker flock: a contended worker is someone else's
+    business right now — callers may already hold their own worker's
+    flock, and blocking here could deadlock two at-capacity spawners)."""
     directory = state_dir()
     if not directory.is_dir():
         return []
@@ -658,7 +660,9 @@ def live_workers() -> List[WorkerRecord]:
         if _record_alive(record):
             records.append(record)
         else:
-            with _worker_lock(record.name):
+            with _try_worker_lock(record.name) as acquired:
+                if not acquired:
+                    continue
                 current = _read_record(record.name)
                 if current is not None and not _record_alive(current):
                     logger.info(
@@ -829,7 +833,13 @@ def ensure_worker(repo_path: str) -> WorkerRecord:
         if record is not None:
             if _record_alive(record) and record.state != STATE_FAILED:
                 if record.state == STATE_READY:
-                    return record
+                    # Bump the idle clock at hand-out: the caller is about
+                    # to lease this worker, and the reaper must not win
+                    # the ensure→lease window against a TTL-stale record.
+                    _update_record_locked(
+                        name, record.generation, last_active_at=time.time(),
+                    )
+                    return _read_record(name) or record
                 return _revalidate_ready(record)
             logger.info(
                 "worker %s (pid %d) is dead — respawning", name, record.pid
@@ -1133,7 +1143,9 @@ def reconcile(now: Optional[float] = None) -> List[str]:
         return reaped
     for path in sorted(directory.glob("*.json")):
         try:
-            with _worker_lock(path.stem):
+            with _try_worker_lock(path.stem) as acquired:
+                if not acquired:
+                    continue  # someone is actively touching it — next tick
                 record = _read_record(path.stem)
                 if record is None:
                     continue
