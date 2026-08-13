@@ -808,14 +808,20 @@ class SessionSupervisor:
             "result": result,
             "cursor_session_id": str(entry.get("cursor_session_id") or ""),
         }
+        # Producer-stable, unique per settled attempt: consumers dedupe
+        # async completions by (delegation_id, type) for their lifetime,
+        # so a plain session name would suppress every follow-up run's
+        # terminal delivery. Stable across retries of the SAME settle
+        # (the attempt id does not change within this supervisor).
+        done_id = f"{name}#done-{self._attempt_id or 'reattached'}"
         for session_key in recipients:
             _enqueue_completion_event({
                 **base_evt,
                 "session_key": session_key,
                 "delegation_id": (
-                    name
+                    done_id
                     if session_key == dispatcher
-                    else f"{name}@{_subscriber_suffix(session_key)}"
+                    else f"{done_id}@{_subscriber_suffix(session_key)}"
                 ),
             })
 

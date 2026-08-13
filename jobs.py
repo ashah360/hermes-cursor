@@ -617,10 +617,17 @@ class CursorJobRegistry:
         when unsubscribed — the dispatcher's completion must never be lost
         — and recipients are deduped by session_key (the dispatcher is
         normally auto-subscribed; CLI/"" subscribers collapse to one copy).
-        The dispatcher's copy keeps the plain session name as its
-        delegation_id (the pre-fan-out scheme); other subscribers' copies
-        get a short subscriber-key hash suffix so the TUI's
-        (delegation_id, type) dedup can't swallow them.
+
+        Delegation ids are producer-stable AND unique per RUN:
+        ``<session>#done-<job_id>`` (plus a subscriber-key hash suffix for
+        non-dispatcher copies). Consumers dedupe async completions by
+        (delegation_id, type) for their whole lifetime, so a PLAIN
+        session name here meant the first run on a session delivered and
+        every follow-up's terminal completion was silently swallowed
+        (verified live: the Cursor app showed completion, Slack never
+        did). The job_id keeps retries of the SAME completion idempotent
+        while distinct runs stay distinct; the human-visible session
+        title is unchanged (it rides in goal/summary).
         """
         try:
             from tools.process_registry import process_registry
@@ -639,6 +646,8 @@ class CursorJobRegistry:
         recipients = sorted({str(k or "") for k in subscribers} | {dispatcher})
 
         base_id = job.session_name or job.cursor_session_id or job.job_id
+        # Stable per-run terminal id — see the docstring above.
+        done_id = f"{base_id}#done-{job.job_id}"
         payload_result = trim_result(result)
         base_evt = {
             "type": "async_delegation",
@@ -667,9 +676,9 @@ class CursorJobRegistry:
                 **base_evt,
                 "session_key": session_key,
                 "delegation_id": (
-                    base_id
+                    done_id
                     if session_key == dispatcher
-                    else f"{base_id}@{_progress.subscriber_suffix(session_key)}"
+                    else f"{done_id}@{_progress.subscriber_suffix(session_key)}"
                 ),
             }
             try:

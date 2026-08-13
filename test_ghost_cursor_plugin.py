@@ -415,7 +415,7 @@ class TestFirstSendRun:
         assert len(events) == 1
         evt = events[0]
         assert evt["type"] == "async_delegation"
-        assert evt["delegation_id"] == job.session_name
+        assert evt["delegation_id"] == f"{job.session_name}#done-{job.job_id}"
         assert evt["session_key"] == "gw:test:1"  # routes back to the caller
         assert evt["status"] == "completed"
         assert evt["cursor_session_id"] == "s-done"
@@ -809,7 +809,45 @@ class TestCursorSendMessage:
         events = _drain_completion_queue()
         assert len(events) == 1
         assert events[0]["result"]["session_id"] == "s-send"
-        assert events[0]["delegation_id"] == name
+        assert events[0]["delegation_id"] == (
+            f"{name}#done-{second_job.job_id}"
+        )
+
+    def test_sequential_completions_have_distinct_stable_delegation_ids(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Gateway delivery dedupes async completions by delegation_id
+        for its whole lifetime: two sequential runs on ONE session must
+        emit DISTINCT terminal ids (else the second is swallowed —
+        the confirmed missing-Slack-delivery bug), while a retry of the
+        SAME completion keeps the same id (producer-stable)."""
+        seq = _SdkSequence(
+            _gated_replay_factory(_preset_event(), sid="s-seq"),
+            _gated_replay_factory(_preset_event(), sid="s-seq"),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        cursor_send_message(name, "first task")
+        first_job = gc_jobs.registry.get_by_name(name)
+        assert first_job.done_event.wait(10)
+        first = _completion_events(_drain_completion_queue())
+
+        cursor_send_message(name, "second task")
+        second_job = gc_jobs.registry.get_by_name(name)
+        assert second_job is not first_job
+        assert second_job.done_event.wait(10)
+        second = _completion_events(_drain_completion_queue())
+
+        assert len(first) == 1 and len(second) == 1
+        id_1, id_2 = first[0]["delegation_id"], second[0]["delegation_id"]
+        assert id_1 != id_2, "follow-up completion would be deduped away"
+        # Producer-stable: recomputable from the run identity, so a retry
+        # of the SAME completion carries the SAME id.
+        assert id_1 == f"{name}#done-{first_job.job_id}"
+        assert id_2 == f"{name}#done-{second_job.job_id}"
+        # The human-visible session title is unchanged in both.
+        assert f"'{name}'" in second[0]["summary"] or name in second[0]["summary"]
 
     def test_send_after_run_settled_is_a_plain_followup(
         self, clean_state, monkeypatch, tmp_path
@@ -2137,7 +2175,7 @@ class TestProgressSubscriptions:
         completions = _completion_events(collected)
         assert len(completions) == 1
         assert completions[0]["status"] == "completed"
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#done-{job.job_id}"
         assert len(_digest_events(collected)) >= 2
 
     def test_interrupt_and_reprompt_carries_subscription_and_numbering(
@@ -2856,11 +2894,14 @@ class TestMultiSubscriberDelivery:
         assert len(completions) == 2
         by_key = {c["session_key"]: c for c in completions}
         assert set(by_key) == {"gw:alice", "gw:bob"}
-        # Distinct delegation_ids (TUI dedup): the dispatcher keeps the
-        # plain session name, other subscribers get the hash suffix.
-        assert by_key["gw:alice"]["delegation_id"] == name
+        # Distinct delegation_ids (TUI dedup): stable per-run done id
+        # for the dispatcher, hash-suffixed copies for other subscribers.
+        assert by_key["gw:alice"]["delegation_id"] == (
+            f"{name}#done-{job.job_id}"
+        )
         assert by_key["gw:bob"]["delegation_id"] == (
-            f"{name}@{gc_progress.subscriber_suffix('gw:bob')}"
+            f"{name}#done-{job.job_id}"
+            f"@{gc_progress.subscriber_suffix('gw:bob')}"
         )
         # Identical payloads apart from routing.
         assert by_key["gw:alice"]["status"] == "completed"
@@ -2931,7 +2972,7 @@ class TestMultiSubscriberDelivery:
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         assert completions[0]["session_key"] == ""
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#done-{job.job_id}"
 
     # -- legacy scalar migration ---------------------------------------------
 
@@ -6818,7 +6859,7 @@ class TestSupervisorReattach:
         evt = completions[0]
         assert evt["status"] == "completed"
         assert evt["session_key"] == ""
-        assert evt["delegation_id"] == name
+        assert evt["delegation_id"].startswith(f"{name}#done-")
         assert "all done" in evt["summary"]
 
     def test_replayed_finished_never_beats_the_gets_cancelled(
@@ -6871,8 +6912,10 @@ class TestSupervisorReattach:
         assert len(completions) == 2
         by_key = {e["session_key"]: e for e in completions}
         assert set(by_key) == {"", "alice"}
-        assert by_key[""]["delegation_id"] == name
-        assert by_key["alice"]["delegation_id"] != name  # suffixed copy
+        dispatcher_id = by_key[""]["delegation_id"]
+        assert dispatcher_id.startswith(f"{name}#done-")
+        assert by_key["alice"]["delegation_id"].startswith(dispatcher_id)
+        assert by_key["alice"]["delegation_id"] != dispatcher_id  # suffixed
 
         # A second reconcile pass finds nothing live: settled is settled.
         assert gc_supervisor.reconcile_once() == []
