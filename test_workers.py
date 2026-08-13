@@ -412,9 +412,10 @@ class TestRecordV2AndFencing:
         current_gen = record.generation
         assert current_gen
 
-        ok = workers._update_record(
-            record.name, "gen-someone-else", last_error="stale writer"
-        )
+        with workers._worker_lock(record.name):
+            ok = workers._update_record_locked(
+                record.name, "gen-someone-else", last_error="stale writer"
+            )
         assert ok is False
         persisted = workers._read_record(record.name)
         assert persisted.generation == current_gen
@@ -725,10 +726,11 @@ class TestLeasesAndReaping:
 
     def _backdate(self, name, seconds):
         record = workers._read_record(name)
-        workers._update_record(
-            name, record.generation,
-            last_active_at=record.last_active_at - seconds,
-        )
+        with workers._worker_lock(name):
+            workers._update_record_locked(
+                name, record.generation,
+                last_active_at=record.last_active_at - seconds,
+            )
 
     def test_reaper_never_evicts_a_leased_worker(self, tmp_path, fake_spawn):
         repo = tmp_path / "repo"
@@ -774,9 +776,10 @@ class TestLeasesAndReaping:
         stale = dict(rec.leases["run-crashed"])
         stale["holder_pid"] = 999999999  # never alive
         stale["acquired_at"] = stale["acquired_at"] - workers.LEASE_STALE_GRACE_S * 10
-        workers._update_record(
-            record.name, rec.generation, leases={"run-crashed": stale},
-        )
+        with workers._worker_lock(record.name):
+            workers._update_record_locked(
+                record.name, rec.generation, leases={"run-crashed": stale},
+            )
         self._backdate(record.name, workers.IDLE_TTL_S * 10)
 
         assert workers.reconcile() == [record.name]

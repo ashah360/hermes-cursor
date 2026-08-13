@@ -128,9 +128,9 @@ class WorkerRecord:
     transient-service identity (or the degraded detached fallback),
     ``data_dir`` is the worker's isolated ``CURSOR_DATA_DIR``,
     ``management_addr`` the CLI's health/readiness endpoint, ``pid_birth``
-    the /proc starttime pid-reuse fence, ``log_offset`` the byte position
-    readiness evidence must appear AFTER (generation-scoped readiness),
-    and ``leases`` the per-RUN leases that protect the worker from the
+    the /proc starttime pid-reuse fence (readiness evidence is
+    generation-scoped structurally: each generation logs to its own
+    file), and ``leases`` the per-RUN leases that protect the worker from the
     idle reaper. A v1 record (no ``version``) is adopted on read — never
     killed — as supervision="legacy".
     """
@@ -149,10 +149,8 @@ class WorkerRecord:
     management_addr: str = ""
     pid_birth: Optional[int] = None
     state: str = STATE_READY
-    ready_at: Optional[float] = None
     last_active_at: float = 0.0
     last_error: str = ""
-    log_offset: int = 0
     leases: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -534,25 +532,6 @@ def _spawn_worker(
         cli, name, repo_path,
         data_dir=data_dir, management_addr=management_addr,
     )
-    # Temporary CI spawn diagnostics (GHOST_CURSOR_SPAWN_DIAG=1).
-    diag = (
-        Path(os.environ.get("RUNNER_TEMP") or "/tmp") / f"gc-spawn-diag-{name}.txt"
-        if os.environ.get("GHOST_CURSOR_SPAWN_DIAG")
-        else None
-    )
-    if diag is not None:
-        argv = ["bash", "-c", f'echo "wrapper up pid=$$" >> "{diag}"; exec "$@"', "bash", *argv]
-        redacted = {
-            key: (f"<redacted len={len(value)}>" if re.search(r"KEY|TOKEN|SECRET|PASSWORD", key) else value)
-            for key, value in sorted(env.items())
-        }
-        diag.write_text(
-            json.dumps(
-                {"cli": cli, "cwd": str(repo_path), "argv": argv, "env": redacted},
-                indent=1,
-            )
-            + "\n"
-        )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log_file:
         proc = subprocess.Popen(
@@ -564,21 +543,6 @@ def _spawn_worker(
             env=env,
             start_new_session=True,
         )
-    if diag is not None:
-        time.sleep(2.0)
-        exit_status = proc.poll()  # authoritative: reaps if it exited
-        ps = subprocess.run(
-            ["ps", "-ww", "-p", str(proc.pid), "-o", "stat=,command="],
-            capture_output=True, text=True,
-        )
-        log_bytes = log_path.stat().st_size if log_path.exists() else -1
-        with open(diag, "a") as fh:
-            fh.write(
-                f"after 2s: pid={proc.pid} poll={exit_status} "
-                f"pid_alive={_pid_alive(proc.pid)} ps_rc={ps.returncode} "
-                f"ps={ps.stdout.strip()!r} log_bytes={log_bytes}\n"
-                f"log: {_log_tail(log_path)!r}\n"
-            )
     return proc.pid
 
 
@@ -687,14 +651,8 @@ def _read_record(name: str) -> Optional[WorkerRecord]:
                 else None
             ),
             state=str(data.get("state") or STATE_READY),
-            ready_at=(
-                float(data["ready_at"])
-                if data.get("ready_at") is not None
-                else None
-            ),
             last_active_at=float(data.get("last_active_at") or 0.0),
             last_error=str(data.get("last_error") or ""),
-            log_offset=int(data.get("log_offset") or 0),
             leases=dict(leases) if isinstance(leases, dict) else {},
         )
     except FileNotFoundError:
@@ -714,19 +672,6 @@ def _write_record(record: WorkerRecord) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(asdict(record)), "utf-8")
     tmp.replace(path)
-
-
-def _update_record(name: str, expected_generation: str, **fields: Any) -> bool:
-    """Fenced read-modify-write: merge ``fields`` into the record ONLY
-    when its generation still equals ``expected_generation``.
-
-    Returns False (and writes nothing) when the record is gone or another
-    generation owns it — a failed/losing generation can never overwrite
-    the authoritative record. Takes the worker flock itself; do not call
-    while already holding it (use :func:`_update_record_locked`).
-    """
-    with _worker_lock(name):
-        return _update_record_locked(name, expected_generation, **fields)
 
 
 def _update_record_locked(
@@ -805,34 +750,29 @@ def _log_tail(log_path: Path) -> str:
         return ""
 
 
-def _log_since(log_path: Path, offset: int) -> str:
-    """The log content written AFTER ``offset`` — the only bytes that
-    count as THIS generation's evidence (stale-readiness fix: an old
-    incarnation's ready line must never prove a fresh spawn). A file now
-    SHORTER than the offset was truncated/rotated since the spawn — all
-    of its content is newer than the offset, so it all counts."""
+def _log_head(log_path: Path, limit: int = 262_144) -> str:
+    """The first ``limit`` bytes of a log (the CLI prints its readiness
+    line at startup, so the head is where evidence lives)."""
     try:
-        offset = max(int(offset), 0)
-        if log_path.stat().st_size < offset:
-            offset = 0
         with log_path.open("rb") as fh:
-            fh.seek(offset)
-            return fh.read().decode("utf-8", errors="replace")
+            return fh.read(limit).decode("utf-8", errors="replace")
     except Exception:
         return ""
 
 
 def _ready_evidence(record: WorkerRecord) -> bool:
-    """Whether THIS generation has produced readiness evidence."""
-    return READY_LINE in _log_since(Path(record.log_path), record.log_offset)
+    """Whether THIS generation has produced readiness evidence. Each
+    generation logs to its own file, so scoping is structural."""
+    return READY_LINE in _log_head(Path(record.log_path))
 
 
 def _wait_ready(record: WorkerRecord) -> None:
     """Poll for THIS generation's readiness, bounded by READY_TIMEOUT_S.
 
-    Evidence is generation-scoped: only log content past the spawn-time
-    ``log_offset`` counts. Raises :class:`WorkerError` on startup death
-    or timeout; the caller persists the failure onto the record.
+    Evidence is generation-scoped structurally (each generation logs to
+    its own file, and the management probe hits this generation's
+    endpoint). Raises :class:`WorkerError` on startup death or timeout;
+    the caller persists the failure onto the record.
     """
     log_path = Path(record.log_path)
     deadline = time.monotonic() + READY_TIMEOUT_S
@@ -847,7 +787,7 @@ def _wait_ready(record: WorkerRecord) -> None:
         if dead_reads >= 2:
             raise WorkerError(
                 f"worker '{record.name}' exited during startup — log tail:\n"
-                f"{_log_since(log_path, record.log_offset) or _log_tail(log_path) or '(empty log)'}"
+                f"{_log_tail(log_path) or '(empty log)'}"
             )
         time.sleep(_READY_POLL_S)
     # The process is still alive but never reported ready. It is NOT
@@ -857,7 +797,7 @@ def _wait_ready(record: WorkerRecord) -> None:
     raise WorkerError(
         f"worker '{record.name}' did not report ready within "
         f"{int(READY_TIMEOUT_S)}s — log tail:\n"
-        f"{_log_since(log_path, record.log_offset) or '(empty log)'}"
+        f"{_log_tail(log_path) or '(empty log)'}"
     )
 
 

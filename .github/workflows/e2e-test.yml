@@ -99,14 +99,9 @@ jobs:
           uv run --with pytest --with pytest-timeout --with httpx pytest tests/plugins/e2e/test_e2e.py -q -v \
             -p no:cacheprovider --timeout=300 --timeout-method=thread
 
-      - name: Spawn diagnostics (temporary — GHOST_CURSOR_SPAWN_DIAG)
+      - name: Worker diagnostics
         if: always()
         run: |
-          echo "=== diag files ==="
-          for f in "$RUNNER_TEMP"/gc-spawn-diag-*.txt; do
-            [ -e "$f" ] || { echo "(none)"; break; }
-            echo "--- $f"; cat "$f"
-          done
           echo "=== plugin worker logs ==="
           find /tmp/pytest-of-runner -path '*ghost_cursor/workers*' -name '*.log' \
             -exec sh -c 'echo "--- $1 ($(wc -c < "$1") bytes)"; tail -c 2000 "$1"' _ {} \; 2>/dev/null || true
