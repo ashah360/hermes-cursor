@@ -698,8 +698,8 @@ class TestSystemdOwnershipVerification:
         cmd = workers._systemd_run_command(
             "cursor-worker-w.service",
             ["/usr/bin/agent", "worker", "start", "--name", "w"],
-            {"CURSOR_DATA_DIR": "/state/data/w", "PATH": "/usr/bin",
-             "HOME": "/home/u", "IRRELEVANT": "x"},
+            {"CURSOR_DATA_DIR": "/state/data/w", "CURSOR_API_KEY": "cursor-key",
+             "PATH": "/usr/bin", "HOME": "/home/u", "IRRELEVANT": "x"},
             "/repo",
             Path("/state/w-gen.log"),
         )
@@ -713,6 +713,7 @@ class TestSystemdOwnershipVerification:
         assert "--property=StandardOutput=append:/state/w-gen.log" in cmd
         assert "--working-directory=/repo" in cmd
         assert "--setenv=CURSOR_DATA_DIR=/state/data/w" in cmd
+        assert "--setenv=CURSOR_API_KEY=cursor-key" in cmd
         assert "--setenv=IRRELEVANT=x" not in cmd  # only the allowlist
         # The payload argv rides verbatim after the `--` separator.
         assert cmd[cmd.index("--"):] == [

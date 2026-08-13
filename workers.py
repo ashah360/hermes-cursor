@@ -540,7 +540,10 @@ def _systemd_run_command(
         f"--property=StandardError=append:{log_path}",
         f"--working-directory={cwd}",
     ]
-    for key in ("CURSOR_DATA_DIR", "PATH", "HOME"):
+    # The transient service has a fresh environment.  Cursor's worker mode
+    # needs the same API key as the REST control plane; without it an isolated
+    # data directory has no persisted login and startup fails before routing.
+    for key in ("CURSOR_DATA_DIR", "CURSOR_API_KEY", "PATH", "HOME"):
         if key in env:
             cmd.append(f"--setenv={key}={env[key]}")
     return cmd + ["--", *argv]
