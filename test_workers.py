@@ -1,12 +1,76 @@
-"""Tests for workers.py — the detached worker manager, with a faked
-process table (``_pid_alive``) and a faked spawner (``_spawn_worker``)."""
+"""Tests for workers.py — the worker controller, with a faked process
+table (``_pid_alive``) and a faked spawner (``_spawn_worker``)."""
 
 import json
 import os
+import subprocess
 
 import pytest
 
 from plugins.ghost_cursor import workers
+
+
+def _git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=str(cwd), check=True, capture_output=True,
+    )
+
+
+def _make_repo(path):
+    """A real git repo with one commit (worktrees need a commit)."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", "-b", "main", cwd=path)
+    (path / "seed.txt").write_text("seed\n")
+    _git("add", ".", cwd=path)
+    _git("commit", "-q", "-m", "seed", cwd=path)
+    return path
+
+
+class TestCanonicalIdentity:
+    """Canonical identity = realpath(git rev-parse --show-toplevel).
+
+    Governing invariants: a subdirectory keys the SAME worker as its
+    worktree root; sibling linked worktrees of one repository stay
+    DISTINCT; non-git directories degrade to their realpath.
+    """
+
+    def test_subdir_resolves_to_worktree_toplevel(self, tmp_path):
+        repo = _make_repo(tmp_path / "repo")
+        sub = repo / "src" / "nested"
+        sub.mkdir(parents=True)
+        assert workers.canonical_repo_path(str(sub)) == os.path.realpath(repo)
+        assert workers.worker_name_for(str(sub)) == workers.worker_name_for(
+            str(repo)
+        )
+
+    def test_sibling_worktrees_stay_distinct(self, tmp_path):
+        repo = _make_repo(tmp_path / "repo")
+        wt = tmp_path / "wt-feature"
+        _git("worktree", "add", "-q", str(wt), "-b", "feature", cwd=repo)
+        assert workers.canonical_repo_path(str(wt)) == os.path.realpath(wt)
+        assert workers.canonical_repo_path(str(wt)) != (
+            workers.canonical_repo_path(str(repo))
+        )
+        # A subdir of the linked worktree keys the WORKTREE, not the repo.
+        sub = wt / "sub"
+        sub.mkdir()
+        assert workers.canonical_repo_path(str(sub)) == os.path.realpath(wt)
+
+    def test_non_git_dir_falls_back_to_realpath(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        assert workers.canonical_repo_path(str(plain)) == os.path.realpath(
+            plain
+        )
+
+    def test_symlink_to_worktree_resolves(self, tmp_path):
+        repo = _make_repo(tmp_path / "repo")
+        link = tmp_path / "link"
+        link.symlink_to(repo)
+        assert workers.canonical_repo_path(str(link)) == os.path.realpath(
+            repo
+        )
 
 
 @pytest.fixture

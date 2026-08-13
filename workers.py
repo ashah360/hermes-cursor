@@ -62,6 +62,29 @@ class WorkerError(RuntimeError):
     """Worker spawn/registration failure — actionable message, no worker."""
 
 
+def canonical_repo_path(path: str) -> str:
+    """The canonical worktree identity for a local path.
+
+    ``realpath(git rev-parse --show-toplevel)``: a subdirectory keys the
+    same worker (and admission identity) as its worktree root, while
+    sibling linked worktrees of one repository stay distinct (rev-parse
+    returns the WORKTREE root, not the main checkout). Non-git paths
+    degrade to their plain realpath. Never raises.
+    """
+    real = os.path.realpath(str(path))
+    try:
+        proc = subprocess.run(
+            ["git", "-C", real, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+        top = (proc.stdout or "").strip()
+        if proc.returncode == 0 and top:
+            return os.path.realpath(top)
+    except Exception:
+        logger.debug("canonical_repo_path git probe failed", exc_info=True)
+    return real
+
+
 @dataclass
 class WorkerRecord:
     """One managed worker (the persisted ``<name>.json`` shape)."""
@@ -86,10 +109,10 @@ def state_dir() -> Path:
 
 
 def worker_name_for(repo_path: str) -> str:
-    """Deterministic worker name for a checkout: one worker per realpath
-    per box. The hostname slug keeps names readable in cursor.com's
-    machine list; the hash pins the exact checkout."""
-    real = os.path.realpath(str(repo_path))
+    """Deterministic worker name for a worktree: one worker per canonical
+    worktree per box. The hostname slug keeps names readable in
+    cursor.com's machine list; the hash pins the exact worktree."""
+    real = canonical_repo_path(repo_path)
     digest = hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
     host = re.sub(r"[^a-z0-9]+", "-", socket.gethostname().lower()).strip("-")
     return f"{host[:24] or 'host'}-{digest}"
@@ -317,11 +340,11 @@ def ensure_worker(repo_path: str) -> WorkerRecord:
     """The live worker serving ``repo_path``, spawning one when needed.
 
     Reuse first (the common case, and the second-worker trap avoider):
-    a live managed worker for this exact checkout is returned as-is. A
+    a live managed worker for this exact worktree is returned as-is. A
     dead record is cleaned and replaced. Raises :class:`WorkerError` when
     the spawn fails or never reports ready.
     """
-    real = os.path.realpath(str(repo_path))
+    real = canonical_repo_path(repo_path)
     name = worker_name_for(real)
 
     record = _read_record(name)

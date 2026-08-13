@@ -37,6 +37,8 @@ No live cursor runs.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -1392,6 +1394,81 @@ class TestSameRepoConcurrency:
         second = _start_run("t2", repo=str(tmp_path))
         assert "already running" not in second  # no rejection once settled
         assert _job_for("s-two").done_event.wait(10)
+
+
+def _make_git_repo(path):
+    """A real git repo with one commit (linked worktrees need one)."""
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("add", "."),
+        ("commit", "-q", "--allow-empty", "-m", "seed"),
+    ):
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=str(path), check=True, capture_output=True,
+        )
+    return path
+
+
+class TestCanonicalWorktreeIdentity:
+    """Canonical identity = realpath(git rev-parse --show-toplevel) at the
+    tool boundary: /repo and /repo/subdir are ONE admission identity (and
+    one persisted repo key); sibling linked worktrees stay distinct."""
+
+    def test_create_session_records_the_worktree_toplevel(
+        self, clean_state, tmp_path
+    ):
+        repo = _make_git_repo(tmp_path / "repo")
+        sub = repo / "src" / "inner"
+        sub.mkdir(parents=True)
+        name = _created_name(cursor_create_session(repo=str(sub)))
+        assert gc_handles.get(name)["repo"] == os.path.realpath(repo)
+
+    def test_subdir_and_toplevel_share_one_admission_identity(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        repo = _make_git_repo(tmp_path / "repo")
+        sub = repo / "src"
+        sub.mkdir()
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-top")
+        )
+        first = _start_run("task at toplevel", repo=str(repo))
+        try:
+            _assert_running_ack(first)
+            second = _start_run("task at subdir", repo=str(sub))
+            assert "cannot start" in second
+            assert "already running" in second
+        finally:
+            release.set()
+        assert _job_for("s-top").done_event.wait(10)
+
+    def test_sibling_worktrees_run_concurrently(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        repo = _make_git_repo(tmp_path / "repo")
+        wt = tmp_path / "wt-feature"
+        subprocess.run(
+            ["git", "worktree", "add", "-q", str(wt), "-b", "feature"],
+            cwd=str(repo), check=True, capture_output=True,
+        )
+        release = threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release, sid="s-main", early_edit=False),
+            _gated_replay_factory(release, sid="s-wt", early_edit=False),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+        res_main = _start_run("main task", repo=str(repo))
+        res_wt = _start_run("worktree task", repo=str(wt))
+        try:
+            _assert_running_ack(res_main)
+            _assert_running_ack(res_wt)
+        finally:
+            release.set()
+        for sid in ("s-main", "s-wt"):
+            assert _job_for(sid).done_event.wait(10)
 
 
 # ---------------------------------------------------------------------------

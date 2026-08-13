@@ -1066,7 +1066,9 @@ def run_cloud(
         derived_url, derived_ref = workdir_str, None
     else:
         workdir = resolve_repo(repo)
-        workdir_str = str(workdir)
+        # Canonical worktree identity: worker naming, admission, and the
+        # execution cwd all key the worktree TOPLEVEL, never a subdir.
+        workdir_str = _workers.canonical_repo_path(str(workdir))
         if repo_url and starting_ref:
             derived_url, derived_ref = repo_url, starting_ref
         else:

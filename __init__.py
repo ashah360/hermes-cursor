@@ -99,6 +99,7 @@ from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
 from . import supervisor as _supervisor
+from . import workers as _workers
 
 logger = logging.getLogger(__name__)
 
@@ -1259,6 +1260,11 @@ def _send_to_session(
             "status": "failed",
             "error": f"session '{name}' has no repo recorded",
         }
+    # Canonicalize local paths on the way out: handles recorded before
+    # the canonical-identity change may hold a subdir; the dispatch key
+    # (and execution cwd) must be the worktree toplevel.
+    if _cloud.normalize_github_url(repo) is None and os.path.isdir(repo):
+        repo = _workers.canonical_repo_path(repo)
     # runtime=cloud sessions may record a github URL as their repo — no
     # local checkout to verify. Local paths must still exist.
     if _cloud.normalize_github_url(repo) is None and not os.path.isdir(repo):
@@ -1519,7 +1525,10 @@ def cursor_create_session(
             workdir = _runner.resolve_repo(target_repo)
         except _runner.HarnessError as exc:
             return f"cannot create session: {exc}"
-        workdir_str = str(workdir)
+        # Canonical worktree identity: /repo and /repo/subdir are ONE
+        # session/admission/worker identity (sibling git worktrees stay
+        # distinct — rev-parse returns the worktree root).
+        workdir_str = _workers.canonical_repo_path(str(workdir))
         try:
             # Eager git introspection (local checkouts): a repo without a
             # github origin (or on a detached HEAD) can never dispatch, so
