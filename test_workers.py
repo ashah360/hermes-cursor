@@ -87,9 +87,11 @@ def fake_spawn(monkeypatch, fake_procs):
     writes the ready line to the log immediately."""
     calls = []
 
-    def spawn(name, repo_path, log_path):
+    def spawn(name, repo_path, log_path, **kw):
         pid = 1000 + len(calls)
-        calls.append({"name": name, "repo_path": repo_path, "log_path": log_path})
+        calls.append({
+            "name": name, "repo_path": repo_path, "log_path": log_path, **kw,
+        })
         fake_procs.add(pid)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(f"registering...\n{workers.READY_LINE}\n")
@@ -103,6 +105,54 @@ def fake_spawn(monkeypatch, fake_procs):
 def fast_ready(monkeypatch):
     monkeypatch.setattr(workers, "READY_TIMEOUT_S", 1.0)
     monkeypatch.setattr(workers, "_READY_POLL_S", 0.01)
+
+
+@pytest.fixture(autouse=True)
+def no_systemd(monkeypatch):
+    """Tests never touch the host's real user systemd manager; the
+    systemd path is exercised through explicit fakes."""
+    monkeypatch.setattr(workers, "_systemd_available", lambda: False)
+
+
+@pytest.fixture
+def fake_systemd(monkeypatch, fake_procs):
+    """A fake user systemd manager: records started units, assigns
+    MainPIDs 9000..., mints invocation ids, tracks stops."""
+    state = {"started": [], "stopped": [], "units": {}}
+
+    def start(unit, argv, env, cwd, log_path):
+        pid = 9000 + len(state["started"])
+        state["started"].append({
+            "unit": unit, "argv": list(argv), "env": dict(env),
+            "cwd": cwd, "log_path": log_path,
+        })
+        state["units"][unit] = {
+            "ActiveState": "active",
+            "MainPID": str(pid),
+            "InvocationID": f"inv-{len(state['started']):04d}",
+        }
+        fake_procs.add(pid)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as fh:
+            fh.write(f"registering...\n{workers.READY_LINE}\n")
+
+    def show(unit):
+        return dict(state["units"].get(unit) or {
+            "ActiveState": "inactive", "MainPID": "0", "InvocationID": "",
+        })
+
+    def stop(unit):
+        state["stopped"].append(unit)
+        info = state["units"].pop(unit, None)
+        if info:
+            fake_procs.discard(int(info["MainPID"]))
+
+    monkeypatch.setattr(workers, "_systemd_available", lambda: True)
+    monkeypatch.setattr(workers, "_systemd_start", start)
+    monkeypatch.setattr(workers, "_systemd_show", show)
+    monkeypatch.setattr(workers, "_systemd_stop", stop)
+    monkeypatch.setattr(workers, "_linger_enabled", lambda: True)
+    return state
 
 
 class TestWorkerNames:
@@ -171,7 +221,7 @@ class TestEnsureWorker:
         repo = tmp_path / "repo"
         repo.mkdir()
 
-        def spawn_silent(name, repo_path, log_path):
+        def spawn_silent(name, repo_path, log_path, **kw):
             fake_procs.add(2000)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text("registering forever...\n")
@@ -187,7 +237,7 @@ class TestEnsureWorker:
         repo = tmp_path / "repo"
         repo.mkdir()
 
-        def spawn_dying(name, repo_path, log_path):
+        def spawn_dying(name, repo_path, log_path, **kw):
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text("fatal: not logged in\n")
             return 3000  # never added to fake_procs — already dead
@@ -206,7 +256,7 @@ class TestEnsureWorker:
         reads = iter([False])  # dead once, then alive forever
         monkeypatch.setattr(workers, "_pid_alive", lambda pid: next(reads, True))
 
-        def spawn_slow(name, repo_path, log_path):
+        def spawn_slow(name, repo_path, log_path, **kw):
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text("registering...\n")
             return 4000
@@ -282,7 +332,7 @@ class TestRecordV2AndFencing:
         repo.mkdir()
         calls = []
 
-        def slow_spawn(name, repo_path, log_path):
+        def slow_spawn(name, repo_path, log_path, **kw):
             _time.sleep(0.2)  # hold the lock long enough for a real race
             pid = 5000 + len(calls)
             calls.append(name)
@@ -325,7 +375,7 @@ class TestGenerationScopedReadiness:
         # Evidence from a PREVIOUS incarnation, within tail range.
         log.write_text(f"old boot...\n{workers.READY_LINE}\nStopping worker\n")
 
-        def spawn_never_ready(name, repo_path, log_path):
+        def spawn_never_ready(name, repo_path, log_path, **kw):
             fake_procs.add(6001)
             with open(log_path, "a") as fh:
                 fh.write("registering fresh generation...\n")
@@ -346,7 +396,7 @@ class TestGenerationScopedReadiness:
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text(f"old boot...\n{workers.READY_LINE}\n")
 
-        def spawn_ready(name, repo_path, log_path):
+        def spawn_ready(name, repo_path, log_path, **kw):
             fake_procs.add(6002)
             with open(log_path, "a") as fh:
                 fh.write(f"fresh boot...\n{workers.READY_LINE}\n")
@@ -356,6 +406,106 @@ class TestGenerationScopedReadiness:
         record = workers.ensure_worker(str(repo))
         assert record.pid == 6002
         assert record.state == "ready"
+
+
+class TestDataRootIsolation:
+    """Every worker gets its own deterministic CURSOR_DATA_DIR and its
+    own management endpoint — no two workers share either."""
+
+    def test_distinct_worktrees_get_distinct_data_roots_and_ports(
+        self, tmp_path, fake_spawn
+    ):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a))
+        rec_b = workers.ensure_worker(str(repo_b))
+        assert rec_a.data_dir and rec_b.data_dir
+        assert rec_a.data_dir != rec_b.data_dir
+        assert rec_a.data_dir == str(workers.state_dir() / "data" / rec_a.name)
+        assert rec_a.management_addr and rec_b.management_addr
+        assert rec_a.management_addr != rec_b.management_addr
+        assert rec_a.management_addr.startswith("127.0.0.1:")
+        # The spawner was handed the SAME isolation parameters.
+        assert fake_spawn[0]["data_dir"] == rec_a.data_dir
+        assert fake_spawn[0]["management_addr"] == rec_a.management_addr
+
+    def test_spawn_command_isolates_data_dir_and_management(self):
+        argv, env = workers._spawn_command(
+            "/usr/bin/agent", "w-name", "/repo",
+            data_dir="/state/data/w-name",
+            management_addr="127.0.0.1:42700",
+        )
+        assert argv[:4] == ["/usr/bin/agent", "worker", "start", "--name"]
+        assert "--worker-dir" in argv and "/repo" in argv
+        assert "--management-addr" in argv
+        assert argv[argv.index("--management-addr") + 1] == "127.0.0.1:42700"
+        assert env["CURSOR_DATA_DIR"] == "/state/data/w-name"
+        assert "LD_LIBRARY_PATH" not in env  # loader vars still stripped
+
+
+class TestSystemdSupervision:
+    def test_spawns_transient_service_with_deterministic_identity(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert record.supervision == "systemd"
+        assert record.unit == f"cursor-worker-{record.name}.service"
+        assert record.pid == 9000                # MainPID is authoritative
+        assert record.generation == "inv-0001"   # InvocationID = generation
+        assert record.state == workers.STATE_READY
+        started = fake_systemd["started"][0]
+        assert started["unit"] == record.unit
+        assert started["env"]["CURSOR_DATA_DIR"] == record.data_dir
+
+    def test_adopted_after_restart_without_respawn(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        # A fresh plugin process (nothing in memory) re-ensures: the
+        # persisted record + live unit are adopted, not respawned.
+        second = workers.ensure_worker(str(repo))
+        assert second.pid == first.pid
+        assert second.generation == first.generation
+        assert len(fake_systemd["started"]) == 1
+
+    def test_stop_generation_stops_the_unit(self, tmp_path, fake_systemd):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        stops_before = len(fake_systemd["stopped"])
+        with workers._worker_lock(record.name):
+            workers._stop_generation(record)
+        # Full-cgroup teardown goes through the unit — exactly one stop.
+        assert fake_systemd["stopped"][stops_before:] == [record.unit]
+
+    def test_dead_unit_respawns_new_generation(self, tmp_path, fake_systemd, fake_procs):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        fake_procs.discard(first.pid)  # the service died
+        fake_systemd["units"].pop(first.unit, None)
+        second = workers.ensure_worker(str(repo))
+        assert second.generation != first.generation
+        assert second.pid != first.pid
+        assert not second.verified  # routing proof does NOT carry over
+
+
+class TestDegradedFallback:
+    def test_no_user_systemd_falls_back_to_detached_and_says_so(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert record.supervision == "detached"
+        assert record.unit == ""
+        # Isolation still applies on the degraded path.
+        assert record.data_dir
+        assert record.management_addr
 
 
 class TestSpawnEnv:

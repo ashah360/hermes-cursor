@@ -210,8 +210,198 @@ def _spawn_env() -> Dict[str, str]:
     }
 
 
-def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
-    """Start ``agent worker start`` detached, output to ``log_path``.
+def _spawn_command(
+    cli: str,
+    name: str,
+    repo_path: str,
+    data_dir: str = "",
+    management_addr: str = "",
+) -> tuple:
+    """(argv, env) for one worker generation.
+
+    ``data_dir`` isolates the worker's ``CURSOR_DATA_DIR`` (the CLI takes
+    a SQLite BEGIN EXCLUSIVE on <data-dir>/worker.lock, so isolation is
+    what makes parallel worktrees possible; auth lives in the config dir
+    and stays shared). ``management_addr`` exposes the CLI's
+    /healthz /readyz /metrics endpoint (localhost only).
+    """
+    env = _spawn_env()
+    if data_dir:
+        env["CURSOR_DATA_DIR"] = str(data_dir)
+    argv = [cli, "worker", "start", "--name", name, "--worker-dir", str(repo_path)]
+    if management_addr:
+        argv += ["--management-addr", str(management_addr)]
+    return argv, env
+
+
+# ---------------------------------------------------------------------------
+# User-systemd transient services (seams — tests fake these four)
+# ---------------------------------------------------------------------------
+
+UNIT_PREFIX = "cursor-worker-"
+# Bounded full-cgroup stop: systemd escalates TERM → KILL at this bound.
+STOP_TIMEOUT_S = 20
+# How long a started unit may take to expose a MainPID.
+_UNIT_PID_WAIT_S = 10.0
+
+_SYSTEMCTL_TIMEOUT_S = 30
+
+
+def _unit_name(worker_name: str) -> str:
+    return f"{UNIT_PREFIX}{worker_name}.service"
+
+
+def _run_systemctl(args: List[str], timeout: float = _SYSTEMCTL_TIMEOUT_S):
+    return subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _systemd_available() -> bool:
+    """Whether the per-user systemd manager can own worker services."""
+    try:
+        proc = _run_systemctl(
+            ["systemctl", "--user", "is-system-running"], timeout=10
+        )
+        return (proc.stdout or "").strip() in ("running", "degraded")
+    except Exception:
+        return False
+
+
+def _linger_enabled() -> Optional[bool]:
+    """Whether the user session lingers (units survive logout). None when
+    undeterminable. Advisory: surfaced as a warning, never a hard fail."""
+    try:
+        proc = _run_systemctl(
+            ["loginctl", "show-user", os.environ.get("USER") or str(os.getuid()),
+             "--property=Linger"], timeout=10,
+        )
+        out = (proc.stdout or "").strip()
+        if out.startswith("Linger="):
+            return out == "Linger=yes"
+    except Exception:
+        pass
+    return None
+
+
+def _systemd_start(
+    unit: str, argv: List[str], env: Dict[str, str], cwd: str, log_path: Path
+) -> None:
+    """Start ``argv`` as a transient user service (no unit file).
+
+    The user manager forks the worker — zero process-tree coupling to
+    the gateway. KillMode=control-group + TimeoutStopSec give bounded
+    full-cgroup teardown; Restart=no keeps respawn decisions in this
+    controller; --collect garbage-collects failed transient units.
+    stdout/stderr append to ``log_path`` so the log contract matches the
+    detached path.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "systemd-run", "--user", f"--unit={unit}", "--collect",
+        "--service-type=exec",
+        "--property=KillMode=control-group",
+        f"--property=TimeoutStopSec={STOP_TIMEOUT_S}",
+        "--property=Restart=no",
+        f"--property=StandardOutput=append:{log_path}",
+        f"--property=StandardError=append:{log_path}",
+        f"--working-directory={cwd}",
+    ]
+    for key in ("CURSOR_DATA_DIR", "PATH", "HOME"):
+        if key in env:
+            cmd.append(f"--setenv={key}={env[key]}")
+    cmd += ["--", *argv]
+    proc = _run_systemctl(cmd)
+    if proc.returncode != 0:
+        raise WorkerError(
+            f"systemd-run failed for unit {unit} (rc {proc.returncode}): "
+            f"{(proc.stderr or proc.stdout or '').strip()[:500]}"
+        )
+
+
+def _systemd_show(unit: str) -> Dict[str, str]:
+    """{ActiveState, SubState, MainPID, InvocationID} for a unit ({} on
+    failure)."""
+    try:
+        proc = _run_systemctl([
+            "systemctl", "--user", "show", unit,
+            "--property=ActiveState,SubState,MainPID,InvocationID",
+        ], timeout=10)
+        out: Dict[str, str] = {}
+        for line in (proc.stdout or "").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                out[key.strip()] = value.strip()
+        return out
+    except Exception:
+        return {}
+
+
+def _systemd_stop(unit: str) -> None:
+    """Stop a unit (blocks until the cgroup is empty or TimeoutStopSec
+    escalates to SIGKILL), then clear any failed state."""
+    try:
+        _run_systemctl(
+            ["systemctl", "--user", "stop", unit],
+            timeout=STOP_TIMEOUT_S + 15,
+        )
+    except Exception:
+        logger.warning("systemctl stop %s failed", unit, exc_info=True)
+    try:
+        _run_systemctl(["systemctl", "--user", "reset-failed", unit], timeout=10)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Isolation: per-worker data root + management endpoint
+# ---------------------------------------------------------------------------
+
+# Management ports: deterministic per-name base inside this range, linear
+# probe past squatters. Localhost only — the endpoint is unauthenticated.
+_MGMT_PORT_BASE = 42600
+_MGMT_PORT_RANGE = 300
+
+
+def _data_dir_for(name: str) -> Path:
+    return state_dir() / "data" / name
+
+
+def _alloc_management_port(name: str) -> int:
+    """A currently-bindable localhost port, deterministically seeded by
+    the worker name so restarts tend to reuse the same port."""
+    base = _MGMT_PORT_BASE + (
+        int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16)
+        % _MGMT_PORT_RANGE
+    )
+    for offset in range(_MGMT_PORT_RANGE):
+        port = _MGMT_PORT_BASE + (
+            (base - _MGMT_PORT_BASE + offset) % _MGMT_PORT_RANGE
+        )
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                probe.bind(("127.0.0.1", port))
+            finally:
+                probe.close()
+            return port
+        except OSError:
+            continue
+    raise WorkerError(
+        f"no free management port in {_MGMT_PORT_BASE}-"
+        f"{_MGMT_PORT_BASE + _MGMT_PORT_RANGE - 1} for worker '{name}'"
+    )
+
+
+def _spawn_worker(
+    name: str,
+    repo_path: str,
+    log_path: Path,
+    data_dir: str = "",
+    management_addr: str = "",
+) -> int:
+    """Start ``agent worker start`` detached (the DEGRADED fallback path
+    — no user systemd), output to ``log_path``.
 
     Returns the pid. The process gets its own session so it outlives the
     plugin (never killed on shutdown) and never inherits our terminal.
@@ -223,8 +413,10 @@ def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
             "agent CLI (it provides `agent worker start`) or use "
             "runtime='cloud'"
         )
-    env = _spawn_env()
-    argv = [cli, "worker", "start", "--name", name, "--worker-dir", str(repo_path)]
+    argv, env = _spawn_command(
+        cli, name, repo_path,
+        data_dir=data_dir, management_addr=management_addr,
+    )
     # Temporary CI spawn diagnostics (GHOST_CURSOR_SPAWN_DIAG=1).
     diag = (
         Path(os.environ.get("RUNNER_TEMP") or "/tmp") / f"gc-spawn-diag-{name}.txt"
@@ -505,7 +697,7 @@ def _wait_ready(record: WorkerRecord) -> None:
     deadline = time.monotonic() + READY_TIMEOUT_S
     dead_reads = 0
     while time.monotonic() < deadline:
-        if _ready_evidence(record):
+        if _ready_evidence(record) or _probe_ready(record):
             return
         # Two consecutive dead readings before declaring death: right after
         # fork the child's cmdline is still the parent's, so a single
@@ -536,7 +728,7 @@ def _cleanup_generation(record: WorkerRecord) -> None:
     _record_path(record.name).unlink(missing_ok=True)
     # Only per-generation logs are removed; a legacy record's shared
     # <name>.log is left for post-mortems.
-    if record.generation and record.generation in Path(record.log_path).name:
+    if Path(record.log_path).name.startswith(f"{record.name}-"):
         Path(record.log_path).unlink(missing_ok=True)
 
 
@@ -634,15 +826,39 @@ def ensure_worker(repo_path: str) -> WorkerRecord:
 def _spawn_generation(name: str, real: str) -> WorkerRecord:
     """Spawn a fresh generation for ``name`` (caller holds the flock).
 
-    Each generation gets its OWN log file (``<name>-<generation>.log``)
-    so readiness evidence is structurally generation-scoped: an old
-    incarnation's 'Worker is now running' line can never prove a fresh
-    spawn ready.
+    Isolation: a deterministic per-worker ``CURSOR_DATA_DIR`` (the CLI's
+    worker.lock lives inside it, so no two worktrees ever contend) and a
+    per-worker localhost management endpoint. Supervision: a transient
+    user systemd service when the user manager is available (gateway-
+    independent lifetime, MainPID/InvocationID identity, bounded full-
+    cgroup stop), else the clearly-surfaced degraded detached fallback.
+    Each generation logs to its OWN file (``<name>-<gen>.log``) so
+    readiness evidence is structurally generation-scoped.
     """
-    generation = _mint_generation()
-    log_path = state_dir() / f"{name}-{generation}.log"
-    log_offset = log_path.stat().st_size if log_path.exists() else 0
-    pid = _spawn_worker(name, real, log_path)
+    minted = _mint_generation()
+    log_path = state_dir() / f"{name}-{minted}.log"
+    data_dir = _data_dir_for(name)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    addr = f"127.0.0.1:{_alloc_management_port(name)}"
+
+    if _systemd_available():
+        supervision = "systemd"
+        unit = _unit_name(name)
+        pid, generation = _spawn_unit(unit, name, real, log_path, data_dir, addr)
+    else:
+        supervision = "detached"
+        unit = ""
+        generation = minted
+        logger.warning(
+            "worker %s: user systemd unavailable — DEGRADED detached "
+            "supervision (no cgroup containment; stop is a bounded "
+            "process-group kill)", name,
+        )
+        pid = _spawn_worker(
+            name, real, log_path,
+            data_dir=str(data_dir), management_addr=addr,
+        )
+
     record = WorkerRecord(
         name=name,
         repo_path=real,
@@ -651,35 +867,101 @@ def _spawn_generation(name: str, real: str) -> WorkerRecord:
         started_at=time.time(),
         verified=False,
         generation=generation,
+        unit=unit,
+        supervision=supervision,
+        data_dir=str(data_dir),
+        management_addr=addr,
         state=STATE_SPAWNING,
-        log_offset=log_offset,
         pid_birth=_pid_birth(pid),
         last_active_at=time.time(),
     )
     _write_record(record)
     logger.info(
-        "spawned worker %s (pid %d, generation %s) for %s",
-        name, pid, generation, real,
+        "spawned worker %s (pid %d, generation %s, %s) for %s",
+        name, pid, generation, supervision, real,
     )
     try:
         _wait_ready(record)
     except WorkerError as exc:
         state = STATE_FAILED if not _pid_alive(record.pid) else STATE_SPAWNING
         _update_record_locked(
-            name, generation, state=state, last_error=str(exc)[:500],
+            name, record.generation, state=state, last_error=str(exc)[:500],
         )
         raise
     _update_record_locked(
-        name, generation,
+        name, record.generation,
         state=STATE_READY, ready_at=time.time(), last_error="",
     )
     return _read_record(name) or record
 
 
+def _spawn_unit(
+    unit: str,
+    name: str,
+    real: str,
+    log_path: Path,
+    data_dir: Path,
+    addr: str,
+) -> tuple:
+    """Start one transient service and resolve its (MainPID,
+    InvocationID) identity. Caller holds the flock."""
+    cli = _agent_cli_path()
+    if not cli:
+        raise WorkerError(
+            f"the '{AGENT_CLI}' CLI is not on PATH — install the cursor "
+            "agent CLI (it provides `agent worker start`) or use "
+            "runtime='cloud'"
+        )
+    if _linger_enabled() is False:
+        logger.warning(
+            "user lingering is disabled (loginctl enable-linger %s) — "
+            "worker services will die at logout",
+            os.environ.get("USER") or os.getuid(),
+        )
+    # A remnant unit with no live record is unmanaged (the record is the
+    # authority and it is dead/absent here) — clear it so the fresh
+    # generation's name is free and no shadow worker swallows routing.
+    show = _systemd_show(unit)
+    if show.get("ActiveState") in ("active", "activating", "deactivating"):
+        logger.warning(
+            "stopping unmanaged remnant unit %s (record was dead/absent)",
+            unit,
+        )
+    _systemd_stop(unit)
+    argv, env = _spawn_command(
+        cli, name, real, data_dir=str(data_dir), management_addr=addr
+    )
+    _systemd_start(unit, argv, env, cwd=real, log_path=log_path)
+    deadline = time.monotonic() + _UNIT_PID_WAIT_S
+    while True:
+        show = _systemd_show(unit)
+        pid = int(show.get("MainPID") or 0)
+        if pid > 0:
+            return pid, str(show.get("InvocationID") or "") or _mint_generation("unit")
+        if show.get("ActiveState") in ("failed", "inactive") or (
+            time.monotonic() >= deadline
+        ):
+            raise WorkerError(
+                f"unit {unit} started but exposed no MainPID "
+                f"(ActiveState={show.get('ActiveState')!r}) — log tail:\n"
+                f"{_log_tail(log_path) or '(empty log)'}"
+            )
+        time.sleep(0.1)
+
+
 def _stop_generation(record: WorkerRecord) -> None:
-    """Best-effort teardown of a generation's process remnants (caller
-    holds the flock). Fleshed out by the supervision layer (systemd unit
-    stop / process-group kill); a dead record is a no-op."""
+    """Bounded teardown of a generation's whole process tree (caller
+    holds the flock).
+
+    systemd records ALWAYS stop through the unit — even when the leader
+    pid is already dead, the unit's cgroup may still hold descendants
+    (the observed leaked-tmux-child scope); ``systemctl stop`` empties
+    the cgroup within TimeoutStopSec. Detached records degrade to a
+    bounded TERM→KILL of the process group.
+    """
+    if record.supervision == "systemd" and record.unit:
+        _systemd_stop(record.unit)
+        return
     if not _record_alive(record):
         return
     _kill_detached(record)
