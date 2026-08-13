@@ -242,23 +242,131 @@ def state_dir() -> Path:
     return target
 
 
+def _conflict_path(target: Path, name: str) -> Path:
+    return target / f"{name}.conflict.json"
+
+
+def _read_conflict_candidates(name: str) -> Optional[List[Dict[str, Any]]]:
+    """The preserved ownership-evidence candidates for a conflicted
+    worker (raw record dicts, each with a ``_source`` key), or None when
+    the worker is not in a migration-collision conflict. Never raises."""
+    try:
+        path = _conflict_path(state_dir(), str(name))
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text("utf-8"))
+        candidates = data.get("candidates")
+        return candidates if isinstance(candidates, list) else None
+    except Exception:
+        logger.warning("conflict evidence read failed for %s", name, exc_info=True)
+        return None
+
+
+def _note_migration_conflict(
+    target: Path, name: str, incoming: Dict[str, Any], source: Path
+) -> None:
+    """Record an EXPLICIT machine-global collision: two profiles claim
+    the same worker name with materially different records. No winner is
+    picked — both candidates' full records are preserved as evidence,
+    the authoritative record turns CONFLICT, and nothing is adopted,
+    stopped, deleted, or replaced until resolution positively proves a
+    candidate dead/invalid."""
+    conflict_file = _conflict_path(target, name)
+    try:
+        existing = json.loads(conflict_file.read_text("utf-8"))
+        candidates = existing.get("candidates") or []
+    except Exception:
+        candidates = []
+    if not candidates:
+        # First collision: the already-migrated record is candidate #1.
+        try:
+            current = json.loads((target / f"{name}.json").read_text("utf-8"))
+            candidates.append({**current, "_source": "machine-global"})
+        except Exception:
+            pass
+    key = (int(incoming.get("pid") or 0), str(incoming.get("generation") or ""))
+    if key not in [
+        (int(c.get("pid") or 0), str(c.get("generation") or ""))
+        for c in candidates
+    ]:
+        candidates.append({**incoming, "_source": str(source)})
+    conflict_file.write_text(json.dumps({
+        "noted_at": time.time(),
+        "candidates": candidates,
+    }), "utf-8")
+    # The authoritative record becomes an explicit conflict marker
+    # (v2-shaped so the state survives the read path), keeping the
+    # first-seen candidate's identity fields for diagnosis only.
+    try:
+        marker = _parse_record(candidates[0])
+    except Exception:
+        marker = _parse_record(incoming)
+    _write_record(WorkerRecord(**{
+        **asdict(marker),
+        "state": STATE_CONFLICT,
+        "last_error": (
+            "migration collision: multiple profiles claim this worker "
+            f"with different records (pids "
+            f"{sorted(int(c.get('pid') or 0) for c in candidates)}) — "
+            "no winner picked; see the .conflict.json evidence"
+        ),
+    }))
+    logger.error(
+        "worker %s: migration COLLISION across profiles (candidate pids "
+        "%s) — conflict state recorded, nothing adopted or stopped",
+        name, sorted(int(c.get("pid") or 0) for c in candidates),
+    )
+
+
 def _migrate_profile_records(target: Path) -> None:
     """Copy pre-v2 profile-local records — from EVERY discoverable
     profile — into the machine-global control dir (adoption: live
     workers and their deterministic units keep running untouched; the
     originals are left behind for any old plugin version still reading
-    them). Collisions FAIL CLOSED: an existing target record is never
-    overwritten, and a later source never clobbers an earlier one.
-    Never raises."""
+    them).
+
+    Collisions FAIL CLOSED: a second source claiming the same worker
+    name with a materially different record (different pid/generation)
+    never overwrites — it becomes an explicit CONFLICT with both
+    candidates preserved as evidence (:func:`_note_migration_conflict`);
+    an identical record is skipped silently. Never raises."""
     try:
         for source in _profile_state_dirs():
             try:
                 if not source.is_dir() or source == target:
                     continue
                 for path in sorted(source.glob("*.json")):
+                    if path.name.endswith(".conflict.json"):
+                        continue
                     dest = target / path.name
                     if dest.exists():
-                        continue  # fail closed — first record wins
+                        try:
+                            incoming = json.loads(path.read_text("utf-8"))
+                            current = json.loads(dest.read_text("utf-8"))
+                        except Exception:
+                            continue
+                        same = (
+                            int(incoming.get("pid") or 0)
+                            == int(current.get("pid") or 0)
+                            and str(incoming.get("generation") or "")
+                            == str(current.get("generation") or "")
+                        )
+                        if not same:
+                            # A DEAD incoming candidate is positively
+                            # invalid — skip it (also prevents stale
+                            # profile leftovers from re-conflicting a
+                            # previously resolved worker forever).
+                            try:
+                                incoming_alive = _pid_alive(
+                                    int(incoming.get("pid") or 0)
+                                )
+                            except (TypeError, ValueError):
+                                incoming_alive = False
+                            if incoming_alive:
+                                _note_migration_conflict(
+                                    target, path.stem, incoming, source
+                                )
+                        continue
                     target.mkdir(parents=True, exist_ok=True)
                     dest.write_text(path.read_text("utf-8"), "utf-8")
                     logger.info(
@@ -684,48 +792,54 @@ def _read_record(name: str) -> Optional[WorkerRecord]:
     path = _record_path(name)
     try:
         data = json.loads(path.read_text("utf-8"))
-        base = dict(
-            name=str(data["name"]),
-            repo_path=str(data["repo_path"]),
-            pid=int(data["pid"]),
-            log_path=str(data["log_path"]),
-            started_at=float(data.get("started_at") or 0.0),
-            verified=bool(data.get("verified")),
-        )
-        if not data.get("version"):
-            return WorkerRecord(
-                **base,
-                version=RECORD_VERSION,
-                generation=f"legacy-{int(data['pid'])}",
-                supervision="legacy",
-                state=STATE_READY,
-                last_active_at=float(data.get("started_at") or 0.0),
-            )
-        leases = data.get("leases")
-        return WorkerRecord(
-            **base,
-            version=int(data.get("version") or RECORD_VERSION),
-            generation=str(data.get("generation") or ""),
-            unit=str(data.get("unit") or ""),
-            supervision=str(data.get("supervision") or "detached"),
-            data_dir=str(data.get("data_dir") or ""),
-            management_addr=str(data.get("management_addr") or ""),
-            pid_birth=(
-                int(data["pid_birth"])
-                if data.get("pid_birth") is not None
-                else None
-            ),
-            state=str(data.get("state") or STATE_READY),
-            last_active_at=float(data.get("last_active_at") or 0.0),
-            last_error=str(data.get("last_error") or ""),
-            leases=dict(leases) if isinstance(leases, dict) else {},
-        )
+        return _parse_record(data)
     except FileNotFoundError:
         return None
     except Exception:
         logger.warning("unreadable worker record %s — removing", path, exc_info=True)
         path.unlink(missing_ok=True)
         return None
+
+
+def _parse_record(data: Dict[str, Any]) -> WorkerRecord:
+    """One record dict (v1 or v2 shape) parsed into a WorkerRecord.
+    Raises on junk — callers decide the failure policy."""
+    base = dict(
+        name=str(data["name"]),
+        repo_path=str(data["repo_path"]),
+        pid=int(data["pid"]),
+        log_path=str(data["log_path"]),
+        started_at=float(data.get("started_at") or 0.0),
+        verified=bool(data.get("verified")),
+    )
+    if not data.get("version"):
+        return WorkerRecord(
+            **base,
+            version=RECORD_VERSION,
+            generation=f"legacy-{int(data['pid'])}",
+            supervision="legacy",
+            state=STATE_READY,
+            last_active_at=float(data.get("started_at") or 0.0),
+        )
+    leases = data.get("leases")
+    return WorkerRecord(
+        **base,
+        version=int(data.get("version") or RECORD_VERSION),
+        generation=str(data.get("generation") or ""),
+        unit=str(data.get("unit") or ""),
+        supervision=str(data.get("supervision") or "detached"),
+        data_dir=str(data.get("data_dir") or ""),
+        management_addr=str(data.get("management_addr") or ""),
+        pid_birth=(
+            int(data["pid_birth"])
+            if data.get("pid_birth") is not None
+            else None
+        ),
+        state=str(data.get("state") or STATE_READY),
+        last_active_at=float(data.get("last_active_at") or 0.0),
+        last_error=str(data.get("last_error") or ""),
+        leases=dict(leases) if isinstance(leases, dict) else {},
+    )
 
 
 def _write_record(record: WorkerRecord) -> None:
@@ -795,7 +909,13 @@ def live_workers() -> List[WorkerRecord]:
                 if not acquired:
                     continue
                 current = _read_record(record.name)
-                if current is not None and not _record_alive(current):
+                if (
+                    current is not None
+                    and not _record_alive(current)
+                    # Conflicted records are never lazily cleaned: another
+                    # candidate may be alive; resolution owns them.
+                    and current.state != STATE_CONFLICT
+                ):
                     logger.info(
                         "cleaning dead worker record %s (pid %d)",
                         current.name, current.pid,
@@ -1020,6 +1140,11 @@ def ensure_worker(
 
     with _worker_lock(name):
         record = _read_record(name)
+        if record is not None and record.state == STATE_CONFLICT:
+            # Conflicted ownership resolves ONLY on positive proof (all
+            # other candidates dead / the foreign unit gone) — raises an
+            # actionable error otherwise; never stops a candidate.
+            record = _resolve_conflict_or_raise(name, record)
         if record is not None:
             usable: Optional[WorkerRecord] = None
             if _record_alive(record) and record.state not in (
@@ -1082,6 +1207,72 @@ def ensure_worker(
         _await_generation_ready(record)
         record = _read_record(name) or record
         return _install_lease_locked(record, lease_id, lease_session)
+
+
+def _resolve_conflict_or_raise(
+    name: str, record: WorkerRecord
+) -> Optional[WorkerRecord]:
+    """Resolve a CONFLICT record on positive proof only (caller holds
+    the flock).
+
+    Migration collisions (candidate evidence on file): while MORE than
+    one candidate is alive, raise — no winner, nothing adopted/stopped/
+    deleted. Exactly one live candidate = every other is positively
+    dead: adopt the survivor. Zero live candidates: verified teardown of
+    remnants, then clear (returns None so the caller may spawn fresh).
+
+    Unit-identity conflicts (no candidate file): resolve only when our
+    recorded process is gone AND the unit's teardown can be verified
+    (the stop path itself refuses live units with unproven ownership).
+    """
+    candidates = _read_conflict_candidates(name)
+    if candidates is None:
+        if _record_alive(record) or not _stop_generation(record):
+            raise WorkerError(
+                f"worker '{name}' is in identity conflict: its unit "
+                f"{record.unit or '-'} cannot be positively proven ours "
+                "— not adopting and not stopping it; inspect with "
+                f"`systemctl --user status {record.unit or ''}`"
+            )
+        _cleanup_generation(record)
+        return None
+
+    parsed: List[WorkerRecord] = []
+    for candidate in candidates:
+        try:
+            parsed.append(_parse_record(dict(candidate)))
+        except Exception:
+            continue  # unparseable evidence is not a live claim
+    alive = [c for c in parsed if _record_alive(c)]
+    if len(alive) > 1:
+        raise WorkerError(
+            f"worker '{name}' has CONFLICTING ownership: "
+            f"{len(alive)} live candidates from different profiles "
+            f"(pids {sorted(c.pid for c in alive)}) — refusing to "
+            "adopt, stop, or replace any of them; stop the stale one "
+            "manually (see the .conflict.json evidence in the worker "
+            "state dir), then re-send"
+        )
+    if len(alive) == 1:
+        survivor = alive[0]
+        _write_record(survivor)
+        _conflict_path(state_dir(), name).unlink(missing_ok=True)
+        logger.warning(
+            "worker %s: ownership conflict RESOLVED — every other "
+            "candidate is dead; adopted the surviving pid %d",
+            name, survivor.pid,
+        )
+        return survivor
+    # Zero live candidates: all positively dead — verified teardown of
+    # whatever remnants the marker still points at, then a clean slate.
+    if not _stop_generation(record):
+        raise WorkerError(
+            f"worker '{name}': all conflict candidates are dead but "
+            "remnant teardown could not be verified — retry shortly"
+        )
+    _cleanup_generation(record)
+    _conflict_path(state_dir(), name).unlink(missing_ok=True)
+    return None
 
 
 def _install_lease_locked(
@@ -1289,18 +1480,27 @@ def _stop_generation(record: WorkerRecord) -> bool:
     """
     if record.supervision == "systemd" and record.unit:
         show = _systemd_show(record.unit)
-        invocation = str(show.get("InvocationID") or "")
-        if (
-            show.get("ActiveState") == "active"
-            and invocation
-            and record.generation
-            and invocation != record.generation
-        ):
-            logger.warning(
-                "unit %s is a FOREIGN generation (%s != %s) — refusing "
-                "to stop it", record.unit, invocation, record.generation,
-            )
-            return False
+        if not show:
+            return False  # UNKNOWN unit state — never stop blind
+        if show.get("ActiveState") in ("active", "activating", "deactivating"):
+            # Stopping a LIVE unit requires positively proven ownership:
+            # the live InvocationID must exist AND match our generation.
+            # A missing id is UNKNOWN ownership — exactly like a
+            # mismatch, the unit may belong to another generation or
+            # controller and is never ours to kill.
+            invocation = str(show.get("InvocationID") or "")
+            if not (
+                invocation
+                and record.generation
+                and invocation == record.generation
+            ):
+                logger.warning(
+                    "unit %s is live with unproven ownership (live "
+                    "invocation %r vs our generation %r) — refusing to "
+                    "stop it",
+                    record.unit, invocation, record.generation,
+                )
+                return False
         return _systemd_stop(record.unit)
     _kill_detached(record)
     return _pgid_empty(record.pid)
@@ -1669,6 +1869,14 @@ def reconcile(now: Optional[float] = None) -> List[str]:
                 record = _read_record(path.stem)
                 if record is None:
                     continue
+                if record.state == STATE_CONFLICT:
+                    # Conflicts resolve on positive proof only — never
+                    # via eviction (that could stop a live candidate).
+                    try:
+                        _resolve_conflict_or_raise(record.name, record)
+                    except WorkerError:
+                        pass  # still conflicted — next tick
+                    continue
                 if not _record_alive(record):
                     if _evict_locked(record, "process dead"):
                         reaped.append(record.name)
@@ -1739,9 +1947,12 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
     idle = sorted(
         (
             r for r in others
-            # Legacy workers may serve runs this controller cannot see —
-            # they are never reclaim candidates (they retire at death).
-            if r.supervision != "legacy" and not _fresh_leases(r, now)
+            # Legacy workers may serve runs this controller cannot see,
+            # and CONFLICTED workers must never have a candidate stopped
+            # — neither is ever a reclaim candidate.
+            if r.supervision != "legacy"
+            and r.state != STATE_CONFLICT
+            and not _fresh_leases(r, now)
         ),
         key=lambda r: float(r.last_active_at or r.started_at),
     )

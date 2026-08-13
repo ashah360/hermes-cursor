@@ -373,14 +373,18 @@ class TestMultiProfileMigration:
         names = {r.name for r in workers.live_workers()}
         assert {name_a, name_b} <= names  # both profiles adopted
 
-    def test_collisions_fail_closed_never_overwrite(
-        self, tmp_path, fake_procs
+    def test_live_live_collision_is_an_explicit_conflict_with_no_winner(
+        self, tmp_path, fake_procs, fake_spawn, monkeypatch
     ):
+        """Two profiles hold the SAME worker name with DIFFERENT live
+        pids: first-record-wins would leave one live worker untracked
+        and later permit duplication. The collision must become an
+        explicit machine-global CONFLICT — no winner, no stop, no
+        overwrite, no spawn — until one candidate is provably dead."""
         hermes_home = Path(os.environ["HERMES_HOME"])
         repo = tmp_path / "repo"
         repo.mkdir()
         name = workers.worker_name_for(str(repo))
-        # The SAME worker name exists in two sources with different pids.
         self._seed(
             hermes_home / "state" / "ghost_cursor" / "workers",
             name, repo, 9921,
@@ -389,15 +393,37 @@ class TestMultiProfileMigration:
             hermes_home / "profiles" / "beta" / "state" / "ghost_cursor" / "workers",
             name, repo, 9922,
         )
-        fake_procs.update({9921, 9922})
+        fake_procs.update({9921, 9922})  # BOTH candidates are alive
+        kills = []
+        monkeypatch.setattr(
+            workers, "_kill_detached", lambda record: kills.append(record.pid)
+        )
+        stops = []
+        monkeypatch.setattr(
+            workers, "_systemd_stop", lambda unit: stops.append(unit) or True
+        )
         workers._reset_migration_for_tests()
 
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo), lease_id="run-x")
+        assert "conflict" in str(err.value)
+        assert "9921" in str(err.value) and "9922" in str(err.value)
+        assert kills == [] and stops == []      # neither candidate stopped
+        assert len(fake_spawn) == 0             # no duplicate spawn
         record = workers._read_record(name)
-        assert record is not None
-        first_pid = record.pid
-        # Re-running migration never overwrites what already landed.
-        workers._reset_migration_for_tests()
-        assert workers._read_record(name).pid == first_pid
+        assert record.state == workers.STATE_CONFLICT
+        # Ownership evidence for BOTH candidates is preserved.
+        candidates = workers._read_conflict_candidates(name)
+        assert {c["pid"] for c in candidates} == {9921, 9922}
+
+        # Resolution: one candidate provably dead -> the survivor is
+        # adopted safely and dispatch works again.
+        fake_procs.discard(9922)
+        resolved = workers.ensure_worker(str(repo), lease_id="run-x")
+        assert resolved.pid == 9921
+        assert resolved.state != workers.STATE_CONFLICT
+        assert kills == [] and stops == []      # still nothing stopped
+        assert workers._read_conflict_candidates(name) is None
 
 
 class TestLegacyProtection:
@@ -732,6 +758,31 @@ class TestSystemdOwnershipVerification:
         with pytest.raises(workers.WorkerError):
             workers.ensure_worker(str(repo))
         assert len(fake_systemd["stopped"]) == stops_before
+
+    def test_stop_path_refuses_active_unit_with_missing_invocation(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        """Missing live InvocationID is UNKNOWN ownership, exactly like a
+        mismatch: the stop path must never issue systemctl stop against
+        an active unit it cannot positively prove it owns."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # our leader died…
+        # …and the active unit exposes NO invocation id (unprovable).
+        fake_systemd["units"][record.unit] = {
+            "ActiveState": "active",
+            "MainPID": "424242",
+            "InvocationID": "",
+        }
+        stops_before = len(fake_systemd["stopped"])
+        with workers._worker_lock(record.name):
+            assert workers._stop_generation(record) is False
+        assert len(fake_systemd["stopped"]) == stops_before  # NOT stopped
+        # The ensure path fails closed the same way: record retained.
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        assert workers._read_record(record.name) is not None
 
     def test_unverified_stop_fails_closed_and_retains_the_record(
         self, tmp_path, fake_systemd, fake_procs, monkeypatch

@@ -7010,6 +7010,33 @@ class TestSupervisorReattach:
         assert gc_supervisor.reconcile_once() == []
         assert _completion_events(_drain_completion_queue()) == []
 
+    def test_sequential_reattached_settles_have_distinct_stable_ids(
+        self, clean_state
+    ):
+        """Symmetric to the live-job case: two settles of the same
+        session by different supervisor attempts must emit DISTINCT
+        terminal delegation ids; the same attempt re-settling keeps its
+        id (producer-stable)."""
+        ids = []
+        for attempt in ("att-one", "att-two"):
+            gc_handles.record(
+                "Twice settled", repo="/w", status="running",
+                cursor_session_id="bc-tw", session_key="",
+            )
+            gc_handles.record_supervision(
+                "Twice settled", phase="streaming",
+                current_attempt_id=attempt, attempt_n=1,
+            )
+            sup = gc_supervisor.SessionSupervisor("Twice settled")
+            sup._attempt_id = attempt  # what _supervise loads
+            sup._settle("completed")
+            events = _completion_events(_drain_completion_queue())
+            assert len(events) == 1
+            ids.append(events[0]["delegation_id"])
+        assert ids[0] != ids[1]
+        assert ids[0] == "Twice settled#done-att-one"
+        assert ids[1] == "Twice settled#done-att-two"
+
     def test_orphaned_handle_without_remote_agent_settles_failed(
         self, clean_state, monkeypatch
     ):
