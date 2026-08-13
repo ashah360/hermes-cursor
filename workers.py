@@ -160,7 +160,7 @@ class WorkerRecord:
 
 
 def _profile_state_dir() -> Path:
-    """The pre-v2 PROFILE-local worker-state location (migration source)."""
+    """The current profile's pre-v2 worker-state location."""
     try:
         from hermes_constants import get_hermes_home
 
@@ -168,6 +168,48 @@ def _profile_state_dir() -> Path:
     except Exception:
         home = Path(os.environ.get("HERMES_HOME", "") or (Path.home() / ".hermes"))
     return home / "state" / "ghost_cursor" / "workers"
+
+
+def _profile_state_dirs() -> List[Path]:
+    """EVERY discoverable pre-v2 profile-local worker-state location:
+    the current profile, the default profile, and each named profile
+    under ``<root>/profiles/*`` — worker identity is machine-global, so
+    any profile's records are adoption candidates. Never raises."""
+    roots: List[Path] = []
+
+    def _add_root(root: Path) -> None:
+        try:
+            root = Path(root)
+        except Exception:
+            return
+        if root not in roots:
+            roots.append(root)
+        # A root that IS a named profile sits under <base>/profiles/<x>:
+        # its base (the default profile) and sibling profiles count too.
+        if root.parent.name == "profiles":
+            _add_root(root.parent.parent)
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        _add_root(Path(get_hermes_home()))
+    except Exception:
+        pass
+    env_home = os.environ.get("HERMES_HOME", "").strip()
+    if env_home:
+        _add_root(Path(env_home))
+    if not roots:
+        _add_root(Path.home() / ".hermes")
+    for root in list(roots):
+        profiles = root / "profiles"
+        try:
+            if profiles.is_dir():
+                for child in sorted(profiles.iterdir()):
+                    if child.is_dir() and child not in roots:
+                        roots.append(child)
+        except Exception:
+            continue
+    return [root / "state" / "ghost_cursor" / "workers" for root in roots]
 
 
 # Migration is idempotent but cheap to skip: one pass per target dir per
@@ -201,25 +243,34 @@ def state_dir() -> Path:
 
 
 def _migrate_profile_records(target: Path) -> None:
-    """Copy pre-v2 profile-local records into the machine-global control
-    dir (adoption: live workers keep running untouched; the originals are
-    left behind for any old plugin version still reading them). Never
-    raises."""
+    """Copy pre-v2 profile-local records — from EVERY discoverable
+    profile — into the machine-global control dir (adoption: live
+    workers and their deterministic units keep running untouched; the
+    originals are left behind for any old plugin version still reading
+    them). Collisions FAIL CLOSED: an existing target record is never
+    overwritten, and a later source never clobbers an earlier one.
+    Never raises."""
     try:
-        source = _profile_state_dir()
-        if not source.is_dir() or source == target:
-            return
-        for path in source.glob("*.json"):
-            dest = target / path.name
-            if dest.exists():
-                continue
-            target.mkdir(parents=True, exist_ok=True)
-            dest.write_text(path.read_text("utf-8"), "utf-8")
-            logger.info(
-                "migrated profile-local worker record %s to the "
-                "machine-global control dir (adopted, not respawned)",
-                path.name,
-            )
+        for source in _profile_state_dirs():
+            try:
+                if not source.is_dir() or source == target:
+                    continue
+                for path in sorted(source.glob("*.json")):
+                    dest = target / path.name
+                    if dest.exists():
+                        continue  # fail closed — first record wins
+                    target.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(path.read_text("utf-8"), "utf-8")
+                    logger.info(
+                        "migrated profile-local worker record %s (from %s) "
+                        "to the machine-global control dir (adopted, not "
+                        "respawned)", path.name, source,
+                    )
+            except Exception:
+                logger.warning(
+                    "worker record migration from %s failed", source,
+                    exc_info=True,
+                )
     except Exception:
         logger.warning("worker record migration failed", exc_info=True)
 
@@ -1308,24 +1359,29 @@ def _plugin_config(key: str) -> Any:
 def _max_workers() -> int:
     """The worker cap for this box: ``plugins.ghost_cursor.max_workers``
     in config.yaml, else 10 (Cursor's documented per-user self-hosted
-    quota). Robust to junk values."""
+    quota). Robust to junk/non-finite values (inf/nan/strings)."""
+    import math
+
     try:
-        value = int(_plugin_config("max_workers"))
-        if value >= 1:
-            return value
-    except (TypeError, ValueError):
+        raw = float(_plugin_config("max_workers"))
+        if math.isfinite(raw) and int(raw) >= 1:
+            return int(raw)
+    except (TypeError, ValueError, OverflowError):
         pass
     return 10
 
 
 def _idle_ttl_s() -> float:
     """The idle reap TTL: ``plugins.ghost_cursor.worker_idle_ttl_s`` in
-    config.yaml, else :data:`IDLE_TTL_S`. Robust to junk values."""
+    config.yaml, else :data:`IDLE_TTL_S`. Robust to junk/non-finite
+    values (inf/nan/strings — inf would disable reaping forever)."""
+    import math
+
     try:
         value = float(_plugin_config("worker_idle_ttl_s"))
-        if value > 0:
+        if math.isfinite(value) and value > 0:
             return value
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pass
     return IDLE_TTL_S
 
@@ -1411,30 +1467,83 @@ def acquire_lease(name: str, lease_id: str, session: str = "") -> bool:
         )
 
 
-def bind_lease(name: str, lease_id: str, agent_id: str, run_id: str) -> None:
+def bind_lease(name: str, lease_id: str, agent_id: str, run_id: str) -> bool:
     """Bind a dispatch lease to its real remote identity (called at the
     producer boundary, the instant the create/follow-up returned).
 
     From here the lease protects the worker until an OBSERVED remote
-    terminal — across gateway restarts and stream failures. Never
-    raises."""
+    terminal — across gateway restarts and stream failures. Returns the
+    AUTHORITATIVE outcome: False means the binding is NOT durable
+    (record gone, lease gone, generation changed, or the write failed)
+    and the caller must not proceed as if the worker were protected.
+    Never raises (a failure reads as False)."""
     try:
         with _worker_lock(str(name)):
             record = _read_record(str(name))
             if record is None or str(lease_id) not in (record.leases or {}):
-                return
+                return False
             leases = dict(record.leases)
             leases[str(lease_id)] = {
                 **leases[str(lease_id)],
                 "agent_id": str(agent_id or ""),
                 "run_id": str(run_id or ""),
             }
-            _update_record_locked(
+            return _update_record_locked(
                 str(name), record.generation,
                 leases=leases, last_active_at=time.time(),
             )
     except Exception:
         logger.warning("bind_lease(%s, %s) failed", name, lease_id, exc_info=True)
+        return False
+
+
+def restore_session_lease(
+    repo_path: str, session: str, agent_id: str, run_id: str
+) -> bool:
+    """Reconstruct run protection for a recovered session: bind the
+    worktree worker's existing UNBOUND lease for ``session`` when one
+    survives, else install a fresh BOUND lease. Returns False when no
+    live worker exists for the worktree — the caller must then fail
+    closed rather than attach an unprotected run. Never raises."""
+    try:
+        name = worker_name_for(str(repo_path))
+        with _worker_lock(name):
+            record = _read_record(name)
+            if record is None or not _record_alive(record):
+                return False
+            leases = dict(record.leases or {})
+            target = next(
+                (
+                    key for key, lease in leases.items()
+                    if str((lease or {}).get("session") or "") == str(session)
+                    and not str((lease or {}).get("agent_id") or "")
+                ),
+                None,
+            )
+            if target is None:
+                target = f"recovered-{uuid.uuid4().hex[:12]}"
+                pid = os.getpid()
+                leases[target] = {
+                    "session": str(session),
+                    "holder_pid": pid,
+                    "holder_birth": _pid_birth(pid),
+                    "acquired_at": time.time(),
+                }
+            leases[target] = {
+                **leases[target],
+                "agent_id": str(agent_id or ""),
+                "run_id": str(run_id or ""),
+            }
+            return _update_record_locked(
+                name, record.generation,
+                leases=leases, last_active_at=time.time(),
+            )
+    except Exception:
+        logger.warning(
+            "restore_session_lease(%s, %s) failed", repo_path, session,
+            exc_info=True,
+        )
+        return False
 
 
 def release_leases_for_session(session_name: str) -> None:

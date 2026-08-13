@@ -668,11 +668,33 @@ class _CloudWorker:
             return
         # Bind the dispatch lease to the real remote identity FIRST: from
         # this instant the worker is protected until an observed remote
-        # terminal, across restarts and stream failures.
+        # terminal, across restarts and stream failures. Binding is
+        # AUTHORITATIVE — continuing without a bound lease is forbidden:
+        # on failure, try to reconstruct protection outright, and when
+        # even that fails, keep whatever protection exists and CANCEL
+        # the run rather than executing unprotected (the identity is
+        # already persisted; recovery can resume it once healthy).
         if self._lease_held and self._worker_record is not None:
-            _workers.bind_lease(
+            bound = _workers.bind_lease(
                 self._worker_record.name, self._lease_id, agent_id, run_id
             )
+            if not bound:
+                bound = _workers.restore_session_lease(
+                    self._repo, self._session_title or "", agent_id, run_id
+                )
+            if not bound:
+                logger.critical(
+                    "worker %s: run %s could not be protected by a bound "
+                    "lease — cancelling the run instead of executing "
+                    "unprotected", self._worker_record.name, run_id,
+                )
+                self.abort_reason = self.abort_reason or "cancel"
+                self.abort_detail = (
+                    self.abort_detail
+                    or "run lease could not be bound — refused to execute "
+                    "unprotected"
+                )
+                self._cancel_requested.set()
         if self._on_created is None:
             return
         try:
@@ -952,7 +974,12 @@ class _CloudWorker:
             except _workers.WorkerError as exc:
                 self._put("cloud.fatal", {"error": str(exc)})
                 return
-            self._lease_held = True
+            # Held only when the returned record really carries our
+            # lease (the atomic path guarantees it; ephemeral records
+            # from tests/fakes without durable state lease nothing).
+            self._lease_held = self._lease_id in (
+                self._worker_record.leases or {}
+            )
 
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)

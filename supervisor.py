@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
@@ -113,6 +114,9 @@ CREATE_INTENT_MIN_AGE_S = 300.0
 # An adopted agent must have been created no earlier than this long before
 # the intent was persisted (clock-skew allowance).
 CREATE_MATCH_SKEW_S = 120.0
+# Structural shape of a cursor agent id ("bc-..."): a unique recovery
+# match without one is not adoptable.
+_AGENT_ID_RE = re.compile(r"^bc-[A-Za-z0-9-]+$")
 
 # Reconnect pacing for the re-attached stream (bounded per drop; the
 # supervisor itself never gives up — it degrades to the poll watchdog).
@@ -1069,14 +1073,18 @@ def _recover_create_intent(
     ever recorded.
 
     Bounded recovery (the API has no idempotency key and no name filter):
-    list the newest agents and adopt the NEWEST one whose name equals the
-    session title and whose createdAt falls inside
-    ``[intent_ts - CREATE_MATCH_SKEW_S, now]``. Ambiguity (several
-    matches) is adopted-newest and REPORTED — never auto-cancelled. A
-    truncated listing with no match resolves to "unresolved" (check
-    cursor.com/agents), never a false "failed"; an exhaustive listing
-    with no match settles the handle failed. Returns True when an agent
-    was adopted (the caller then attaches a supervisor). Never raises.
+    list the newest agents and adopt a UNIQUE match — name equals the
+    session title, createdAt inside ``[intent_ts - CREATE_MATCH_SKEW_S,
+    now]``, structurally valid ``bc-...`` agent id, usable run id — and
+    only after the worktree worker's lease is restored/bound (a local
+    run is never attached unprotected). SEVERAL matches stay unresolved
+    for operator review (nothing auto-adopted, nothing auto-cancelled);
+    so do unique matches with unusable identity or an unrestorable
+    lease. A truncated listing with no match resolves to "unresolved"
+    (check cursor.com/agents), never a false "failed"; an exhaustive
+    listing with no match settles the handle failed. Returns True when
+    an agent was adopted (the caller then attaches a supervisor). Never
+    raises.
     """
     intent = entry.get("create_intent")
     if not isinstance(intent, dict) or str(intent.get("state") or "") != "creating":
@@ -1119,10 +1127,53 @@ def _recover_create_intent(
     if len(matches) == 1:
         match = matches[0]
         agent_id = str(match.get("id") or "")
+        run_id = str(match.get("latestRunId") or "")
+        if not _AGENT_ID_RE.match(agent_id) or not run_id:
+            # A unique match without a structurally valid agent id and a
+            # usable run id is not adoptable — never guess.
+            _handles.record(
+                name,
+                create_intent={**intent, "state": "unresolved"},
+                status_note=(
+                    "create recovery matched one agent but its identity "
+                    f"is unusable (id {agent_id!r}, run {run_id!r}) — "
+                    "review at https://cursor.com/agents"
+                ),
+            )
+            _eventlog.append(name, _events.lifecycle(
+                "create.unresolved",
+                note=f"unique match with unusable identity ({agent_id!r})",
+            ))
+            return False
+        # A LOCAL session's recovered run must stay protected: bind the
+        # worker's surviving unbound lease (or install a fresh bound
+        # one). Without protection the reaper could take the worker from
+        # under a live run — fail closed instead of attaching.
+        if str(entry.get("runtime") or "") != "cloud":
+            repo = str(entry.get("repo") or "")
+            if not repo or not _workers.restore_session_lease(
+                repo, name, agent_id, run_id
+            ):
+                _handles.record(
+                    name,
+                    create_intent={**intent, "state": "unresolved"},
+                    status_note=(
+                        "create recovery found the agent but the "
+                        "worktree's worker lease could not be restored "
+                        "(worker gone?) — not attaching an unprotected "
+                        "run; re-send to respawn the worker, or review "
+                        "at https://cursor.com/agents"
+                    ),
+                )
+                _eventlog.append(name, _events.lifecycle(
+                    "create.unresolved",
+                    note="worker lease could not be restored",
+                ))
+                return False
         _handles.record(
             name,
             cursor_session_id=agent_id,
-            latest_run_id=str(match.get("latestRunId") or "") or None,
+            latest_run_id=run_id or None,
             status="running",
             status_note="",
             create_intent={**intent, "state": "recovered"},

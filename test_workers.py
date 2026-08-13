@@ -342,6 +342,64 @@ class TestMachineGlobalControlDir:
         assert (workers.state_dir() / f"{name}.json").exists()
 
 
+class TestMultiProfileMigration:
+    def _seed(self, directory, name, repo, pid):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name, "repo_path": os.path.realpath(str(repo)),
+            "pid": pid, "log_path": str(directory / f"{name}.log"),
+            "started_at": 1000.0, "verified": True,
+        }))
+
+    def test_discovers_default_profile_and_named_profiles(
+        self, tmp_path, fake_procs
+    ):
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        name_a = workers.worker_name_for(str(repo_a))
+        name_b = workers.worker_name_for(str(repo_b))
+        self._seed(
+            hermes_home / "state" / "ghost_cursor" / "workers",
+            name_a, repo_a, 9911,
+        )
+        self._seed(
+            hermes_home / "profiles" / "beta" / "state" / "ghost_cursor" / "workers",
+            name_b, repo_b, 9912,
+        )
+        fake_procs.update({9911, 9912})
+        workers._reset_migration_for_tests()
+
+        names = {r.name for r in workers.live_workers()}
+        assert {name_a, name_b} <= names  # both profiles adopted
+
+    def test_collisions_fail_closed_never_overwrite(
+        self, tmp_path, fake_procs
+    ):
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        # The SAME worker name exists in two sources with different pids.
+        self._seed(
+            hermes_home / "state" / "ghost_cursor" / "workers",
+            name, repo, 9921,
+        )
+        self._seed(
+            hermes_home / "profiles" / "beta" / "state" / "ghost_cursor" / "workers",
+            name, repo, 9922,
+        )
+        fake_procs.update({9921, 9922})
+        workers._reset_migration_for_tests()
+
+        record = workers._read_record(name)
+        assert record is not None
+        first_pid = record.pid
+        # Re-running migration never overwrites what already landed.
+        workers._reset_migration_for_tests()
+        assert workers._read_record(name).pid == first_pid
+
+
 class TestLegacyProtection:
     """A legacy (generation-0) worker may be serving a pre-v2 run this
     controller cannot see (no leases, possibly another profile) — it is
@@ -630,8 +688,10 @@ class TestSystemdOwnershipVerification:
         assert "--working-directory=/repo" in cmd
         assert "--setenv=CURSOR_DATA_DIR=/state/data/w" in cmd
         assert "--setenv=IRRELEVANT=x" not in cmd  # only the allowlist
-        assert cmd[-5:] == ["--", "/usr/bin/agent", "worker", "start",
-                            "--name", "w"][-5:]
+        # The payload argv rides verbatim after the `--` separator.
+        assert cmd[cmd.index("--"):] == [
+            "--", "/usr/bin/agent", "worker", "start", "--name", "w",
+        ]
 
     def test_identity_mismatch_fails_closed_without_stopping_foreign_unit(
         self, tmp_path, fake_systemd
@@ -1025,6 +1085,46 @@ class TestAtomicEnsureAndLease:
                 last_active_at=rec.last_active_at - 999999.0,
             )
         assert workers.reconcile() == [record.name]
+
+    def test_bind_lease_is_authoritative(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-1")
+        assert workers.bind_lease(record.name, "run-1", "bc-a", "run-x") is True
+        assert workers.bind_lease(record.name, "run-nope", "bc-a", "run-x") is False
+        assert workers.bind_lease("no-such-worker", "run-1", "bc-a", "run-x") is False
+
+    def test_restore_session_lease_binds_or_creates_protection(
+        self, tmp_path, fake_spawn
+    ):
+        """Crash recovery must reconstruct protection: an existing
+        unbound lease for the session is bound; with none left (expired
+        during the outage), a fresh bound lease is installed."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(
+            str(repo), lease_id="run-1", lease_session="My session"
+        )
+        assert workers.restore_session_lease(
+            str(repo), "My session", "bc-r", "run-r"
+        ) is True
+        rec = workers._read_record(record.name)
+        assert rec.leases["run-1"]["agent_id"] == "bc-r"  # bound in place
+
+        workers.release_lease(record.name, "run-1")
+        assert workers.restore_session_lease(
+            str(repo), "My session", "bc-r2", "run-r2"
+        ) is True
+        rec = workers._read_record(record.name)
+        bound = [l for l in rec.leases.values() if l.get("agent_id") == "bc-r2"]
+        assert bound and bound[0]["session"] == "My session"
+
+    def test_restore_session_lease_fails_without_a_live_worker(self, tmp_path):
+        repo = tmp_path / "gone"
+        repo.mkdir()
+        assert workers.restore_session_lease(
+            str(repo), "Ghost session", "bc-x", "run-x"
+        ) is False
 
     def test_release_leases_for_session(self, tmp_path, fake_spawn):
         repo_a, repo_b = tmp_path / "a", tmp_path / "b"

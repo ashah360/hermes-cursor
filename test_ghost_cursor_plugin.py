@@ -6496,11 +6496,25 @@ class TestCreateIntentAndRecovery:
         # The intent settled to "recorded" — recovery has nothing to do.
         assert entry["create_intent"]["state"] == "recorded"
 
-    def _stale_intent_entry(self, name, ts):
+    def _stale_intent_entry(self, name, ts, repo="/w"):
         gc_handles.record(
-            name, repo="/w", status="created", session_key="",
+            name, repo=repo, status="created", session_key="",
             create_intent={"ts": ts, "state": "creating"},
         )
+
+    def _bindable_worker(self, monkeypatch, repo, session):
+        """A live worker record for ``repo`` holding the session's
+        UNBOUND dispatch lease — the state a crashed dispatcher leaves."""
+        monkeypatch.setattr(gc_workers, "_pid_alive", lambda pid: True)
+        name = gc_workers.worker_name_for(str(repo))
+        record = gc_workers.WorkerRecord(
+            name=name, repo_path=os.path.realpath(str(repo)), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-reco-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        gc_workers.acquire_lease(name, "run-crashed", session=session)
+        return name
 
     @staticmethod
     def _iso(t):
@@ -6510,11 +6524,18 @@ class TestCreateIntentAndRecovery:
             t, _dt.timezone.utc
         ).isoformat().replace("+00:00", "Z")
 
-    def test_reconciler_adopts_a_unique_matching_agent(
-        self, clean_state, monkeypatch
+    def test_reconciler_adopts_a_unique_matching_agent_and_rebinds_the_lease(
+        self, clean_state, monkeypatch, tmp_path
     ):
         intent_ts = time.time() - 600
-        self._stale_intent_entry("Fix the flux capacitor", intent_ts)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._stale_intent_entry(
+            "Fix the flux capacitor", intent_ts, repo=str(repo)
+        )
+        worker_name = self._bindable_worker(
+            monkeypatch, repo, "Fix the flux capacitor"
+        )
         client = _FakeRestClient()
         client.list_agents = lambda limit=20: {"items": [
             {"id": "bc-match", "name": "Fix the flux capacitor",
@@ -6530,6 +6551,71 @@ class TestCreateIntentAndRecovery:
         assert entry["cursor_session_id"] == "bc-match"
         assert entry["latest_run_id"] == "run-n"
         assert entry["create_intent"]["state"] == "recovered"
+        # The session's unbound dispatch lease was BOUND to the recovered
+        # identity — the worker stays protected while the run lives.
+        lease = gc_workers._read_record(worker_name).leases["run-crashed"]
+        assert lease["agent_id"] == "bc-match"
+        assert lease["run_id"] == "run-n"
+
+    def test_recovery_without_a_bindable_worker_stays_unresolved(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A local session whose worker cannot be leased must not attach
+        an UNPROTECTED run — the intent stays unresolved, fail closed."""
+        intent_ts = time.time() - 600
+        repo = tmp_path / "repo"
+        repo.mkdir()  # no worker record exists for it
+        self._stale_intent_entry("Wandering ghost", intent_ts, repo=str(repo))
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-ghost", "name": "Wandering ghost",
+             "createdAt": self._iso(intent_ts + 40), "latestRunId": "run-g"},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Wandering ghost")
+        assert not entry.get("cursor_session_id")
+        assert entry["create_intent"]["state"] == "unresolved"
+        assert "lease" in str(entry.get("status_note") or "")
+
+    def test_invalid_unique_match_stays_unresolved(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A unique match with a structurally invalid agent id or no
+        usable run id is not adoptable — unresolved, never guessed."""
+        intent_ts = time.time() - 600
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._stale_intent_entry("Broken identity", intent_ts, repo=str(repo))
+        self._bindable_worker(monkeypatch, repo, "Broken identity")
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "not-an-agent-id", "name": "Broken identity",
+             "createdAt": self._iso(intent_ts + 40), "latestRunId": "run-b"},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Broken identity")
+        assert not entry.get("cursor_session_id")
+        assert entry["create_intent"]["state"] == "unresolved"
+
+        # Same for a match with no usable run id.
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-runless", "name": "Broken identity",
+             "createdAt": self._iso(intent_ts + 40)},
+        ]}
+        gc_handles.record(
+            "Broken identity",
+            create_intent={"ts": intent_ts, "state": "creating"},
+        )
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Broken identity")
+        assert not entry.get("cursor_session_id")
+        assert entry["create_intent"]["state"] == "unresolved"
 
     def test_ambiguous_recovery_stays_unresolved_and_adopts_none(
         self, clean_state, monkeypatch
@@ -6558,7 +6644,7 @@ class TestCreateIntentAndRecovery:
         assert "cursor.com/agents" in note
 
     def test_recovery_runs_for_the_real_crash_shape_spawning_phase(
-        self, clean_state, monkeypatch
+        self, clean_state, monkeypatch, tmp_path
     ):
         """The actual crash shape: begin_attempt left supervision phase
         'spawning' (LIVE), the intent says 'creating', no agent id was
@@ -6566,11 +6652,14 @@ class TestCreateIntentAndRecovery:
         attachment — a supervisor attached here would settle the session
         failed ('no remote agent id') and strand the real agent."""
         intent_ts = time.time() - 600
+        repo = tmp_path / "repo"
+        repo.mkdir()
         gc_handles.record(
-            "Crashed mid create", repo="/w", status="created",
+            "Crashed mid create", repo=str(repo), status="created",
             session_key="",
             create_intent={"ts": intent_ts, "state": "creating"},
         )
+        self._bindable_worker(monkeypatch, repo, "Crashed mid create")
         gc_handles.record_supervision(
             "Crashed mid create", phase="spawning",
             current_attempt_id="att-crash", attempt_n=1,
