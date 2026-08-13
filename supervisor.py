@@ -80,6 +80,7 @@ from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
 from . import render as _render
+from . import workers as _workers
 from .rest_client import RestApiError, RestClientError
 
 logger = logging.getLogger(__name__)
@@ -1010,6 +1011,13 @@ def reconcile_once() -> List[str]:
     (local terminal, remote GET RUNNING). Returns the session names
     attached this pass. Never raises."""
     attached: List[str] = []
+    try:
+        # Worker controller housekeeping rides the same tick: retire dead
+        # generations, reap idle LEASELESS workers (a leased worker is
+        # never touched). Never raises.
+        _workers.reconcile()
+    except Exception:
+        logger.exception("ghost_cursor worker reconcile pass failed")
     try:
         # One client per pass, built lazily (the repair probe needs the
         # GET authority; no probe-worthy handle → no client, no preflight).

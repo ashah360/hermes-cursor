@@ -920,6 +920,11 @@ def _run_attempt(
                     cursor_session_id=sid,
                     runtime=str(obj.get("runtime") or job.runtime),
                     worker=str(obj.get("worker") or "") or None,
+                    # "detached" = the clearly-surfaced degraded fallback
+                    # (no user systemd); "systemd" = full supervision.
+                    worker_supervision=(
+                        str(obj.get("worker_supervision") or "") or None
+                    ),
                     agents_ui_url=str(obj.get("agents_ui_url") or "") or None,
                     repo_url=str(obj.get("repo_url") or "") or None,
                     starting_ref=str(obj.get("starting_ref") or "") or None,

@@ -62,6 +62,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -585,6 +586,11 @@ class _CloudWorker:
         self._saw_conversation = False
         self._worker_record: Optional[_workers.WorkerRecord] = None
         self._started_monotonic = time.monotonic()
+        # Per-RUN worker lease (runtime=local): held from dispatch until
+        # this worker thread unwinds — every exit path first observes the
+        # settle authority (final GET) or cancels the remote run.
+        self._lease_id = f"run-{uuid.uuid4().hex[:12]}"
+        self._lease_held = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -851,6 +857,11 @@ class _CloudWorker:
             self._put("cloud.error", {"error": f"cursor cloud worker crashed: {exc}"})
         finally:
             self._settled = True
+            # Release the per-run worker lease: every path to here either
+            # observed the settle authority (final GET) or sent a cancel;
+            # crash safety is the lease's dead-holder grace.
+            if self._lease_held and self._worker_record is not None:
+                _workers.release_lease(self._worker_record.name, self._lease_id)
             self._put("__done__", {})
 
     def _run_inner(self, watcher: threading.Thread) -> None:
@@ -861,19 +872,28 @@ class _CloudWorker:
             return
         self._client = client
 
-        # Worker (runtime=local): reuse-or-spawn, bounded ready wait.
+        # PURE preflights first — nothing below may cost a worker spawn
+        # or a lease. Model-catalog validation (clear error listing
+        # valid ids) happens before any worker exists so a malformed
+        # request never leaves an idle worker behind.
+        catalog_error = model_catalog_error(client, self._model_id)
+        if catalog_error:
+            self._put("cloud.fatal", {"error": catalog_error})
+            return
+
+        # Worker (runtime=local): reuse-or-spawn, bounded ready wait,
+        # then the per-RUN lease that protects it from the reaper.
         if self._runtime == "local":
             try:
                 self._worker_record = _workers.ensure_worker(self._repo)
             except _workers.WorkerError as exc:
                 self._put("cloud.fatal", {"error": str(exc)})
                 return
-
-        # Model-catalog validation (clear error listing valid ids).
-        catalog_error = model_catalog_error(client, self._model_id)
-        if catalog_error:
-            self._put("cloud.fatal", {"error": catalog_error})
-            return
+            self._lease_held = _workers.acquire_lease(
+                self._worker_record.name,
+                self._lease_id,
+                session=self._session_title or "",
+            )
 
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)
@@ -912,6 +932,13 @@ class _CloudWorker:
                 "runtime": self._runtime,
                 "worker": (
                     self._worker_record.name if self._worker_record else ""
+                ),
+                # "systemd" | "detached" | "legacy" — "detached" is the
+                # clearly-surfaced DEGRADED supervision fallback.
+                "worker_supervision": (
+                    self._worker_record.supervision
+                    if self._worker_record
+                    else ""
                 ),
                 "agents_ui_url": ui_url,
                 "repo_url": self._repo_url or "",

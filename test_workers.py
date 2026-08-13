@@ -525,6 +525,111 @@ class TestSpawnEnv:
         assert env["PATH"] == "/usr/bin"
 
 
+class TestLeasesAndReaping:
+    """Per-RUN leases protect a worker from every cleanup path; the idle
+    reaper takes only leaseless workers past the TTL."""
+
+    def _backdate(self, name, seconds):
+        record = workers._read_record(name)
+        workers._update_record(
+            name, record.generation,
+            last_active_at=record.last_active_at - seconds,
+        )
+
+    def test_reaper_never_evicts_a_leased_worker(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert workers.acquire_lease(record.name, "run-1", session="s")
+        self._backdate(record.name, workers.IDLE_TTL_S * 10)
+
+        reaped = workers.reconcile()
+        assert reaped == []
+        assert workers._read_record(record.name) is not None
+
+    def test_idle_leaseless_worker_reaped_after_ttl(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        self._backdate(record.name, workers.IDLE_TTL_S * 10)
+
+        reaped = workers.reconcile()
+        assert reaped == [record.name]
+        assert workers._read_record(record.name) is None
+
+    def test_release_clears_lease_and_bumps_activity(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        workers.acquire_lease(record.name, "run-1")
+        assert workers._read_record(record.name).leases
+        workers.release_lease(record.name, "run-1")
+        after = workers._read_record(record.name)
+        assert after.leases == {}
+        # A fresh idle clock: the just-released worker is not reap-bait.
+        assert workers.reconcile() == []
+
+    def test_stale_lease_of_dead_holder_expires(self, tmp_path, fake_spawn, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        # A lease whose holder process died (crash) and whose grace has
+        # passed no longer protects the worker.
+        workers.acquire_lease(record.name, "run-crashed")
+        rec = workers._read_record(record.name)
+        stale = dict(rec.leases["run-crashed"])
+        stale["holder_pid"] = 999999999  # never alive
+        stale["acquired_at"] = stale["acquired_at"] - workers.LEASE_STALE_GRACE_S * 10
+        workers._update_record(
+            record.name, rec.generation, leases={"run-crashed": stale},
+        )
+        self._backdate(record.name, workers.IDLE_TTL_S * 10)
+
+        assert workers.reconcile() == [record.name]
+
+    def test_lease_on_unknown_record_is_a_noop(self):
+        assert workers.acquire_lease("no-such-worker", "run-1") is False
+        workers.release_lease("no-such-worker", "run-1")  # never raises
+
+
+class TestCapacity:
+    def test_reclaims_idle_leaseless_worker_before_spawning(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        monkeypatch.setattr(workers, "_max_workers", lambda: 2)
+        repo_a, repo_b, repo_c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for r in (repo_a, repo_b, repo_c):
+            r.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a))
+        rec_b = workers.ensure_worker(str(repo_b))
+        workers.acquire_lease(rec_b.name, "run-b")  # b is BUSY
+
+        rec_c = workers.ensure_worker(str(repo_c))  # at cap: a reclaimed
+        assert rec_c is not None
+        assert workers._read_record(rec_a.name) is None      # idle a evicted
+        assert workers._read_record(rec_b.name) is not None  # leased b kept
+
+    def test_honest_quota_exhaustion_when_all_leased(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        monkeypatch.setattr(workers, "_max_workers", lambda: 2)
+        repo_a, repo_b, repo_c = tmp_path / "a", tmp_path / "b", tmp_path / "c"
+        for r in (repo_a, repo_b, repo_c):
+            r.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a))
+        rec_b = workers.ensure_worker(str(repo_b))
+        workers.acquire_lease(rec_a.name, "run-a")
+        workers.acquire_lease(rec_b.name, "run-b")
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo_c))
+        message = str(err.value)
+        assert "capacity" in message or "quota" in message
+        # Honest: names the busy workers; nothing was evicted or queued.
+        assert workers._read_record(rec_a.name) is not None
+        assert workers._read_record(rec_b.name) is not None
+
+
 class TestLiveWorkersAndCleanup:
     def test_lists_only_live_and_cleans_dead(self, tmp_path, fake_spawn, fake_procs):
         repo_a, repo_b = tmp_path / "a", tmp_path / "b"

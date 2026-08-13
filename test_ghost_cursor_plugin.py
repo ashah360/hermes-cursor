@@ -6405,6 +6405,48 @@ def _wait_settled(name, status, timeout=10.0):
     )
 
 
+class TestRunLeases:
+    """A local run holds a per-RUN worker lease from dispatch until the
+    observed remote-terminal settle — the reaper can never take a worker
+    mid-run — and the reaper is actually wired into the reconciler."""
+
+    def test_local_run_holds_lease_until_settled(self, tmp_path, monkeypatch):
+        record = gc_workers.WorkerRecord(
+            name="lease-w", repo_path=str(tmp_path), pid=4242,
+            log_path="/dev/null", started_at=time.time(), verified=True,
+            generation="gen-lease-1", state="ready",
+        )
+        gc_workers._write_record(record)
+        seen = {}
+
+        def capture_mid_stream():
+            rec = gc_workers._read_record("lease-w")
+            seen["leases"] = dict(rec.leases) if rec else None
+            return None
+
+        client = _FakeRestClient(streams=[[
+            _sse("status", {"status": "RUNNING"}),
+            capture_mid_stream,
+            _sse("assistant", {"text": "done"}, id="1"),
+            _sse("result", {"status": "FINISHED"}, id="2"),
+            _sse("done", {}),
+        ]])
+        _install_fake_rest(monkeypatch, client, worker=record)
+        _run_cloud_events(tmp_path)
+
+        assert seen["leases"], "no lease held while the run streamed"
+        after = gc_workers._read_record("lease-w")
+        assert after.leases == {}, "lease not released after settle"
+
+    def test_supervisor_reconciler_runs_the_worker_reaper(self, monkeypatch, clean_state):
+        calls = []
+        monkeypatch.setattr(
+            gc_workers, "reconcile", lambda: calls.append(1) or []
+        )
+        gc_supervisor.reconcile_once()
+        assert calls, "reconcile_once did not run the worker reaper"
+
+
 class TestSupervisorReattach:
     def test_reconciler_reattaches_ingests_and_settles_from_the_get(
         self, clean_state, monkeypatch

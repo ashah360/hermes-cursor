@@ -820,6 +820,11 @@ def ensure_worker(repo_path: str) -> WorkerRecord:
             )
             _stop_generation(record)
             _cleanup_generation(record)
+        # Capacity: reclaim idle (leaseless) workers before spawning; an
+        # all-leased fleet raises an honest quota error instead of
+        # silently serializing. Eviction try-locks other workers only —
+        # never blocks while holding this worker's flock.
+        _enforce_capacity(name, real)
         return _spawn_generation(name, real)
 
 
@@ -984,6 +989,234 @@ def _kill_detached(record: WorkerRecord) -> None:
             if not _pid_alive(record.pid):
                 return
             time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Per-RUN leases + idle reaping + capacity
+# ---------------------------------------------------------------------------
+
+# A worker with no fresh lease for this long is reaped by reconcile().
+IDLE_TTL_S = float(os.environ.get("GHOST_CURSOR_WORKER_IDLE_TTL_S") or 1800.0)
+# A lease whose HOLDER process died still protects the worker this long
+# past acquisition (covers the settle window of a crashed dispatcher; a
+# re-attached supervisor settles the run remotely, it holds no lease).
+LEASE_STALE_GRACE_S = 300.0
+
+
+def _max_workers() -> int:
+    """The worker cap for this box. Default mirrors Cursor's documented
+    self-hosted quota (10 per user); override via env for larger teams."""
+    try:
+        return max(int(os.environ.get("GHOST_CURSOR_MAX_WORKERS") or 10), 1)
+    except (TypeError, ValueError):
+        return 10
+
+
+def _lease_fresh(lease: Dict[str, Any], now: float) -> bool:
+    """A lease protects its worker while the HOLDER process is alive, or
+    (dead holder — crash) until the stale grace expires."""
+    try:
+        pid = int(lease.get("holder_pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 0:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        if alive:
+            birth = lease.get("holder_birth")
+            if birth is None or _pid_birth(pid) in (None, int(birth)):
+                return True
+    try:
+        acquired = float(lease.get("acquired_at") or 0.0)
+    except (TypeError, ValueError):
+        acquired = 0.0
+    return now - acquired < LEASE_STALE_GRACE_S
+
+
+def _fresh_leases(record: WorkerRecord, now: float) -> Dict[str, Dict[str, Any]]:
+    return {
+        key: lease for key, lease in (record.leases or {}).items()
+        if isinstance(lease, dict) and _lease_fresh(lease, now)
+    }
+
+
+def acquire_lease(name: str, lease_id: str, session: str = "") -> bool:
+    """Lease the worker for one RUN (never a whole conversation).
+
+    A leased worker is protected from the idle reaper and from capacity
+    reclaim until the lease is released (observed remote-terminal) or —
+    crash safety — its holder dies and the stale grace passes. Returns
+    False when no record exists (fake/ephemeral workers lease nothing).
+    """
+    name, lease_id = str(name), str(lease_id)
+    if not name or not lease_id:
+        return False
+    with _worker_lock(name):
+        record = _read_record(name)
+        if record is None:
+            return False
+        pid = os.getpid()
+        leases = dict(record.leases or {})
+        leases[lease_id] = {
+            "session": str(session or ""),
+            "holder_pid": pid,
+            "holder_birth": _pid_birth(pid),
+            "acquired_at": time.time(),
+        }
+        return _update_record_locked(
+            name, record.generation,
+            leases=leases, last_active_at=time.time(),
+        )
+
+
+def release_lease(name: str, lease_id: str) -> None:
+    """Release one run's lease (idempotent, never raises). Bumps the
+    idle clock so a just-finished worker gets a full TTL."""
+    try:
+        name, lease_id = str(name), str(lease_id)
+        if not name or not lease_id:
+            return
+        with _worker_lock(name):
+            record = _read_record(name)
+            if record is None or lease_id not in (record.leases or {}):
+                return
+            leases = dict(record.leases)
+            leases.pop(lease_id, None)
+            _update_record_locked(
+                name, record.generation,
+                leases=leases, last_active_at=time.time(),
+            )
+    except Exception:
+        logger.warning("release_lease(%s, %s) failed", name, lease_id, exc_info=True)
+
+
+def _evict_locked(record: WorkerRecord, reason: str) -> None:
+    """Stop + retire one generation (caller holds its flock)."""
+    logger.info(
+        "evicting worker %s (pid %d, generation %s): %s",
+        record.name, record.pid, record.generation, reason,
+    )
+    _stop_generation(record)
+    _cleanup_generation(record)
+
+
+def reconcile(now: Optional[float] = None) -> List[str]:
+    """One reaper pass: retire dead generations and reap IDLE (leaseless
+    past :data:`IDLE_TTL_S`) workers with a bounded full-tree stop.
+    A leased worker is never touched. Returns the reaped names.
+    Never raises (a broken worker must not break the caller's tick)."""
+    reaped: List[str] = []
+    now = time.time() if now is None else now
+    directory = state_dir()
+    if not directory.is_dir():
+        return reaped
+    for path in sorted(directory.glob("*.json")):
+        try:
+            with _worker_lock(path.stem):
+                record = _read_record(path.stem)
+                if record is None:
+                    continue
+                if not _record_alive(record):
+                    _evict_locked(record, "process dead")
+                    reaped.append(record.name)
+                    continue
+                fresh = _fresh_leases(record, now)
+                if fresh != (record.leases or {}):
+                    # Trim expired leases so the map cannot grow forever.
+                    _update_record_locked(
+                        record.name, record.generation, leases=fresh,
+                    )
+                if fresh:
+                    continue
+                if now - float(record.last_active_at or record.started_at) > (
+                    IDLE_TTL_S
+                ):
+                    _evict_locked(record, f"idle past {int(IDLE_TTL_S)}s TTL")
+                    reaped.append(record.name)
+        except Exception:
+            logger.warning(
+                "reconcile pass failed for %s", path.stem, exc_info=True
+            )
+    return reaped
+
+
+@contextmanager
+def _try_worker_lock(name: str) -> Iterator[bool]:
+    """Non-blocking flock variant for capacity eviction: a contended
+    worker is skipped (someone is actively touching it), never waited on
+    — two at-capacity spawners can never deadlock on each other."""
+    path = state_dir() / "locks" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            pass
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _enforce_capacity(spawning_name: str, real: str) -> None:
+    """Make room for a new worker under the cap, or fail honestly.
+
+    Reclaims LEASELESS workers (least-recently-active first, regardless
+    of TTL — capacity pressure beats idle patience) until the new spawn
+    fits. Never evicts a leased worker, never queues, never silently
+    serializes: when every slot is held by a leased worker this raises
+    a WorkerError naming them.
+    """
+    limit = _max_workers()
+    now = time.time()
+    others = [r for r in live_workers() if r.name != spawning_name]
+    if len(others) < limit:
+        return
+    idle = sorted(
+        (r for r in others if not _fresh_leases(r, now)),
+        key=lambda r: float(r.last_active_at or r.started_at),
+    )
+    need = len(others) - limit + 1
+    for record in idle:
+        if need <= 0:
+            break
+        with _try_worker_lock(record.name) as acquired:
+            if not acquired:
+                continue  # contended — someone is using it; skip
+            current = _read_record(record.name)
+            if (
+                current is None
+                or current.generation != record.generation
+                or _fresh_leases(current, time.time())
+            ):
+                continue  # changed under us — no longer safe to evict
+            _evict_locked(current, "capacity reclaim")
+            need -= 1
+    if need > 0:
+        busy = sorted(
+            f"{r.name} ({r.repo_path})"
+            for r in live_workers()
+            if r.name != spawning_name and _fresh_leases(r, time.time())
+        )
+        raise WorkerError(
+            f"worker capacity exhausted: {len(busy)} of {limit} workers "
+            f"hold active run leases and none can be reclaimed for "
+            f"{real} — busy: {', '.join(busy) or '(none visible)'}. "
+            "Wait for a run to finish, stop one (cursor_stop), or raise "
+            "GHOST_CURSOR_MAX_WORKERS if your Cursor plan allows more "
+            "self-hosted workers."
+        )
 
 
 def unroutable_hint(name: str, repo_path: str) -> str:
