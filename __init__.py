@@ -874,6 +874,31 @@ def _run_attempt(
         "retryable": None,
         "retry_after": None,
     }
+    handle_name = job.session_name or job.requested_session_id or ""
+
+    def _persist_create_intent() -> None:
+        # Durable intent BEFORE the non-idempotent create POST: a crash
+        # in the window before the identity lands is recovered by the
+        # reconciler's bounded title/time matching (supervisor).
+        _handles.record(
+            handle_name,
+            create_intent={"ts": time.time(), "state": "creating"},
+        )
+
+    def _persist_created(agent_id: str, run_id: str, resumed: bool) -> None:
+        # Producer-boundary identity write: the agent id becomes durable
+        # the moment the API returns it — before any queue hop.
+        with job._lock:
+            job.cursor_session_id = agent_id
+            job.resumed = resumed
+        _handles.record(
+            handle_name or agent_id,
+            cursor_session_id=agent_id,
+            latest_run_id=run_id or None,
+            status="running",
+            create_intent={"ts": time.time(), "state": "recorded"},
+        )
+
     normalizer = _events.SdkNormalizer()
     try:
         for key, obj in _cloud.run_cloud(
@@ -888,6 +913,8 @@ def _run_attempt(
             model=job.requested_model,
             runtime=job.runtime,
             session_title=job.session_name or None,
+            on_create_intent=_persist_create_intent,
+            on_created=_persist_created,
             # Kwarg only when armed: fakes/replays without the param keep
             # working for ordinary (non-retry) dispatches.
             **(

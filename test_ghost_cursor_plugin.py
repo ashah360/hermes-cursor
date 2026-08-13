@@ -6405,6 +6405,141 @@ def _wait_settled(name, status, timeout=10.0):
     )
 
 
+class TestCreateIntentAndRecovery:
+    """Cursor's create is NOT idempotent (no idempotency key in the API):
+    a durable intent is persisted before the POST, the returned identity
+    is persisted at the producer boundary, and a crashed create is
+    recovered by bounded newest-title/time matching — ambiguity is
+    reported, never auto-cancelled."""
+
+    def test_intent_fires_before_create_and_identity_lands_at_producer(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(agent_id="bc-intent-1", run_id="run-intent-1")
+        _install_fake_rest(monkeypatch, client)
+        order = []
+        list(gc_cloud.run_cloud(
+            "do it", str(tmp_path),
+            inactivity_timeout_s=30.0,
+            cancel_check=lambda: False,
+            on_create_intent=lambda: order.append(
+                ("intent", len(client.create_calls))
+            ),
+            on_created=lambda agent_id, run_id, resumed: order.append(
+                ("created", agent_id, run_id, resumed)
+            ),
+        ))
+        # Intent persisted BEFORE the non-idempotent POST left the box…
+        assert order[0] == ("intent", 0)
+        # …and the returned identity persisted at the producer boundary.
+        assert order[1] == ("created", "bc-intent-1", "run-intent-1", False)
+
+    def test_send_persists_intent_then_agent_identity_on_the_handle(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        client = _FakeRestClient(agent_id="bc-intent-2", run_id="run-intent-2")
+        _install_fake_rest(monkeypatch, client)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        cursor_send_message(name, "build the thing")
+        job = _job_for("bc-intent-2")
+        assert job.done_event.wait(10)
+        entry = gc_handles.get(name)
+        assert entry["cursor_session_id"] == "bc-intent-2"
+        assert entry["latest_run_id"] == "run-intent-2"
+        # The intent settled to "recorded" — recovery has nothing to do.
+        assert entry["create_intent"]["state"] == "recorded"
+
+    def _stale_intent_entry(self, name, ts):
+        gc_handles.record(
+            name, repo="/w", status="created", session_key="",
+            create_intent={"ts": ts, "state": "creating"},
+        )
+
+    def test_reconciler_adopts_newest_matching_agent_and_reports_ambiguity(
+        self, clean_state, monkeypatch
+    ):
+        import datetime as _dt
+
+        intent_ts = time.time() - 600
+        iso = lambda t: _dt.datetime.fromtimestamp(
+            t, _dt.timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        self._stale_intent_entry("Fix the flux capacitor", intent_ts)
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-newer", "name": "Fix the flux capacitor",
+             "createdAt": iso(intent_ts + 40), "latestRunId": "run-n"},
+            {"id": "bc-older", "name": "Fix the flux capacitor",
+             "createdAt": iso(intent_ts + 10), "latestRunId": "run-o"},
+            {"id": "bc-unrelated", "name": "Other work",
+             "createdAt": iso(intent_ts + 20)},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Fix the flux capacitor")
+        assert entry["cursor_session_id"] == "bc-newer"   # newest match wins
+        assert entry["latest_run_id"] == "run-n"
+        assert entry["create_intent"]["state"] == "recovered"
+        # Ambiguity is REPORTED (never auto-cancelled).
+        assert "bc-older" in str(entry.get("status_note") or "")
+
+    def test_reconciler_reports_unresolved_when_listing_truncates(
+        self, clean_state, monkeypatch
+    ):
+        self._stale_intent_entry("Needle session", time.time() - 600)
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {
+            "items": [
+                {"id": f"bc-{i}", "name": "Other", "createdAt": "2026-01-01T00:00:00Z"}
+                for i in range(limit)
+            ],
+            "nextCursor": "bc-more",
+        }
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Needle session")
+        assert entry["create_intent"]["state"] == "unresolved"
+        assert not entry.get("cursor_session_id")
+        assert "cursor.com/agents" in str(entry.get("status_note") or "")
+
+    def test_reconciler_settles_failed_when_create_never_landed(
+        self, clean_state, monkeypatch
+    ):
+        self._stale_intent_entry("Ghost create", time.time() - 600)
+        client = _FakeRestClient()
+        client.list_agents = lambda limit=20: {"items": [
+            {"id": "bc-x", "name": "Other", "createdAt": "2026-01-01T00:00:00Z"},
+        ]}
+        monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+        monkeypatch.setattr(gc_supervisor, "ensure_supervisor", lambda name: None)
+
+        gc_supervisor.reconcile_once()
+        entry = gc_handles.get("Ghost create")
+        assert entry["create_intent"]["state"] == "failed"
+        assert entry["status"] == "failed"
+
+
+class TestPreflightOrder:
+    def test_bad_model_never_spawns_or_leases_a_worker(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(models=["real-model"])
+        _install_fake_rest(monkeypatch, client)
+        monkeypatch.setattr(
+            gc_workers, "ensure_worker",
+            lambda repo: pytest.fail(
+                "a failed pure preflight must never spawn a worker"
+            ),
+        )
+        with pytest.raises(gc_cloud.CloudRunnerError) as err:
+            _run_cloud_events(tmp_path, model="bogus-model")
+        assert "not in the cursor model catalog" in str(err.value)
+
+
 class TestRunLeases:
     """A local run holds a per-RUN worker lease from dispatch until the
     observed remote-terminal settle — the reaper can never take a worker

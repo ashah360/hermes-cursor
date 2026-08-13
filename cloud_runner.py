@@ -545,12 +545,21 @@ class _CloudWorker:
         repo_url: Optional[str] = None,
         starting_ref: Optional[str] = None,
         session_title: Optional[str] = None,
+        on_create_intent: Optional[Callable[[], None]] = None,
+        on_created: Optional[Callable[[str, str, bool], None]] = None,
     ) -> None:
         self._task = task
         self._repo = repo
         self._out_q = out_q
         self._cancel_requested = cancel_requested
         self._runtime = runtime
+        # Producer-boundary durability hooks (create is NOT idempotent):
+        # on_create_intent fires right before the fresh-create POST;
+        # on_created(agent_id, run_id, resumed) fires the moment the API
+        # returned identity — BEFORE any queue hop, so a consumer crash
+        # can no longer lose the agent id.
+        self._on_create_intent = on_create_intent
+        self._on_created = on_created
         # Prior agent to continue with a follow-up run (None = fresh create).
         self._resume_agent_id = agent_id
         self._model = model or None
@@ -650,6 +659,14 @@ class _CloudWorker:
 
     # -- agent establishment ---------------------------------------------------
 
+    def _notify_created(self, agent_id: str, run_id: str, resumed: bool) -> None:
+        if self._on_created is None or not agent_id:
+            return
+        try:
+            self._on_created(agent_id, run_id, resumed)
+        except Exception:
+            logger.exception("on_created callback failed")
+
     def _establish(self, client: CursorRestClient) -> Tuple[str, str, bool, str]:
         """Create the run: follow-up on the existing agent, else a fresh
         agent. Returns (agent_id, run_id, resumed, agents_ui_url)."""
@@ -657,6 +674,7 @@ class _CloudWorker:
             try:
                 created = client.send_followup(self._resume_agent_id, self._task)
                 run_id = str((created.get("run") or {}).get("id") or "")
+                self._notify_created(self._resume_agent_id, run_id, True)
                 return (
                     self._resume_agent_id,
                     run_id,
@@ -693,6 +711,15 @@ class _CloudWorker:
             if self._repo_url
             else None
         )
+        # Durable intent BEFORE the non-idempotent POST: the API has no
+        # idempotency key, so a crash between this create and the
+        # identity write is recovered by bounded title/time matching
+        # (supervisor reconciler) instead of leaking a live agent.
+        if self._on_create_intent is not None:
+            try:
+                self._on_create_intent()
+            except Exception:
+                logger.exception("on_create_intent callback failed")
         created = client.create_agent(
             self._task,
             model_id=self._model_id or None,
@@ -709,6 +736,7 @@ class _CloudWorker:
         agent_id = str(agent.get("id") or "")
         run_id = str(run.get("id") or "")
         url = str(agent.get("url") or "") or f"{AGENTS_UI_BASE}/{agent_id}"
+        self._notify_created(agent_id, run_id, False)
         return agent_id, run_id, False, url
 
     # -- stream consumption ------------------------------------------------------
@@ -1037,6 +1065,8 @@ def run_cloud(
     starting_ref: Optional[str] = None,
     session_title: Optional[str] = None,
     first_event_timeout_s: Optional[float] = None,
+    on_create_intent: Optional[Callable[[], None]] = None,
+    on_created: Optional[Callable[[str, str, bool], None]] = None,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Run cursor on ``task`` as a cloud agent, yielding events.
 
@@ -1128,6 +1158,8 @@ def run_cloud(
         repo_url=derived_url,
         starting_ref=derived_ref,
         session_title=session_title,
+        on_create_intent=on_create_intent,
+        on_created=on_created,
     )
     thread = threading.Thread(
         target=worker.run, name="ghost-cursor-cloud", daemon=True

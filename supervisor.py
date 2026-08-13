@@ -104,6 +104,15 @@ FAST_FAIL_WINDOW_S = 120.0
 # GET authority and un-settles them. Bounded by this window so the pass
 # never polls the whole terminal backlog forever.
 FALSE_SETTLE_REPAIR_WINDOW_S = 15 * 60.0
+# Create-intent recovery (the API has NO idempotency key): an intent still
+# "creating" after this age with no live job is presumed crashed and is
+# recovered by title/time matching. Generous: POST /v1/agents has been
+# observed to take >30s, and a healthy dispatcher clears the intent at the
+# producer boundary within one request round-trip.
+CREATE_INTENT_MIN_AGE_S = 300.0
+# An adopted agent must have been created no earlier than this long before
+# the intent was persisted (clock-skew allowance).
+CREATE_MATCH_SKEW_S = 120.0
 
 # Reconnect pacing for the re-attached stream (bounded per drop; the
 # supervisor itself never gives up — it degrades to the poll watchdog).
@@ -1003,6 +1012,151 @@ def _repair_false_settle(
     return True
 
 
+def _parse_iso_ts(value: Any) -> Optional[float]:
+    """Epoch seconds for an ISO-8601 string ('Z' suffix included), or
+    None when unparseable."""
+    import datetime as _dt
+
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return _dt.datetime.fromisoformat(raw).timestamp()
+    except Exception:
+        return None
+
+
+def _recover_create_intent(
+    name: str, entry: Dict[str, Any], client_factory: Any
+) -> bool:
+    """Resolve a crashed create: the durable intent said a non-idempotent
+    ``POST /v1/agents`` was about to leave the box, and no identity was
+    ever recorded.
+
+    Bounded recovery (the API has no idempotency key and no name filter):
+    list the newest agents and adopt the NEWEST one whose name equals the
+    session title and whose createdAt falls inside
+    ``[intent_ts - CREATE_MATCH_SKEW_S, now]``. Ambiguity (several
+    matches) is adopted-newest and REPORTED — never auto-cancelled. A
+    truncated listing with no match resolves to "unresolved" (check
+    cursor.com/agents), never a false "failed"; an exhaustive listing
+    with no match settles the handle failed. Returns True when an agent
+    was adopted (the caller then attaches a supervisor). Never raises.
+    """
+    intent = entry.get("create_intent")
+    if not isinstance(intent, dict) or str(intent.get("state") or "") != "creating":
+        return False
+    if str(entry.get("cursor_session_id") or ""):
+        # Identity landed after all (e.g. legacy write path) — settle the
+        # intent; nothing to recover.
+        _handles.record(name, create_intent={**intent, "state": "recorded"})
+        return False
+    if _job_is_live(name):
+        return False  # the dispatching process is still mid-create
+    try:
+        intent_ts = float(intent.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        intent_ts = 0.0
+    if time.time() - intent_ts < CREATE_INTENT_MIN_AGE_S:
+        return False  # a live create POST can legitimately take >30s
+    try:
+        client = client_factory()
+    except _cloud.CloudRunnerError as exc:
+        logger.debug("create-intent recovery skipped (no client): %s", exc)
+        return False
+    try:
+        response = client.list_agents(limit=100)
+    except RestClientError as exc:
+        logger.warning("create-intent recovery list_agents failed: %s", exc)
+        return False
+    items = response.get("items")
+    items = items if isinstance(items, list) else []
+
+    def _created_at(agent: Dict[str, Any]) -> float:
+        return _parse_iso_ts((agent or {}).get("createdAt")) or 0.0
+
+    matches = [
+        agent for agent in items
+        if isinstance(agent, dict)
+        and str(agent.get("name") or "") == name
+        and _created_at(agent) >= intent_ts - CREATE_MATCH_SKEW_S
+    ]
+    if matches:
+        newest = max(matches, key=_created_at)
+        agent_id = str(newest.get("id") or "")
+        others = sorted(
+            str(a.get("id") or "") for a in matches if a is not newest
+        )
+        note = (
+            f"ambiguous create recovery: adopted {agent_id}; other agents "
+            f"titled {name!r} in the window: {', '.join(others)} — review "
+            "at cursor.com/agents (nothing was auto-cancelled)"
+            if others else ""
+        )
+        _handles.record(
+            name,
+            cursor_session_id=agent_id,
+            latest_run_id=str(newest.get("latestRunId") or "") or None,
+            status="running",
+            status_note=note,
+            create_intent={**intent, "state": "recovered"},
+        )
+        _handles.record_supervision(
+            name,
+            phase=PHASE_STREAMING,
+            current_attempt_id=mint_attempt_id(),
+            attempt_n=1,
+        )
+        _eventlog.append(name, _events.lifecycle(
+            "create.recovered",
+            agent_id=agent_id,
+            ambiguous_with=others or None,
+            note=(
+                "a crashed create was recovered by newest-title/time "
+                "matching; re-attaching supervision"
+            ),
+        ))
+        logger.warning(
+            "ghost_cursor recovered crashed create for %s -> %s%s",
+            name, agent_id, f" (ambiguous: {others})" if others else "",
+        )
+        return True
+
+    truncated = bool(response.get("nextCursor")) or len(items) >= 100
+    if truncated:
+        _handles.record(
+            name,
+            create_intent={**intent, "state": "unresolved"},
+            status_note=(
+                "create outcome UNRESOLVED: the agent listing is truncated "
+                "and no matching agent was visible — check "
+                "https://cursor.com/agents for an agent titled "
+                f"{name!r} before re-sending"
+            ),
+        )
+        _eventlog.append(name, _events.lifecycle(
+            "create.unresolved", note="agent listing truncated; not settled",
+        ))
+        return False
+
+    _handles.record(
+        name,
+        status="failed",
+        create_intent={**intent, "state": "failed"},
+        status_note=(
+            "the create never landed remotely (no agent with this title "
+            "exists) — the dispatching process died before the POST; "
+            "re-send to retry"
+        ),
+    )
+    _eventlog.append(name, _events.lifecycle(
+        "create.failed", note="no matching remote agent; settled failed",
+    ))
+    return False
+
+
 def reconcile_once() -> List[str]:
     """One reconciler pass: spawn a supervisor for every handle in a
     non-terminal supervision phase with no live supervision in this
@@ -1035,7 +1189,8 @@ def reconcile_once() -> List[str]:
                 continue
             if not _handles.supervision_is_live(entry):
                 if not (
-                    _adopt_legacy_handle(name, entry)
+                    _recover_create_intent(name, entry, _probe_client)
+                    or _adopt_legacy_handle(name, entry)
                     or _repair_false_settle(name, entry, _probe_client)
                 ):
                     continue
