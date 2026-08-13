@@ -226,6 +226,138 @@ class TestEnsureWorker:
         assert "agent" in str(err.value)
 
 
+class TestRecordV2AndFencing:
+    """Durable versioned records: legacy adoption, generation fencing,
+    cross-process (flock) spawn serialization."""
+
+    def test_legacy_v1_record_is_adopted_not_replaced(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 7777,
+            "log_path": str(directory / f"{name}.log"),
+            "started_at": 12345.0,
+            "verified": True,
+        }))
+        fake_procs.add(7777)
+
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 7777              # adopted, not killed
+        assert len(fake_spawn) == 0            # no respawn
+        assert record.supervision == "legacy"
+        assert record.generation == "legacy-7777"
+        assert record.verified                 # v1 proof carries over
+
+    def test_stale_generation_cannot_overwrite_current_record(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        current_gen = record.generation
+        assert current_gen
+
+        ok = workers._update_record(
+            record.name, "gen-someone-else", last_error="stale writer"
+        )
+        assert ok is False
+        persisted = workers._read_record(record.name)
+        assert persisted.generation == current_gen
+        assert persisted.last_error != "stale writer"
+
+    def test_concurrent_ensure_spawns_exactly_one_worker(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        import threading as _threading
+        import time as _time
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        calls = []
+
+        def slow_spawn(name, repo_path, log_path):
+            _time.sleep(0.2)  # hold the lock long enough for a real race
+            pid = 5000 + len(calls)
+            calls.append(name)
+            fake_procs.add(pid)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as fh:
+                fh.write(f"registering...\n{workers.READY_LINE}\n")
+            return pid
+
+        monkeypatch.setattr(workers, "_spawn_worker", slow_spawn)
+        results, errors = [], []
+
+        def ensure():
+            try:
+                results.append(workers.ensure_worker(str(repo)))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [_threading.Thread(target=ensure) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors
+        assert len(calls) == 1                     # exactly one spawn
+        assert {r.pid for r in results} == {5000}  # both got the winner
+
+
+class TestGenerationScopedReadiness:
+    def test_respawn_rejects_previous_generations_ready_line(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        """A dead worker's log keeps its old 'Worker is now running' line;
+        the respawned generation must NOT be declared ready by it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        log = workers.state_dir() / f"{name}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # Evidence from a PREVIOUS incarnation, within tail range.
+        log.write_text(f"old boot...\n{workers.READY_LINE}\nStopping worker\n")
+
+        def spawn_never_ready(name, repo_path, log_path):
+            fake_procs.add(6001)
+            with open(log_path, "a") as fh:
+                fh.write("registering fresh generation...\n")
+            return 6001
+
+        monkeypatch.setattr(workers, "_spawn_worker", spawn_never_ready)
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "did not report ready" in str(err.value)
+
+    def test_respawn_accepts_own_generations_ready_line(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        log = workers.state_dir() / f"{name}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"old boot...\n{workers.READY_LINE}\n")
+
+        def spawn_ready(name, repo_path, log_path):
+            fake_procs.add(6002)
+            with open(log_path, "a") as fh:
+                fh.write(f"fresh boot...\n{workers.READY_LINE}\n")
+            return 6002
+
+        monkeypatch.setattr(workers, "_spawn_worker", spawn_ready)
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 6002
+        assert record.state == "ready"
+
+
 class TestSpawnEnv:
     def test_strips_loader_and_interpreter_vars(self, monkeypatch):
         monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/python/lib")
