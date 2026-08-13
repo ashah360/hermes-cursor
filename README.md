@@ -40,8 +40,10 @@ Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the age
 
 Sessions are real cloud agents either way — the agent loop always runs on Cursor's side, which is exactly why every session **syncs natively to cursor.com/agents, the web app, and mobile**. With `runtime="local"`, tool calls (terminal, edits) execute on this machine through a "My Machines" worker:
 
-- The plugin spawns `agent worker start` **detached** (own session, pidfile + log under the state dir) the first time a repo needs one, and reattaches to live workers on plugin init — **gateway restarts don't kill runs or workers**.
-- One worker per repo checkout; names are `<hostname>-<8-char path hash>` so two worktrees of the same repo (same git origin) stay distinguishable.
+- **Canonical identity**: every local repo input resolves through `realpath(git rev-parse --show-toplevel)` — `/repo` and `/repo/subdir` are ONE worker + admission identity; sibling linked git worktrees of the same repository stay distinct. Names are `<hostname>-<8-char path hash>`.
+- **One worker per worktree, fully isolated**: each worker gets a deterministic private `CURSOR_DATA_DIR` under the state dir (the CLI's exclusive `worker.lock` lives inside it, so parallel worktrees never contend) plus a localhost `--management-addr` health/readiness endpoint. Cursor authentication stays shared.
+- **Supervision**: workers run as deterministic **transient user systemd services** (`cursor-worker-<name>.service`) — gateway-independent lifetime, MainPID/InvocationID as the record's generation fence, bounded full-cgroup stop, adopted across gateway restarts. Without a user manager the spawn degrades (clearly surfaced) to a detached process with bounded process-group teardown. **Gateway restarts don't kill runs or workers.**
+- **Per-run leases**: a run leases its worker from dispatch until the observed remote-terminal settle; the reconciler reaps only **leaseless** workers past an idle TTL (`GHOST_CURSOR_WORKER_IDLE_TTL_S`, default 1800). At the worker cap (`GHOST_CURSOR_MAX_WORKERS`, default 10 = Cursor's documented per-user quota) idle workers are reclaimed first; an all-leased fleet fails with an honest capacity error, never silent serialization.
 - Routing match is threefold: the worker belongs to the API key's cursor account, the name matches, and the worker's registered repo (its checkout's git origin) matches the target. No match → the create is rejected server-side, no silent fallback to a cursor-hosted VM.
 
 ## Requirements
@@ -132,7 +134,7 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 | `progress.py` | Progress subscriptions — per-run digest timers, `cursor_subscribe` plumbing, completion-queue delivery guards |
 | `rest_client.py` | Typed httpx client for the Cursor REST v1 API — error mapping, GET-only retries, SSE parser |
 | `cloud_runner.py` | REST+SSE transport — agent create/follow-up, SSE consumption with Last-Event-ID re-attach, watchdogs, native cancel, terminal settle via GET runs/{id} |
-| `workers.py` | Detached "My Machines" worker manager for runtime=local — spawn, readiness, routability |
+| `workers.py` | "My Machines" worker controller for runtime=local — canonical worktree identity, isolated data roots, systemd transient services (degraded detached fallback), generation-fenced records, per-run leases, idle reaping, capacity |
 | `events.py` | Canonical envelope builders + cloud-event → envelope mapping |
 | `jobs.py` | Background job tracking + completion/digest delivery into the agent loop |
 | `handles.py` | Session-handle persistence (name → agent id, repo, runtime, subscribers) |

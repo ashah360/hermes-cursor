@@ -1,32 +1,48 @@
-"""Detached "My Machines" worker manager for runtime="local" sessions.
+""""My Machines" worker controller for runtime="local" sessions (v2).
 
 A cloud agent routed with ``env: {"type": "machine", "name": <worker>}``
 executes its tool calls inside a self-hosted worker process (the ``agent``
-CLI's ``worker start``) registered against the repo's checkout. This module
-owns those workers:
+CLI's ``worker start``) registered against a worktree. This module is the
+controller that owns those workers:
 
-* ``ensure_worker(repo_path)`` — reuse the live worker already serving that
-  exact checkout, else spawn a fresh one detached and wait (bounded) for
-  its "Worker is now running" line.
-* Deterministic names: ``<hostname-slug>-<8-char sha256 of the realpath>``
-  — one worker per checkout per box, so the plugin can never start a
-  SECOND worker on a checkout it already serves (phase-0 lesson: a second
-  worker on the same checkout registers fine but NEVER receives
-  assignments; runs targeting it hard-fail in ~35s with an empty
-  conversation).
-* State (``<name>.json``) and logs (``<name>.log``) live under
-  ``<HERMES_HOME>/state/ghost_cursor/workers/``. Dead pidfiles are cleaned
-  lazily on read.
-* Workers are NEVER killed on plugin shutdown — they are cheap, stateless
-  between runs, and killing one would strand any in-flight run routed to
-  it. A worker that dies is simply respawned on the next send.
+* **Canonical identity** — every local path resolves through
+  ``realpath(git rev-parse --show-toplevel)``: one logical worker per
+  canonical worktree per box. ``/repo`` and ``/repo/subdir`` are ONE
+  identity; sibling linked git worktrees stay distinct. Deterministic
+  names: ``<hostname-slug>-<8-char sha256 of the canonical path>`` — the
+  plugin can never start a SECOND worker on a worktree it already serves
+  (phase-0 lesson: a second worker on the same checkout registers fine
+  but NEVER receives assignments).
+* **Isolation** — each worker gets a private deterministic
+  ``CURSOR_DATA_DIR`` (the CLI takes SQLite BEGIN EXCLUSIVE on
+  ``<data-dir>/worker.lock``, so isolation is what makes parallel
+  worktrees possible; auth lives in the config dir and stays shared) and
+  a localhost ``--management-addr`` exposing /healthz /readyz /metrics.
+* **Supervision** — a deterministic transient user systemd service per
+  worker (``cursor-worker-<name>.service``): gateway-independent
+  lifetime, authoritative MainPID + InvocationID (the record's
+  generation), bounded full-cgroup stop, adoption across restarts.
+  Without a user manager the spawn DEGRADES (clearly surfaced) to a
+  detached process with bounded process-group teardown.
+* **Generation-fenced records** — versioned ``<name>.json`` under
+  ``<HERMES_HOME>/state/ghost_cursor/workers/``; every mutation is
+  serialized by a per-worker flock and fenced by generation, so a
+  losing/stale generation can never overwrite the authoritative record.
+  v1 records are adopted, never killed. Readiness evidence is
+  generation-scoped (per-generation log + management probe); a
+  generation that never proved readiness is re-proven before reuse.
+* **Per-RUN leases** — a run leases its worker from dispatch until the
+  observed remote-terminal settle; :func:`reconcile` (the supervisor's
+  tick) reaps only LEASELESS workers past :data:`IDLE_TTL_S`. At the
+  cap (:func:`_max_workers`) idle workers are reclaimed first; an
+  all-leased fleet raises an honest capacity error.
 
-Routability: a FRESH worker may still be unroutable (external worker on
-the same checkout — e.g. a manually-started one this module doesn't know
-about). That failure signature (run goes ERROR within ~60s with zero
-conversation events) is detected by the run loop (``cloud_runner``), which
-uses :func:`live_workers` to name the likely conflict; ``verified`` is
-flipped on the record after the first run that streams real events.
+Health, registration, and routability are three DISTINCT facts: process
+liveness (pid + birth identity / unit state), backend registration (the
+management endpoint's ``connected``), and proven routing (``verified`` —
+flipped by the first run that streams real events through this
+generation; the phase-0 unroutable signature is detected by
+``cloud_runner``, which uses :func:`live_workers` to name the conflict).
 """
 
 from __future__ import annotations
