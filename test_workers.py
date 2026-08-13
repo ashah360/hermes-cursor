@@ -4,6 +4,7 @@ table (``_pid_alive``) and a faked spawner (``_spawn_worker``)."""
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -589,6 +590,102 @@ class TestSystemdSupervision:
         assert second.generation != first.generation
         assert second.pid != first.pid
         assert not second.verified  # routing proof does NOT carry over
+
+
+class TestSystemdOwnershipVerification:
+    def test_systemd_run_command_construction(self):
+        cmd = workers._systemd_run_command(
+            "cursor-worker-w.service",
+            ["/usr/bin/agent", "worker", "start", "--name", "w"],
+            {"CURSOR_DATA_DIR": "/state/data/w", "PATH": "/usr/bin",
+             "HOME": "/home/u", "IRRELEVANT": "x"},
+            "/repo",
+            Path("/state/w-gen.log"),
+        )
+        assert cmd[:2] == ["systemd-run", "--user"]
+        assert "--unit=cursor-worker-w.service" in cmd
+        assert "--collect" in cmd
+        assert "--service-type=exec" in cmd
+        assert "--property=KillMode=control-group" in cmd
+        assert f"--property=TimeoutStopSec={workers.STOP_TIMEOUT_S}" in cmd
+        assert "--property=Restart=no" in cmd
+        assert "--property=StandardOutput=append:/state/w-gen.log" in cmd
+        assert "--working-directory=/repo" in cmd
+        assert "--setenv=CURSOR_DATA_DIR=/state/data/w" in cmd
+        assert "--setenv=IRRELEVANT=x" not in cmd  # only the allowlist
+        assert cmd[-5:] == ["--", "/usr/bin/agent", "worker", "start",
+                            "--name", "w"][-5:]
+
+    def test_adoption_mismatch_is_never_adopted(self, tmp_path, fake_systemd):
+        """A unit whose live MainPID/InvocationID no longer matches the
+        persisted record is NOT this record's generation — it must be
+        replaced, never handed out."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        # The unit was restarted behind our back: same name, new
+        # identity (different MainPID + InvocationID).
+        fake_systemd["units"][first.unit] = {
+            "ActiveState": "active",
+            "MainPID": str(first.pid),        # keep pid: only invocation
+            "InvocationID": "inv-imposter",   # identity differs
+        }
+        second = workers.ensure_worker(str(repo))
+        assert second.generation != first.generation
+        assert len(fake_systemd["started"]) == 2  # respawned, not adopted
+
+    def test_unverified_stop_fails_closed_and_retains_the_record(
+        self, tmp_path, fake_systemd, fake_procs, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # leader died…
+        # …but the stop CANNOT be verified (cgroup still has members).
+        monkeypatch.setattr(workers, "_systemd_stop", lambda unit: False)
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "confirmed stopped" in str(err.value)
+        retained = workers._read_record(record.name)
+        assert retained is not None          # never an untracked remnant
+        assert retained.state == workers.STATE_DRAINING
+        assert "stop unverified" in retained.last_error
+        assert len(fake_systemd["started"]) == 1  # no duplicate spawn
+
+
+class TestReadyReuseRevalidation:
+    def test_disconnected_ready_worker_is_replaced(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(
+            workers, "_probe_management",
+            lambda record: {"status": "not_ready", "connected": False,
+                            "claimed": False},
+        )
+        second = workers.ensure_worker(str(repo))
+        assert second.generation != first.generation  # replaced
+        assert len(fake_spawn) == 2
+
+    def test_claimed_but_connected_worker_is_still_handed_out(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """claimed=true means BUSY, not unhealthy — the claimed-vs-
+        connected distinction must be preserved."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(
+            workers, "_probe_management",
+            lambda record: {"status": "not_ready", "connected": True,
+                            "claimed": True},
+        )
+        second = workers.ensure_worker(str(repo))
+        assert second.generation == first.generation  # reused
+        assert len(fake_spawn) == 1
 
 
 class TestDegradedFallback:

@@ -358,19 +358,16 @@ def _linger_enabled() -> Optional[bool]:
     return None
 
 
-def _systemd_start(
+def _systemd_run_command(
     unit: str, argv: List[str], env: Dict[str, str], cwd: str, log_path: Path
-) -> None:
-    """Start ``argv`` as a transient user service (no unit file).
-
-    The user manager forks the worker — zero process-tree coupling to
-    the gateway. KillMode=control-group + TimeoutStopSec give bounded
-    full-cgroup teardown; Restart=no keeps respawn decisions in this
-    controller; --collect garbage-collects failed transient units.
-    stdout/stderr append to ``log_path`` so the log contract matches the
-    detached path.
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+) -> List[str]:
+    """The exact ``systemd-run`` invocation for one worker generation
+    (pure construction — tested directly): KillMode=control-group +
+    TimeoutStopSec give bounded full-cgroup teardown; Restart=no keeps
+    respawn decisions in this controller; --collect garbage-collects
+    failed transient units; stdout/stderr append to ``log_path`` so the
+    log contract matches the detached path; only the allowlisted env
+    keys cross into the unit."""
     cmd = [
         "systemd-run", "--user", f"--unit={unit}", "--collect",
         "--service-type=exec",
@@ -384,8 +381,19 @@ def _systemd_start(
     for key in ("CURSOR_DATA_DIR", "PATH", "HOME"):
         if key in env:
             cmd.append(f"--setenv={key}={env[key]}")
-    cmd += ["--", *argv]
-    proc = _run_systemctl(cmd)
+    return cmd + ["--", *argv]
+
+
+def _systemd_start(
+    unit: str, argv: List[str], env: Dict[str, str], cwd: str, log_path: Path
+) -> None:
+    """Start ``argv`` as a transient user service (no unit file).
+
+    The user manager forks the worker — zero process-tree coupling to
+    the gateway (see :func:`_systemd_run_command` for the exact unit
+    properties)."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = _run_systemctl(_systemd_run_command(unit, argv, env, cwd, log_path))
     if proc.returncode != 0:
         raise WorkerError(
             f"systemd-run failed for unit {unit} (rc {proc.returncode}): "
