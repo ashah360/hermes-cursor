@@ -171,6 +171,10 @@ def fake_systemd(monkeypatch, fake_procs):
         return True  # verified stop succeeded
 
     monkeypatch.setattr(workers, "_systemd_available", lambda: True)
+    # CI intentionally has no Cursor CLI installed. This fixture exercises
+    # systemd supervision, not binary discovery, so provide the executable
+    # identity that the fake manager receives.
+    monkeypatch.setattr(workers, "_agent_cli_path", lambda: "/usr/bin/agent")
     monkeypatch.setattr(workers, "_systemd_start", start)
     monkeypatch.setattr(workers, "_systemd_show", show)
     monkeypatch.setattr(workers, "_systemd_stop", stop)
