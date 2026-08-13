@@ -75,9 +75,14 @@ class TestCanonicalIdentity:
 
 @pytest.fixture
 def fake_procs(monkeypatch):
-    """A fake process table: pids in the set are alive."""
+    """A fake process table: pids in the set are alive. Kills operate on
+    the fake table (never signal real processes)."""
     alive = set()
     monkeypatch.setattr(workers, "_pid_alive", lambda pid: int(pid) in alive)
+    monkeypatch.setattr(
+        workers, "_kill_detached",
+        lambda record: alive.discard(int(record.pid)),
+    )
     return alive
 
 
@@ -146,6 +151,7 @@ def fake_systemd(monkeypatch, fake_procs):
         info = state["units"].pop(unit, None)
         if info:
             fake_procs.discard(int(info["MainPID"]))
+        return True  # verified stop succeeded
 
     monkeypatch.setattr(workers, "_systemd_available", lambda: True)
     monkeypatch.setattr(workers, "_systemd_start", start)
@@ -681,6 +687,143 @@ class TestLeasesAndReaping:
     def test_lease_on_unknown_record_is_a_noop(self):
         assert workers.acquire_lease("no-such-worker", "run-1") is False
         workers.release_lease("no-such-worker", "run-1")  # never raises
+
+
+class TestAtomicEnsureAndLease:
+    def test_ensure_installs_the_lease_under_one_lock_hold(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(
+            str(repo), lease_id="run-1", lease_session="My session"
+        )
+        assert "run-1" in record.leases
+        persisted = workers._read_record(record.name)
+        assert persisted.leases["run-1"]["session"] == "My session"
+
+    def test_bound_lease_survives_holder_death_until_remote_terminal(
+        self, tmp_path, fake_spawn
+    ):
+        """A lease bound to a real agent/run protects the worker across a
+        gateway restart (dead holder): only an OBSERVED remote terminal
+        releases it — never a timer."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-1")
+        workers.bind_lease(record.name, "run-1", "bc-agent-1", "run-abc")
+        rec = workers._read_record(record.name)
+        lease = dict(rec.leases["run-1"])
+        lease["holder_pid"] = 999999999  # holder crashed
+        lease["acquired_at"] = lease["acquired_at"] - 999999.0
+        with workers._worker_lock(record.name):
+            workers._update_record_locked(
+                record.name, rec.generation,
+                leases={"run-1": lease},
+                last_active_at=rec.last_active_at - 999999.0,
+            )
+
+        assert workers.reconcile() == []          # still protected
+        workers.release_lease(record.name, "run-1")
+        # Release grants a fresh idle TTL; age it out again to prove the
+        # protection is really gone.
+        rec = workers._read_record(record.name)
+        with workers._worker_lock(record.name):
+            workers._update_record_locked(
+                record.name, rec.generation,
+                last_active_at=rec.last_active_at - 999999.0,
+            )
+        assert workers.reconcile() == [record.name]  # released → reapable
+
+    def test_unbound_lease_of_live_holder_expires_eventually(
+        self, tmp_path, fake_spawn
+    ):
+        """A dispatch lease that never bound to an agent (create failed /
+        never happened) must not protect the worker forever even while
+        its holder process lives on."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-1")
+        rec = workers._read_record(record.name)
+        lease = dict(rec.leases["run-1"])  # holder = this live process
+        lease["acquired_at"] = (
+            lease["acquired_at"] - workers.UNBOUND_LEASE_MAX_AGE_S * 10
+        )
+        with workers._worker_lock(record.name):
+            workers._update_record_locked(
+                record.name, rec.generation,
+                leases={"run-1": lease},
+                last_active_at=rec.last_active_at - 999999.0,
+            )
+        assert workers.reconcile() == [record.name]
+
+    def test_release_leases_for_session(self, tmp_path, fake_spawn):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        rec_a = workers.ensure_worker(
+            str(repo_a), lease_id="run-a", lease_session="Session A"
+        )
+        rec_b = workers.ensure_worker(
+            str(repo_b), lease_id="run-b", lease_session="Session B"
+        )
+        workers.release_leases_for_session("Session A")
+        assert workers._read_record(rec_a.name).leases == {}
+        assert workers._read_record(rec_b.name).leases != {}
+
+
+class TestGlobalAdmission:
+    def test_concurrent_distinct_worktrees_cannot_exceed_the_cap(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        """Two different worktrees ensured concurrently at limit-1 must
+        not BOTH spawn: capacity reservation + spawn + record creation
+        are one machine-global critical section."""
+        import threading as _threading
+        import time as _time
+
+        monkeypatch.setattr(workers, "_max_workers", lambda: 1)
+        repos = []
+        for label in ("a", "b"):
+            repo = tmp_path / label
+            repo.mkdir()
+            repos.append(repo)
+        spawned = []
+
+        def slow_spawn(name, repo_path, log_path, **kw):
+            _time.sleep(0.2)  # widen the race window
+            pid = 7100 + len(spawned)
+            spawned.append(name)
+            fake_procs.add(pid)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as fh:
+                fh.write(f"{workers.READY_LINE}\n")
+            return pid
+
+        monkeypatch.setattr(workers, "_spawn_worker", slow_spawn)
+        results, errors = [], []
+
+        def ensure(repo, run_id):
+            try:
+                results.append(
+                    workers.ensure_worker(str(repo), lease_id=run_id)
+                )
+            except workers.WorkerError as exc:
+                errors.append(exc)
+
+        threads = [
+            _threading.Thread(target=ensure, args=(repo, f"run-{i}"))
+            for i, repo in enumerate(repos)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        assert len(results) == 1, "exactly one spawn may win at the cap"
+        assert len(errors) == 1
+        assert "capacity" in str(errors[0])
+        live = workers.live_workers()
+        assert len(live) <= 1
 
 
 class TestCapacity:

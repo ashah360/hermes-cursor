@@ -112,6 +112,10 @@ RECORD_VERSION = 2
 STATE_SPAWNING = "spawning"
 STATE_READY = "ready"
 STATE_FAILED = "failed"
+# A stop that could NOT be verified complete: the record is retained
+# (fail closed — never an untracked remnant or a duplicate spawn) until
+# a later verified stop succeeds.
+STATE_DRAINING = "draining"
 
 
 @dataclass
@@ -407,20 +411,41 @@ def _systemd_show(unit: str) -> Dict[str, str]:
         return {}
 
 
-def _systemd_stop(unit: str) -> None:
-    """Stop a unit (blocks until the cgroup is empty or TimeoutStopSec
-    escalates to SIGKILL), then clear any failed state."""
+def _systemd_stop(unit: str) -> bool:
+    """VERIFIED stop of a unit: run ``systemctl stop`` (blocks until the
+    cgroup is empty or TimeoutStopSec escalates to SIGKILL), then
+    confirm via ``show`` that the unit is genuinely gone/inactive.
+    Returns False when the stop cannot be confirmed — callers must then
+    fail closed (retain the record; never spawn a duplicate)."""
     try:
-        _run_systemctl(
+        proc = _run_systemctl(
             ["systemctl", "--user", "stop", unit],
             timeout=STOP_TIMEOUT_S + 15,
         )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").lower()
+            # "not loaded" means the unit does not exist — already gone.
+            if "not loaded" not in stderr:
+                logger.warning(
+                    "systemctl stop %s failed (rc %d): %s",
+                    unit, proc.returncode, (proc.stderr or "").strip()[:300],
+                )
+                return _unit_stopped(unit)
     except Exception:
         logger.warning("systemctl stop %s failed", unit, exc_info=True)
+        return _unit_stopped(unit)
     try:
         _run_systemctl(["systemctl", "--user", "reset-failed", unit], timeout=10)
     except Exception:
         pass
+    return _unit_stopped(unit)
+
+
+def _unit_stopped(unit: str) -> bool:
+    """Whether a unit is confirmed inactive/gone (its cgroup is empty —
+    systemd only reports inactive/failed once every member exited)."""
+    state = str(_systemd_show(unit).get("ActiveState") or "")
+    return state in ("", "inactive", "failed", "dead", "not-found")
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +464,19 @@ def _data_dir_for(name: str) -> Path:
 
 def _alloc_management_port(name: str) -> int:
     """A currently-bindable localhost port, deterministically seeded by
-    the worker name so restarts tend to reuse the same port."""
+    the worker name so restarts tend to reuse the same port.
+
+    Ports reserved by OTHER live worker records are skipped outright —
+    together with the machine-global admission lock this closes the
+    probe-then-bind race between two concurrent spawns (a not-yet-bound
+    winner's port is already visible in its record)."""
+    reserved = set()
+    for record in live_workers():
+        if record.name != name and ":" in (record.management_addr or ""):
+            try:
+                reserved.add(int(record.management_addr.rsplit(":", 1)[1]))
+            except (TypeError, ValueError):
+                pass
     base = _MGMT_PORT_BASE + (
         int(hashlib.sha256(name.encode("utf-8")).hexdigest(), 16)
         % _MGMT_PORT_RANGE
@@ -448,6 +485,8 @@ def _alloc_management_port(name: str) -> int:
         port = _MGMT_PORT_BASE + (
             (base - _MGMT_PORT_BASE + offset) % _MGMT_PORT_RANGE
         )
+        if port in reserved:
+            continue
         try:
             probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
@@ -544,6 +583,26 @@ def _worker_lock(name: str) -> Iterator[None]:
     """Per-worker cross-process mutex (flock) serializing every
     reconcile/spawn/record mutation for one worker name."""
     path = state_dir() / "locks" / f"{name}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+@contextmanager
+def _admission_lock() -> Iterator[None]:
+    """SHORT machine-global admission mutex: capacity reservation,
+    management-port reservation, spawn, and the authoritative record
+    write form ONE critical section, so two distinct worktree spawns at
+    limit-1 can never both pass (per-worker locks cannot see each
+    other). The bounded ready-wait happens OUTSIDE this lock."""
+    path = state_dir() / "locks" / "admission.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
@@ -806,19 +865,77 @@ def _cleanup_generation(record: WorkerRecord) -> None:
         Path(record.log_path).unlink(missing_ok=True)
 
 
-def _revalidate_ready(record: WorkerRecord) -> WorkerRecord:
-    """Re-prove readiness for a live-but-never-ready generation.
+def _unit_identity_matches(record: WorkerRecord) -> bool:
+    """Adoption validation for systemd records: the unit's live
+    ActiveState/MainPID/InvocationID must match the persisted identity.
+    A mismatch means the unit is NOT the generation this record owns —
+    it is never adopted (the caller respawns through the verified-stop
+    path)."""
+    if record.supervision != "systemd" or not record.unit:
+        return True
+    show = _systemd_show(record.unit)
+    if str(show.get("ActiveState") or "") != "active":
+        return False
+    if str(show.get("MainPID") or "0") != str(record.pid):
+        return False
+    invocation = str(show.get("InvocationID") or "")
+    if invocation and record.generation and invocation != record.generation:
+        return False
+    return True
 
-    A generation that timed out during its original ready wait is never
-    reused as healthy on trust: it must show readiness evidence NOW
-    (management probe when available, else this generation's log slice).
-    Success flips the record to ready; failure raises the same
-    actionable not-ready error. Caller holds the flock.
+
+def _validate_for_handout(record: WorkerRecord) -> Optional[WorkerRecord]:
+    """Validate a live generation before handing it to a dispatch.
+
+    Three distinct facts, checked in order (caller holds the flock):
+
+    * **unit identity** (systemd records): live ActiveState/MainPID/
+      InvocationID must match the persisted record — else None (respawn).
+    * **registration**: when the management endpoint answers, its
+      ``connected`` field is authoritative. connected=True hands out
+      (``claimed`` is busy-ness, NOT ill health — preserved distinction);
+      connected=False on a READY record means the worker lost its
+      backend registration and cannot receive assignments — None
+      (respawn); connected=False on a SPAWNING record is still
+      registering — actionable retry error, not churn.
+    * **fallback evidence** (endpoint silent/absent): a READY record
+      stands on process liveness; a SPAWNING record must show its own
+      generation's log evidence or fail with the retry error.
+
+    Returns the (possibly state-flipped) record to hand out, or None
+    when the generation must be replaced.
     """
-    if _probe_ready(record) or _ready_evidence(record):
+    if not _unit_identity_matches(record):
+        logger.warning(
+            "worker %s: unit identity mismatch (unit %s no longer matches "
+            "pid %d / generation %s) — not adopting",
+            record.name, record.unit or "-", record.pid, record.generation,
+        )
+        return None
+    probe = _probe_management(record)
+    if probe is not None:
+        if probe.get("connected"):
+            if record.state != STATE_READY:
+                _update_record_locked(
+                    record.name, record.generation,
+                    state=STATE_READY, last_error="",
+                )
+                return _read_record(record.name) or record
+            return record
+        if record.state == STATE_READY:
+            logger.warning(
+                "worker %s: management endpoint reports connected=false — "
+                "the worker lost backend registration; replacing it",
+                record.name,
+            )
+            return None
+    else:
+        if record.state == STATE_READY:
+            return record
+    if _ready_evidence(record):
         _update_record_locked(
             record.name, record.generation,
-            state=STATE_READY, ready_at=time.time(), last_error="",
+            state=STATE_READY, last_error="",
         )
         return _read_record(record.name) or record
     raise WorkerError(
@@ -867,12 +984,22 @@ def _probe_management(record: WorkerRecord) -> Optional[Dict[str, Any]]:
         return None
 
 
-def ensure_worker(repo_path: str) -> WorkerRecord:
-    """The live worker serving ``repo_path``, spawning one when needed.
+def ensure_worker(
+    repo_path: str,
+    lease_id: Optional[str] = None,
+    lease_session: str = "",
+) -> WorkerRecord:
+    """The live worker serving ``repo_path``, spawning one when needed —
+    and, when ``lease_id`` is given, LEASED atomically under the same
+    ownership lock (the reaper can never win an ensure→lease window,
+    and a caller that cannot be granted the lease gets an exception,
+    never an unprotected worker).
 
-    Serialized cross-process by the per-worker flock. Reuse first (the
+    Serialized cross-process by the per-worker flock; capacity + port
+    reservation + spawn + the authoritative record write additionally
+    hold the short machine-global admission lock. Reuse first (the
     common case, and the second-worker trap avoider): a live managed
-    worker for this worktree is returned as-is when READY — a live
+    worker for this worktree is handed out when READY — a live
     generation that never proved readiness is re-proven before reuse,
     never trusted. A dead record is cleaned and replaced by a fresh
     generation whose record is only written once its process exists, so
@@ -885,31 +1012,79 @@ def ensure_worker(repo_path: str) -> WorkerRecord:
     with _worker_lock(name):
         record = _read_record(name)
         if record is not None:
-            if _record_alive(record) and record.state != STATE_FAILED:
-                if record.state == STATE_READY:
-                    # Bump the idle clock at hand-out: the caller is about
-                    # to lease this worker, and the reaper must not win
-                    # the ensure→lease window against a TTL-stale record.
-                    _update_record_locked(
-                        name, record.generation, last_active_at=time.time(),
-                    )
-                    return _read_record(name) or record
-                return _revalidate_ready(record)
+            usable: Optional[WorkerRecord] = None
+            if _record_alive(record) and record.state not in (
+                STATE_FAILED, STATE_DRAINING,
+            ):
+                usable = _validate_for_handout(record)  # may raise (retry)
+            if usable is not None:
+                # Bump the idle clock at hand-out: the caller is about
+                # to use this worker.
+                _update_record_locked(
+                    name, usable.generation, last_active_at=time.time(),
+                )
+                usable = _read_record(name) or usable
+                return _install_lease_locked(usable, lease_id, lease_session)
             logger.info(
-                "worker %s (pid %d) is dead — respawning", name, record.pid
+                "worker %s (pid %d, state %s) is not adoptable — replacing",
+                name, record.pid, record.state,
             )
-            _stop_generation(record)
+            if not _stop_generation(record):
+                _update_record_locked(
+                    name, record.generation,
+                    state=STATE_DRAINING,
+                    last_error="stop unverified before respawn",
+                )
+                raise WorkerError(
+                    f"worker '{name}' could not be confirmed stopped — "
+                    "refusing to spawn a duplicate on its data root; "
+                    "retry shortly"
+                )
             _cleanup_generation(record)
-        # Capacity: reclaim idle (leaseless) workers before spawning; an
-        # all-leased fleet raises an honest quota error instead of
-        # silently serializing. Eviction try-locks other workers only —
-        # never blocks while holding this worker's flock.
-        _enforce_capacity(name, real)
-        return _spawn_generation(name, real)
+        # Admission: capacity reservation, management-port reservation,
+        # spawn, and the record write are ONE machine-global critical
+        # section (two distinct worktree spawns at limit-1 must not both
+        # pass). The bounded ready-wait below runs outside it.
+        with _admission_lock():
+            _enforce_capacity(name, real)
+            record = _launch_generation(name, real)
+        _await_generation_ready(record)
+        record = _read_record(name) or record
+        return _install_lease_locked(record, lease_id, lease_session)
 
 
-def _spawn_generation(name: str, real: str) -> WorkerRecord:
-    """Spawn a fresh generation for ``name`` (caller holds the flock).
+def _install_lease_locked(
+    record: WorkerRecord, lease_id: Optional[str], lease_session: str
+) -> WorkerRecord:
+    """Install the caller's per-run lease (caller holds the flock).
+    No-op without a lease_id. Raises when the fenced write is refused —
+    the caller must never proceed with an unprotected worker."""
+    if not lease_id:
+        return record
+    pid = os.getpid()
+    leases = dict(record.leases or {})
+    leases[str(lease_id)] = {
+        "session": str(lease_session or ""),
+        "holder_pid": pid,
+        "holder_birth": _pid_birth(pid),
+        "acquired_at": time.time(),
+        "agent_id": "",
+        "run_id": "",
+    }
+    if not _update_record_locked(
+        record.name, record.generation,
+        leases=leases, last_active_at=time.time(),
+    ):
+        raise WorkerError(
+            f"worker '{record.name}' changed generation while being "
+            "leased — retry the dispatch"
+        )
+    return _read_record(record.name) or record
+
+
+def _launch_generation(name: str, real: str) -> WorkerRecord:
+    """Start a fresh generation and write its authoritative record
+    (caller holds the flock AND the admission lock).
 
     Isolation: a deterministic per-worker ``CURSOR_DATA_DIR`` (the CLI's
     worker.lock lives inside it, so no two worktrees ever contend) and a
@@ -965,19 +1140,24 @@ def _spawn_generation(name: str, real: str) -> WorkerRecord:
         "spawned worker %s (pid %d, generation %s, %s) for %s",
         name, pid, generation, supervision, real,
     )
+    return record
+
+
+def _await_generation_ready(record: WorkerRecord) -> None:
+    """Bounded ready-wait for a just-launched generation (caller holds
+    the flock, NOT the admission lock); persists the outcome."""
     try:
         _wait_ready(record)
     except WorkerError as exc:
         state = STATE_FAILED if not _pid_alive(record.pid) else STATE_SPAWNING
         _update_record_locked(
-            name, record.generation, state=state, last_error=str(exc)[:500],
+            record.name, record.generation,
+            state=state, last_error=str(exc)[:500],
         )
         raise
     _update_record_locked(
-        name, record.generation,
-        state=STATE_READY, ready_at=time.time(), last_error="",
+        record.name, record.generation, state=STATE_READY, last_error="",
     )
-    return _read_record(name) or record
 
 
 def _spawn_unit(
@@ -1006,13 +1186,20 @@ def _spawn_unit(
     # A remnant unit with no live record is unmanaged (the record is the
     # authority and it is dead/absent here) — clear it so the fresh
     # generation's name is free and no shadow worker swallows routing.
+    # The stop is VERIFIED: an unconfirmed remnant means fail closed
+    # (never start a duplicate next to an unkillable shadow).
     show = _systemd_show(unit)
     if show.get("ActiveState") in ("active", "activating", "deactivating"):
         logger.warning(
             "stopping unmanaged remnant unit %s (record was dead/absent)",
             unit,
         )
-    _systemd_stop(unit)
+    if not _systemd_stop(unit):
+        raise WorkerError(
+            f"remnant unit {unit} could not be confirmed stopped — "
+            "refusing to spawn a duplicate worker; inspect it with "
+            f"`systemctl --user status {unit}`"
+        )
     argv, env = _spawn_command(
         cli, name, real, data_dir=str(data_dir), management_addr=addr
     )
@@ -1034,22 +1221,24 @@ def _spawn_unit(
         time.sleep(0.1)
 
 
-def _stop_generation(record: WorkerRecord) -> None:
-    """Bounded teardown of a generation's whole process tree (caller
-    holds the flock).
+def _stop_generation(record: WorkerRecord) -> bool:
+    """VERIFIED bounded teardown of a generation's whole process tree
+    (caller holds the flock). Returns False when the teardown could not
+    be confirmed — callers fail closed (record retained as draining).
 
     systemd records ALWAYS stop through the unit — even when the leader
     pid is already dead, the unit's cgroup may still hold descendants
     (the observed leaked-tmux-child scope); ``systemctl stop`` empties
-    the cgroup within TimeoutStopSec. Detached records degrade to a
-    bounded TERM→KILL of the process group.
+    the cgroup within TimeoutStopSec and the result is verified against
+    the unit's post-stop state. Detached records degrade to a bounded
+    TERM→KILL of the process group verified against the leader pid.
     """
     if record.supervision == "systemd" and record.unit:
-        _systemd_stop(record.unit)
-        return
+        return _systemd_stop(record.unit)
     if not _record_alive(record):
-        return
+        return True
     _kill_detached(record)
+    return not _record_alive(record)
 
 
 def _kill_detached(record: WorkerRecord) -> None:
@@ -1076,45 +1265,93 @@ def _kill_detached(record: WorkerRecord) -> None:
 # ---------------------------------------------------------------------------
 
 # A worker with no fresh lease for this long is reaped by reconcile().
-IDLE_TTL_S = float(os.environ.get("GHOST_CURSOR_WORKER_IDLE_TTL_S") or 1800.0)
-# A lease whose HOLDER process died still protects the worker this long
-# past acquisition (covers the settle window of a crashed dispatcher; a
-# re-attached supervisor settles the run remotely, it holds no lease).
+IDLE_TTL_S = 1800.0
+# An UNBOUND lease (dispatch acquired it, but no agent/run identity was
+# ever bound — the create failed, was lost, or is still in flight) stops
+# protecting the worker past this age even while its holder lives:
+# binding happens within one create round-trip, and intent recovery
+# resolves lost creates well inside this window.
+UNBOUND_LEASE_MAX_AGE_S = 600.0
+# An unbound lease whose HOLDER process died keeps protecting the worker
+# this long past acquisition (the settle window of a crashed dispatcher).
 LEASE_STALE_GRACE_S = 300.0
 
 
-def _max_workers() -> int:
-    """The worker cap for this box. Default mirrors Cursor's documented
-    self-hosted quota (10 per user); override via env for larger teams."""
+def _plugin_config(key: str) -> Any:
+    """A ``plugins.ghost_cursor.<key>`` config.yaml value, or None."""
     try:
-        return max(int(os.environ.get("GHOST_CURSOR_MAX_WORKERS") or 10), 1)
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        return cfg_get(read_raw_config(), "plugins", "ghost_cursor", key)
+    except Exception:
+        return None
+
+
+def _max_workers() -> int:
+    """The worker cap for this box: ``plugins.ghost_cursor.max_workers``
+    in config.yaml, else 10 (Cursor's documented per-user self-hosted
+    quota). Robust to junk values."""
+    try:
+        value = int(_plugin_config("max_workers"))
+        if value >= 1:
+            return value
     except (TypeError, ValueError):
-        return 10
+        pass
+    return 10
 
 
-def _lease_fresh(lease: Dict[str, Any], now: float) -> bool:
-    """A lease protects its worker while the HOLDER process is alive, or
-    (dead holder — crash) until the stale grace expires."""
+def _idle_ttl_s() -> float:
+    """The idle reap TTL: ``plugins.ghost_cursor.worker_idle_ttl_s`` in
+    config.yaml, else :data:`IDLE_TTL_S`. Robust to junk values."""
+    try:
+        value = float(_plugin_config("worker_idle_ttl_s"))
+        if value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return IDLE_TTL_S
+
+
+def _holder_alive(lease: Dict[str, Any]) -> bool:
     try:
         pid = int(lease.get("holder_pid") or 0)
     except (TypeError, ValueError):
-        pid = 0
-    if pid > 0:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except ProcessLookupError:
-            alive = False
-        except PermissionError:
-            alive = True
-        if alive:
-            birth = lease.get("holder_birth")
-            if birth is None or _pid_birth(pid) in (None, int(birth)):
-                return True
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    birth = lease.get("holder_birth")
+    if birth is None:
+        return True
+    return _pid_birth(pid) in (None, int(birth))
+
+
+def _lease_fresh(lease: Dict[str, Any], now: float) -> bool:
+    """Whether one lease still protects its worker.
+
+    A lease BOUND to real agent/run identity protects the worker until
+    an OBSERVED remote terminal releases it (supervisor settle or the
+    reconciler's remote probe) — never a timer, and holder death is
+    irrelevant (the run lives server-side; a restarted gateway must find
+    the worker still protected). An UNBOUND dispatch lease is
+    transitional: it expires ``UNBOUND_LEASE_MAX_AGE_S`` after
+    acquisition even with a live holder (a create that never bound
+    within that window failed or was lost — intent recovery owns it),
+    and ``LEASE_STALE_GRACE_S`` after a dead holder.
+    """
+    if str(lease.get("agent_id") or "") and str(lease.get("run_id") or ""):
+        return True
     try:
         acquired = float(lease.get("acquired_at") or 0.0)
     except (TypeError, ValueError):
         acquired = 0.0
+    if _holder_alive(lease):
+        return now - acquired < UNBOUND_LEASE_MAX_AGE_S
     return now - acquired < LEASE_STALE_GRACE_S
 
 
@@ -1128,10 +1365,10 @@ def _fresh_leases(record: WorkerRecord, now: float) -> Dict[str, Dict[str, Any]]
 def acquire_lease(name: str, lease_id: str, session: str = "") -> bool:
     """Lease the worker for one RUN (never a whole conversation).
 
-    A leased worker is protected from the idle reaper and from capacity
-    reclaim until the lease is released (observed remote-terminal) or —
-    crash safety — its holder dies and the stale grace passes. Returns
-    False when no record exists (fake/ephemeral workers lease nothing).
+    Prefer the atomic path — ``ensure_worker(repo, lease_id=...)`` —
+    which installs the lease under the same ownership lock as the
+    hand-out. This standalone variant exists for callers that already
+    hold a record. Returns False when no record exists.
     """
     name, lease_id = str(name), str(lease_id)
     if not name or not lease_id:
@@ -1147,11 +1384,97 @@ def acquire_lease(name: str, lease_id: str, session: str = "") -> bool:
             "holder_pid": pid,
             "holder_birth": _pid_birth(pid),
             "acquired_at": time.time(),
+            "agent_id": "",
+            "run_id": "",
         }
         return _update_record_locked(
             name, record.generation,
             leases=leases, last_active_at=time.time(),
         )
+
+
+def bind_lease(name: str, lease_id: str, agent_id: str, run_id: str) -> None:
+    """Bind a dispatch lease to its real remote identity (called at the
+    producer boundary, the instant the create/follow-up returned).
+
+    From here the lease protects the worker until an OBSERVED remote
+    terminal — across gateway restarts and stream failures. Never
+    raises."""
+    try:
+        with _worker_lock(str(name)):
+            record = _read_record(str(name))
+            if record is None or str(lease_id) not in (record.leases or {}):
+                return
+            leases = dict(record.leases)
+            leases[str(lease_id)] = {
+                **leases[str(lease_id)],
+                "agent_id": str(agent_id or ""),
+                "run_id": str(run_id or ""),
+            }
+            _update_record_locked(
+                str(name), record.generation,
+                leases=leases, last_active_at=time.time(),
+            )
+    except Exception:
+        logger.warning("bind_lease(%s, %s) failed", name, lease_id, exc_info=True)
+
+
+def release_leases_for_session(session_name: str) -> None:
+    """Release every lease held for one session — called by whoever just
+    OBSERVED the session's remote run reach a terminal state (the
+    re-attached supervisor's settle, or the reconciler's remote probe).
+    Never raises."""
+    try:
+        session_name = str(session_name or "")
+        if not session_name:
+            return
+        for record in live_workers():
+            if not any(
+                str((lease or {}).get("session") or "") == session_name
+                for lease in (record.leases or {}).values()
+            ):
+                continue
+            with _worker_lock(record.name):
+                current = _read_record(record.name)
+                if current is None:
+                    continue
+                kept = {
+                    key: lease for key, lease in (current.leases or {}).items()
+                    if str((lease or {}).get("session") or "") != session_name
+                }
+                if kept != (current.leases or {}):
+                    _update_record_locked(
+                        current.name, current.generation,
+                        leases=kept, last_active_at=time.time(),
+                    )
+    except Exception:
+        logger.warning(
+            "release_leases_for_session(%s) failed", session_name, exc_info=True
+        )
+
+
+def bound_leases() -> List[Dict[str, Any]]:
+    """Every live worker's leases that are BOUND to remote identity —
+    the reconciler probes these against the GET authority and releases
+    the settled ones. Items: {worker, lease_id, agent_id, run_id,
+    session}. Never raises."""
+    out: List[Dict[str, Any]] = []
+    try:
+        for record in live_workers():
+            for lease_id, lease in (record.leases or {}).items():
+                agent_id = str((lease or {}).get("agent_id") or "")
+                run_id = str((lease or {}).get("run_id") or "")
+                if agent_id and run_id:
+                    out.append({
+                        "worker": record.name,
+                        "lease_id": lease_id,
+                        "agent_id": agent_id,
+                        "run_id": run_id,
+                        "session": str((lease or {}).get("session") or ""),
+                    })
+    except Exception:
+        logger.warning("bound_leases scan failed", exc_info=True)
+    return out
 
 
 def release_lease(name: str, lease_id: str) -> None:
@@ -1175,14 +1498,30 @@ def release_lease(name: str, lease_id: str) -> None:
         logger.warning("release_lease(%s, %s) failed", name, lease_id, exc_info=True)
 
 
-def _evict_locked(record: WorkerRecord, reason: str) -> None:
-    """Stop + retire one generation (caller holds its flock)."""
+def _evict_locked(record: WorkerRecord, reason: str) -> bool:
+    """Stop + retire one generation (caller holds its flock).
+
+    The stop is VERIFIED before the record is deleted; a stop that
+    cannot be confirmed retains the record as ``draining`` with the
+    failure recorded — never an untracked remnant. Returns whether the
+    generation was actually retired."""
     logger.info(
         "evicting worker %s (pid %d, generation %s): %s",
         record.name, record.pid, record.generation, reason,
     )
-    _stop_generation(record)
+    if not _stop_generation(record):
+        logger.warning(
+            "worker %s: stop could not be verified — retaining the record "
+            "as draining (fail closed)", record.name,
+        )
+        _update_record_locked(
+            record.name, record.generation,
+            state=STATE_DRAINING,
+            last_error=f"stop unverified during eviction ({reason})"[:500],
+        )
+        return False
     _cleanup_generation(record)
+    return True
 
 
 def reconcile(now: Optional[float] = None) -> List[str]:
@@ -1204,8 +1543,8 @@ def reconcile(now: Optional[float] = None) -> List[str]:
                 if record is None:
                     continue
                 if not _record_alive(record):
-                    _evict_locked(record, "process dead")
-                    reaped.append(record.name)
+                    if _evict_locked(record, "process dead"):
+                        reaped.append(record.name)
                     continue
                 if record.supervision == "legacy":
                     # A generation-0 worker may be serving a pre-v2 run
@@ -1221,11 +1560,10 @@ def reconcile(now: Optional[float] = None) -> List[str]:
                     )
                 if fresh:
                     continue
-                if now - float(record.last_active_at or record.started_at) > (
-                    IDLE_TTL_S
-                ):
-                    _evict_locked(record, f"idle past {int(IDLE_TTL_S)}s TTL")
-                    reaped.append(record.name)
+                ttl = _idle_ttl_s()
+                if now - float(record.last_active_at or record.started_at) > ttl:
+                    if _evict_locked(record, f"idle past {int(ttl)}s TTL"):
+                        reaped.append(record.name)
         except Exception:
             logger.warning(
                 "reconcile pass failed for %s", path.stem, exc_info=True
@@ -1294,8 +1632,8 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
                 or _fresh_leases(current, time.time())
             ):
                 continue  # changed under us — no longer safe to evict
-            _evict_locked(current, "capacity reclaim")
-            need -= 1
+            if _evict_locked(current, "capacity reclaim"):
+                need -= 1
     if need > 0:
         busy = sorted(
             f"{r.name} ({r.repo_path}"
