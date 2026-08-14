@@ -229,17 +229,25 @@ class _MigrationGate:
     every other thread WAITS on the condition (never reads worker state
     ahead of legacy ownership migration); only the owner thread itself —
     a true recursive call from a migration writer — passes through with
-    the already-resolved target. On failure, waiters are woken, ``done``
-    stays false, and the next :func:`state_dir` call attempts the
-    migration again."""
+    the already-resolved target.
 
-    __slots__ = ("cond", "running", "owner", "done")
+    ``attempts_settled`` carries the attempt-outcome semantics: it
+    increments every time a pass settles (success also sets ``done``).
+    A caller that WAITED behind an attempt observes its failure through
+    the counter and degrades for its own call instead of retrying —
+    otherwise every queued waiter would serially re-run a failing
+    migration (a retry convoy). Only a later fresh :func:`state_dir`
+    call, which never waited on the failed attempt, initiates the next
+    pass: persistent failure costs one pass per traffic wave."""
+
+    __slots__ = ("cond", "running", "owner", "done", "attempts_settled")
 
     def __init__(self) -> None:
         self.cond = threading.Condition()
         self.running = False
         self.owner: Optional[int] = None
         self.done = False
+        self.attempts_settled = 0
 
 
 _migration_gates: Dict[str, _MigrationGate] = {}
@@ -252,7 +260,19 @@ def _migration_gate(key: str) -> _MigrationGate:
 
 
 def _reset_migration_for_tests() -> None:
+    """Drop all QUIESCENT migration gates. Refuses loudly while any
+    pass is running: clearing an active gate would strand the running
+    owner on the old gate while a new caller creates a fresh one for
+    the same target — two concurrent migrations."""
     with _migration_gates_mutex:
+        for key, gate in _migration_gates.items():
+            with gate.cond:
+                if gate.running:
+                    raise RuntimeError(
+                        f"migration for {key} is still running — refusing "
+                        "to reset an active gate (it would permit a "
+                        "concurrent migration pass)"
+                    )
         _migration_gates.clear()
 
 
@@ -269,10 +289,11 @@ def state_dir() -> Path:
     Concurrency: the migration pass runs at most once at a time per
     target in this process; other threads BLOCK until it settles, then
     observe the outcome. A failed pass is logged, the target stays
-    usable (degraded), and the next call re-attempts — success alone
-    marks the target migrated. The pass itself runs OUTSIDE the
-    condition, so waiting threads never interact with the cross-process
-    migration flock (no lock-order coupling, no deadlock).
+    usable (degraded) for everyone who waited on that attempt, and only
+    a LATER fresh call re-attempts — success alone marks the target
+    migrated. The pass itself runs OUTSIDE the condition, so waiting
+    threads never interact with the cross-process migration flock (no
+    lock-order coupling, no deadlock).
     """
     base = os.environ.get("XDG_STATE_HOME", "").strip() or str(
         Path.home() / ".local" / "state"
@@ -280,43 +301,48 @@ def state_dir() -> Path:
     target = Path(base) / "ghost_cursor" / "workers"
     gate = _migration_gate(str(target))
     me = threading.get_ident()
-    attempted = False
-    while True:
+    with gate.cond:
+        # Attempts settled before THIS call: anything newer that settles
+        # without success is a failure this caller observed live — it
+        # degrades rather than retrying (no per-waiter retry convoy).
+        baseline = gate.attempts_settled
+        while True:
+            if gate.done:
+                return target
+            if gate.running:
+                if gate.owner == me:
+                    # True same-thread recursion from a migration
+                    # writer: hand back the already-resolved target
+                    # (migration helpers receive the target and do
+                    # not resolve state_dir; this is belt+braces
+                    # against re-entering the held flock).
+                    return target
+                gate.cond.wait()
+                continue
+            if gate.attempts_settled > baseline:
+                # The attempt this caller waited on FAILED (success
+                # would have set done). Usable but degraded for this
+                # call; a later fresh call initiates the retry.
+                return target
+            gate.running = True
+            gate.owner = me
+            break
+    ok = False
+    try:
+        # Outside the condition: waiters block on gate.cond only,
+        # never on the cross-process flock held in here.
+        ok = _migrate_profile_records_serialized(target)
+    finally:
         with gate.cond:
-            while True:
-                if gate.done:
-                    return target
-                if gate.running:
-                    if gate.owner == me:
-                        # True same-thread recursion from a migration
-                        # writer: hand back the already-resolved target
-                        # (migration helpers receive the target and do
-                        # not resolve state_dir; this is belt+braces
-                        # against re-entering the held flock).
-                        return target
-                    gate.cond.wait()
-                    continue
-                if attempted:
-                    # OUR pass failed this call: the target is usable
-                    # (degraded, logged) and stays retryable — the next
-                    # state_dir call attempts the migration again.
-                    return target
-                gate.running = True
-                gate.owner = me
-                break
-        ok = False
-        try:
-            # Outside the condition: waiters block on gate.cond only,
-            # never on the cross-process flock held in here.
-            ok = _migrate_profile_records_serialized(target)
-        finally:
-            with gate.cond:
-                gate.running = False
-                gate.owner = None
-                if ok:
-                    gate.done = True
-                gate.cond.notify_all()
-        attempted = True
+            gate.running = False
+            gate.owner = None
+            gate.attempts_settled += 1
+            if ok:
+                gate.done = True
+            gate.cond.notify_all()
+    # Success or (logged) failure, the resolved target is usable; a
+    # failure stays retryable for the next fresh call.
+    return target
 
 
 def _migrate_profile_records_serialized(target: Path) -> bool:

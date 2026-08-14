@@ -1903,6 +1903,130 @@ class TestMigrationThreadCoordination:
         assert results["a"] == results["b"]
         assert len(passes) == 1
 
+    def test_reset_refuses_while_a_migration_is_running(
+        self, tmp_path, monkeypatch
+    ):
+        """Clearing an ACTIVE gate would let a new caller create a second
+        gate for the same target and run a concurrent migration — reset
+        must fail loudly instead, and late callers must keep
+        coordinating on the ORIGINAL gate."""
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def gated(target):
+            calls.append(1)
+            entered.set()
+            assert release.wait(10)
+            return True
+
+        monkeypatch.setattr(
+            workers, "_migrate_profile_records_serialized", gated
+        )
+        workers._reset_migration_for_tests()
+
+        results = {}
+        thread_a = threading.Thread(
+            target=lambda: results.__setitem__("a", workers.state_dir()),
+            daemon=True,
+        )
+        thread_a.start()
+        assert entered.wait(10)
+
+        with pytest.raises(RuntimeError):
+            workers._reset_migration_for_tests()
+
+        # A second caller still coordinates on the original gate: it
+        # BLOCKS behind the active pass rather than starting its own.
+        thread_b = threading.Thread(
+            target=lambda: results.__setitem__("b", workers.state_dir()),
+            daemon=True,
+        )
+        thread_b.start()
+        time.sleep(0.3)
+        assert "b" not in results
+
+        release.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        assert results["a"] == results["b"]
+        assert len(calls) == 1  # ONE pass — no concurrent migration
+
+        # Quiescent now — reset is allowed again.
+        workers._reset_migration_for_tests()
+
+    def test_failed_pass_degrades_every_queued_waiter_without_a_convoy(
+        self, tmp_path, monkeypatch
+    ):
+        """Attempt-outcome semantics: waiters queued behind a FAILING
+        pass observe that attempt's failure and degrade for their own
+        call — they never serially re-run the migration (3 waiters must
+        not mean 3 passes). Only a later fresh call retries, once."""
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def flaky(target):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(10)
+                return False  # the whole wave observes ONE failure
+            return True
+
+        monkeypatch.setattr(
+            workers, "_migrate_profile_records_serialized", flaky
+        )
+        workers._reset_migration_for_tests()
+
+        expected = (
+            Path(os.environ["XDG_STATE_HOME"]) / "ghost_cursor" / "workers"
+        )
+        gate = workers._migration_gate(str(expected))
+        results = []
+        owner = threading.Thread(
+            target=lambda: results.append(workers.state_dir()), daemon=True
+        )
+        owner.start()
+        assert entered.wait(10)
+        waiters = [
+            threading.Thread(
+                target=lambda: results.append(workers.state_dir()),
+                daemon=True,
+            )
+            for _ in range(3)
+        ]
+        for thread in waiters:
+            thread.start()
+        # All three must be queued on THIS attempt before it fails —
+        # otherwise a slow starter would legitimately count as a fresh
+        # call and retry.
+        deadline = time.time() + 10
+        while len(gate.cond._waiters) < 3:
+            assert time.time() < deadline, "waiters never queued"
+            time.sleep(0.01)
+
+        release.set()
+        for thread in (owner, *waiters):
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+        # Every caller of the wave returned after the SAME settlement,
+        # from exactly ONE (failed) pass.
+        assert len(results) == 4
+        assert all(path == expected for path in results)
+        assert len(calls) == 1
+
+        # A separate later call — one that never waited on the failed
+        # attempt — retries exactly once and succeeds.
+        assert workers.state_dir() == expected
+        assert len(calls) == 2
+        workers.state_dir()
+        assert len(calls) == 2  # one-shot after success
+
     def test_failed_migration_is_retried_on_the_next_call(
         self, tmp_path, monkeypatch, fake_procs
     ):
