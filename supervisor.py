@@ -516,35 +516,46 @@ class SessionSupervisor:
             if status == "failed"
             else {}
         )
+        if not self._release_worker_lease(agent_id, run_id):
+            # The run IS terminal but the local lease release did not
+            # land. Durably settling now would strand the lease forever
+            # (terminal handles are never reattached) — stay live and
+            # let the next supervision cycle retry release-then-settle.
+            return False
         if self._stop_requested.is_set() and status == "cancelled":
             self._ingest_lifecycle("interrupted")
         self._settle(status, **error)
-        self._release_worker_lease(agent_id, run_id)
         return True
 
-    def _release_worker_lease(self, agent_id: str, run_id: str) -> None:
+    def _release_worker_lease(self, agent_id: str, run_id: str) -> bool:
         """Restart bridge: the in-process runner that bound this run's
         worker lease died with the old gateway and can never release it.
-        After the SAME authoritative GET-terminal gate that settled the
-        handle (never SSE replay, never an unknown/nonterminal GET),
-        release the lease positively bound to exactly this agent+run on
-        the handle's recorded local worker. Idempotent; a mismatched,
-        unbound, or cloud-runtime lease is never touched."""
+        Runs after the SAME authoritative GET-terminal observation that
+        settlement uses (never SSE replay, never an unknown/nonterminal
+        GET) and BEFORE the durable settle — release must land (or be a
+        provable no-op) first, or settling removes the retry path.
+
+        Returns True when settlement may proceed: the lease was
+        released, or there is positively nothing to release (no local
+        worker recorded, cloud runtime, no matching bound lease — a
+        mismatched or unbound lease is never touched). False means the
+        release write failed and the caller must retry later."""
         try:
             entry = _handles.get(self.session_name) or {}
             worker = str(entry.get("worker") or "")
             if not worker or _handles.runtime_of(entry) != "local":
-                return
+                return True
             from . import workers as _workers
 
-            _workers.release_bound_lease(
+            return _workers.release_bound_lease(
                 worker, agent_id=agent_id, run_id=run_id
-            )
+            ) != "failed"
         except Exception:
             logger.warning(
                 "worker lease release for %s failed", self.session_name,
                 exc_info=True,
             )
+            return False
 
     # -- ingest boundary (RFC §4) ---------------------------------------------
 

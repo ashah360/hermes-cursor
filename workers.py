@@ -2173,7 +2173,7 @@ def release_lease(name: str, lease_id: str, agent_id: str = "") -> None:
         logger.warning("release_lease(%s, %s) failed", name, lease_id, exc_info=True)
 
 
-def release_bound_lease(name: str, agent_id: str, run_id: str) -> bool:
+def release_bound_lease(name: str, agent_id: str, run_id: str) -> str:
     """Release the lease(s) on worker ``name`` POSITIVELY bound to
     exactly ``(agent_id, run_id)`` — the restart bridge: a reattached
     supervisor that observed this run's authoritative GET terminal has
@@ -2182,17 +2182,26 @@ def release_bound_lease(name: str, agent_id: str, run_id: str) -> bool:
     it). Full identity is required — empty fields never match, so an
     unbound (create-uncertain) lease is untouchable through this path,
     and no lease_id needs to have been persisted on old handles.
-    Idempotent, generation-safe under the worker flock, never raises.
-    Returns True only when a lease was actually released."""
+    Idempotent and generation-safe under the worker flock; never raises.
+
+    Returns an explicit three-way result the caller can order durable
+    settlement on:
+
+    * ``"released"`` — a matching lease existed and its removal LANDED.
+    * ``"noop"`` — positively nothing to release (no record, no
+      matching bound lease, or empty identity): safe to proceed.
+    * ``"failed"`` — a matching lease exists but the fenced write did
+      not land (or an unexpected error): the caller must retry before
+      any step that would remove its own retry path."""
     try:
         name = str(name or "")
         agent_id, run_id = str(agent_id or ""), str(run_id or "")
         if not name or not agent_id or not run_id:
-            return False
+            return "noop"
         with _worker_lock(name):
             record = _read_record(name)
             if record is None:
-                return False
+                return "noop"
             leases = dict(record.leases or {})
             keep = {
                 key: lease for key, lease in leases.items()
@@ -2202,22 +2211,24 @@ def release_bound_lease(name: str, agent_id: str, run_id: str) -> bool:
                 )
             }
             if len(keep) == len(leases):
-                return False
+                return "noop"
+            if not _update_record_locked(
+                name, record.generation,
+                leases=keep, last_active_at=time.time(),
+            ):
+                return "failed"
             logger.info(
                 "worker %s: released lease(s) %s bound to agent %s run %s "
                 "on reattached terminal proof",
                 name, sorted(set(leases) - set(keep)), agent_id, run_id,
             )
-            return _update_record_locked(
-                name, record.generation,
-                leases=keep, last_active_at=time.time(),
-            )
+            return "released"
     except Exception:
         logger.warning(
             "release_bound_lease(%s, %s, %s) failed",
             name, agent_id, run_id, exc_info=True,
         )
-        return False
+        return "failed"
 
 
 def _evict_locked(record: WorkerRecord, reason: str) -> bool:

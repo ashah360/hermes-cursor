@@ -6763,6 +6763,120 @@ class TestSupervisorLeaseRelease:
         _wait_settled(name, "completed")
         assert "run-9" in gc_workers._read_record("host-w1").leases
 
+    def test_crash_between_release_and_settle_leaves_a_retryable_handle(
+        self, clean_state, monkeypatch
+    ):
+        """Durability ordering: authoritative GET terminal → exact lease
+        release → durable settle. A crash in between must leave the
+        lease ALREADY RELEASED and the handle still live/retryable —
+        settled-first would strand the lease forever (terminal handles
+        are never reattached)."""
+        name = _seed_reattachable(name="lost-crash")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        real_settle = gc_supervisor.SessionSupervisor._settle
+        crashed = []
+
+        def crashing_settle(self, status, error=""):
+            if not crashed:
+                crashed.append(1)
+                raise RuntimeError("gateway died between release and settle")
+            return real_settle(self, status, error)
+
+        monkeypatch.setattr(
+            gc_supervisor.SessionSupervisor, "_settle", crashing_settle
+        )
+
+        gc_supervisor.reconcile_once()
+        assert _wait_until(lambda: crashed and not gc_supervisor.has_live(name))
+        # The invariant under test: the lease release LANDED before the
+        # (crashed) settlement…
+        assert gc_workers._read_record("host-w1").leases == {}
+        # …and the handle is NOT terminal — the retry path survives.
+        assert (gc_handles.get(name) or {}).get("status") == "running"
+
+        # Restart: the next reconcile pass re-attaches (release is now a
+        # no-op) and settles exactly once.
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert gc_workers._read_record("host-w1").leases == {}
+
+    def test_release_write_failure_defers_settlement_until_it_lands(
+        self, clean_state, monkeypatch
+    ):
+        """A matching lease exists but the release write fails once: the
+        supervisor must NOT terminal-settle/deliver yet (settling would
+        remove the only retry path). The next supervision cycle releases
+        successfully, THEN settles — exactly once."""
+        name = _seed_reattachable(name="lost-flaky")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        order = []
+        real_release = gc_workers.release_bound_lease
+
+        def flaky_release(name_, agent_id="", run_id=""):
+            if not any(kind == "release" for kind, _ in order):
+                order.append(("release", "failed"))
+                return "failed"
+            result = real_release(name_, agent_id=agent_id, run_id=run_id)
+            order.append(("release", result))
+            return result
+
+        monkeypatch.setattr(gc_workers, "release_bound_lease", flaky_release)
+        real_settle = gc_supervisor.SessionSupervisor._settle
+
+        def recording_settle(self, status, error=""):
+            order.append(("settle", status))
+            return real_settle(self, status, error)
+
+        monkeypatch.setattr(
+            gc_supervisor.SessionSupervisor, "_settle", recording_settle
+        )
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+
+        # Exact semantics: failed release first; settlement only AFTER
+        # the successful release — never before.
+        assert order[0] == ("release", "failed")
+        release_ok = order.index(("release", "released"))
+        first_settle = next(
+            i for i, (kind, _) in enumerate(order) if kind == "settle"
+        )
+        assert first_settle > release_ok
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert gc_workers._read_record("host-w1").leases == {}
+
+    def test_missing_worker_record_never_blocks_settlement(
+        self, clean_state, monkeypatch
+    ):
+        """No worker record at all = positively nothing to release — a
+        no-op that must not stall the terminal settlement."""
+        name = _seed_reattachable(name="lost-noworker")
+        gc_handles.record(name, worker="host-gone")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+
     def test_get_nonterminal_releases_nothing_while_supervising(
         self, clean_state, monkeypatch
     ):

@@ -1812,19 +1812,17 @@ class TestReleaseBoundLease:
         name = self._leased(tmp_path)
         assert workers.release_bound_lease(
             name, agent_id="agent-1", run_id="r-1"
-        ) is True
+        ) == "released"
         assert workers._read_record(name).leases == {}
 
-    def test_mismatched_run_or_agent_releases_nothing(
-        self, tmp_path, fake_spawn
-    ):
+    def test_mismatched_run_or_agent_is_a_noop(self, tmp_path, fake_spawn):
         name = self._leased(tmp_path)
-        assert not workers.release_bound_lease(
+        assert workers.release_bound_lease(
             name, agent_id="agent-1", run_id="r-OTHER"
-        )
-        assert not workers.release_bound_lease(
+        ) == "noop"
+        assert workers.release_bound_lease(
             name, agent_id="agent-OTHER", run_id="r-1"
-        )
+        ) == "noop"
         assert "lease-1" in workers._read_record(name).leases
 
     def test_unbound_lease_is_never_matched(self, tmp_path, fake_spawn):
@@ -1832,21 +1830,45 @@ class TestReleaseBoundLease:
         repo.mkdir()
         record = workers.ensure_worker(str(repo), lease_id="lease-u")
         # Empty identity must never wildcard onto the unbound lease.
-        assert not workers.release_bound_lease(
+        assert workers.release_bound_lease(
             record.name, agent_id="", run_id=""
-        )
-        assert not workers.release_bound_lease(
+        ) == "noop"
+        assert workers.release_bound_lease(
             record.name, agent_id="agent-1", run_id="r-1"
-        )
+        ) == "noop"
         assert "lease-u" in workers._read_record(record.name).leases
 
-    def test_idempotent_and_safe_on_missing_worker(
+    def test_idempotent_and_noop_on_missing_worker(
         self, tmp_path, fake_spawn
     ):
         name = self._leased(tmp_path)
-        assert workers.release_bound_lease(name, "agent-1", "r-1")
-        assert workers.release_bound_lease(name, "agent-1", "r-1") is False
-        assert workers.release_bound_lease("no-such-worker", "a", "r") is False
+        assert workers.release_bound_lease(name, "agent-1", "r-1") == (
+            "released"
+        )
+        assert workers.release_bound_lease(name, "agent-1", "r-1") == "noop"
+        assert workers.release_bound_lease(
+            "no-such-worker", "a", "r"
+        ) == "noop"
+
+    def test_write_failure_with_a_matching_lease_reports_failed(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """A matching lease exists but the fenced record write refuses —
+        the caller must be able to distinguish this from a no-op (it has
+        to RETRY before durably settling)."""
+        name = self._leased(tmp_path)
+        real_update = workers._update_record_locked
+        monkeypatch.setattr(
+            workers, "_update_record_locked", lambda *a, **kw: False
+        )
+        assert workers.release_bound_lease(name, "agent-1", "r-1") == (
+            "failed"
+        )
+        monkeypatch.setattr(workers, "_update_record_locked", real_update)
+        assert "lease-1" in workers._read_record(name).leases  # retained
+        assert workers.release_bound_lease(name, "agent-1", "r-1") == (
+            "released"
+        )
 
     def test_sibling_leases_on_other_runs_survive(
         self, tmp_path, fake_spawn
