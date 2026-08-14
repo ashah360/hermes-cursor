@@ -62,6 +62,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -585,6 +586,16 @@ class _CloudWorker:
         self._saw_conversation = False
         self._worker_record: Optional[_workers.WorkerRecord] = None
         self._started_monotonic = time.monotonic()
+        # Per-RUN worker lease (runtime=local): installed atomically by
+        # ensure_worker, bound to agent/run identity the instant the
+        # create/follow-up returned, and RELEASED only after a remote
+        # terminal state was actually observed (or when no agent was
+        # ever established). An unconfirmed executor exit KEEPS the
+        # lease — conservatively retained (safe leak) rather than risk
+        # reaping a worker whose run may still be live server-side.
+        self._lease_id = f"run-{uuid.uuid4().hex[:12]}"
+        self._lease_held = False
+        self._remote_terminal_observed = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -644,6 +655,32 @@ class _CloudWorker:
 
     # -- agent establishment ---------------------------------------------------
 
+    def _bind_lease(self, agent_id: str, run_id: str) -> None:
+        """Bind the dispatch lease to the real remote identity the
+        instant the create/follow-up returned: from here the worker is
+        protected until an observed remote terminal, across gateway
+        restarts and stream failures. Binding is AUTHORITATIVE —
+        continuing without a bound lease is forbidden: on failure the
+        run is CANCELLED rather than executed unprotected (fail
+        closed)."""
+        if not agent_id or not self._lease_held or self._worker_record is None:
+            return
+        if _workers.bind_lease(
+            self._worker_record.name, self._lease_id, agent_id, run_id
+        ):
+            return
+        logger.critical(
+            "worker %s: run %s could not be protected by a bound lease — "
+            "cancelling the run instead of executing unprotected",
+            self._worker_record.name, run_id,
+        )
+        self.abort_reason = self.abort_reason or "cancel"
+        self.abort_detail = (
+            self.abort_detail
+            or "run lease could not be bound — refused to execute unprotected"
+        )
+        self._cancel_requested.set()
+
     def _establish(self, client: CursorRestClient) -> Tuple[str, str, bool, str]:
         """Create the run: follow-up on the existing agent, else a fresh
         agent. Returns (agent_id, run_id, resumed, agents_ui_url)."""
@@ -651,6 +688,7 @@ class _CloudWorker:
             try:
                 created = client.send_followup(self._resume_agent_id, self._task)
                 run_id = str((created.get("run") or {}).get("id") or "")
+                self._bind_lease(self._resume_agent_id, run_id)
                 return (
                     self._resume_agent_id,
                     run_id,
@@ -703,6 +741,7 @@ class _CloudWorker:
         agent_id = str(agent.get("id") or "")
         run_id = str(run.get("id") or "")
         url = str(agent.get("url") or "") or f"{AGENTS_UI_BASE}/{agent_id}"
+        self._bind_lease(agent_id, run_id)
         return agent_id, run_id, False, url
 
     # -- stream consumption ------------------------------------------------------
@@ -828,7 +867,10 @@ class _CloudWorker:
                 logger.debug("mark_verified failed", exc_info=True)
 
     def _run_is_terminal(self, client: CursorRestClient) -> bool:
-        return self._final_status(client) in _TERMINAL_RUN_STATUSES
+        terminal = self._final_status(client) in _TERMINAL_RUN_STATUSES
+        if terminal:
+            self._remote_terminal_observed = True
+        return terminal
 
     def _final_status(self, client: CursorRestClient) -> str:
         """The run's status per GET runs/{id} — the settle authority."""
@@ -851,6 +893,26 @@ class _CloudWorker:
             self._put("cloud.error", {"error": f"cursor cloud worker crashed: {exc}"})
         finally:
             self._settled = True
+            # Release the per-run lease ONLY when a remote terminal state
+            # was actually observed, or when no agent was ever
+            # established (nothing remote can be running). An unconfirmed
+            # executor exit (exhausted reconnects, unknown remote status,
+            # unacknowledged cancel) KEEPS the lease — conservatively
+            # retained (safe leak) rather than risk reaping a worker
+            # whose run may still be live server-side.
+            if self._lease_held and self._worker_record is not None:
+                if self._remote_terminal_observed or not self._agent_id:
+                    _workers.release_lease(
+                        self._worker_record.name, self._lease_id,
+                        agent_id=self._agent_id,
+                    )
+                else:
+                    logger.info(
+                        "worker %s: lease %s retained (remote terminal not "
+                        "observed) — a later run's terminal proof on the "
+                        "same agent settles it",
+                        self._worker_record.name, self._lease_id,
+                    )
             self._put("__done__", {})
 
     def _run_inner(self, watcher: threading.Thread) -> None:
@@ -861,19 +923,35 @@ class _CloudWorker:
             return
         self._client = client
 
-        # Worker (runtime=local): reuse-or-spawn, bounded ready wait.
-        if self._runtime == "local":
-            try:
-                self._worker_record = _workers.ensure_worker(self._repo)
-            except _workers.WorkerError as exc:
-                self._put("cloud.fatal", {"error": str(exc)})
-                return
-
-        # Model-catalog validation (clear error listing valid ids).
+        # PURE preflights first — nothing below may cost a worker spawn
+        # or a lease. Model-catalog validation (clear error listing
+        # valid ids) happens before any worker exists so a malformed
+        # request never leaves an idle worker behind.
         catalog_error = model_catalog_error(client, self._model_id)
         if catalog_error:
             self._put("cloud.fatal", {"error": catalog_error})
             return
+
+        # Worker (runtime=local): reuse-or-spawn with the per-RUN lease
+        # installed ATOMICALLY under the same ownership lock — a failure
+        # to lease fails the dispatch (fail closed), never yields an
+        # unprotected worker.
+        if self._runtime == "local":
+            try:
+                self._worker_record = _workers.ensure_worker(
+                    self._repo,
+                    lease_id=self._lease_id,
+                    lease_session=self._session_title or "",
+                )
+            except _workers.WorkerError as exc:
+                self._put("cloud.fatal", {"error": str(exc)})
+                return
+            # Held only when the returned record really carries our
+            # lease (the atomic path guarantees it; ephemeral records
+            # from tests/fakes without durable state lease nothing).
+            self._lease_held = self._lease_id in (
+                self._worker_record.leases or {}
+            )
 
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)
@@ -913,6 +991,13 @@ class _CloudWorker:
                 "worker": (
                     self._worker_record.name if self._worker_record else ""
                 ),
+                # "systemd" | "detached" | "legacy" — "detached" is the
+                # clearly-surfaced DEGRADED supervision fallback.
+                "worker_supervision": (
+                    self._worker_record.supervision
+                    if self._worker_record
+                    else ""
+                ),
                 "agents_ui_url": ui_url,
                 "repo_url": self._repo_url or "",
                 "starting_ref": self._starting_ref or "",
@@ -947,6 +1032,10 @@ class _CloudWorker:
         status = _lower_status(self._final_status(client)) or _lower_status(
             (result_data or {}).get("status")
         )
+        if status in ("finished", "cancelled", "expired", "error"):
+            # Remote-emitted terminal state (GET authority or the run's
+            # own result event) — the lease may be released.
+            self._remote_terminal_observed = True
         self._settled = True
         if self.abort_reason == "timeout":
             self._put("cloud.error", self._timeout_error())
@@ -1066,7 +1155,9 @@ def run_cloud(
         derived_url, derived_ref = workdir_str, None
     else:
         workdir = resolve_repo(repo)
-        workdir_str = str(workdir)
+        # Canonical worktree identity: worker naming, admission, and the
+        # execution cwd all key the worktree TOPLEVEL, never a subdir.
+        workdir_str = _workers.canonical_repo_path(str(workdir))
         if repo_url and starting_ref:
             derived_url, derived_ref = repo_url, starting_ref
         else:
