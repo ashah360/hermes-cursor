@@ -421,7 +421,7 @@ def _plan_items(args: Dict[str, Any]) -> List[Dict[str, str]]:
 
 def _sdk_tool_title(name: str, kind: str, args: Dict[str, Any]) -> str:
     # The model-written description is the most human string on the wire
-    # ("Start focused rush install in tmux background") — prefer it for
+    # ("Run focused tests in background") — prefer it for
     # every kind that carries one. args are unstable/optional upstream, so
     # every probe degrades gracefully.
     description = _first_str(args, "description").strip()

@@ -6,7 +6,7 @@ data: {"runId":"run-0f7c7a03-2ca2-4a88-9de0-a0b593a4cc52","status":"FINISHED"}
 
 id: 1783536050627-0
 event: result
-data: {"runId":"run-0f7c7a03-2ca2-4a88-9de0-a0b593a4cc52","status":"CANCELLED","durationMs":9897,"git":{"branches":[{"repoUrl":"github.com/waseemshahwan/machine-smoke-test"}]}}
+data: {"runId":"run-0f7c7a03-2ca2-4a88-9de0-a0b593a4cc52","status":"CANCELLED","durationMs":9897,"git":{"branches":[{"repoUrl":"github.com/example/example-repo"}]}}
 
 id: 1783536050627-0
 event: done

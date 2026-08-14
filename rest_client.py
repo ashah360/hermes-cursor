@@ -3,10 +3,8 @@
 Replaces the python ``cursor-sdk`` (and its ``cursor-sdk-bridge`` sidecar)
 entirely: every call here is a direct https request to ``api.cursor.com``
 authenticated with ``Bearer CURSOR_API_KEY``. No bridge, no sidecar
-process, no local state. The surface was verified live 2026-07-08 against
-the published OpenAPI spec (https://cursor.com/docs-static/cloud-agents-openapi.yaml)
-— see CLOUD_MIGRATION_NOTES.md ("REST+SSE migration — Phase 1") and the
-raw captures in ``fixtures/rest_v1/``.
+process, no local state. The wire contract is covered by sanitized captures
+in ``fixtures/rest_v1/`` and the published Cursor Cloud Agents OpenAPI spec.
 
 Endpoints wrapped (all verified live):
 

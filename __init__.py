@@ -726,7 +726,7 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
             tool = str(envelope.get("tool") or "tool")
             call_id = str(envelope.get("id") or "tool")
             # Title first: the normalizer already prefers the model-written
-            # description ("Start focused rush install in tmux background")
+            # description ("Run focused tests in background")
             # over raw command text.
             detail = str(
                 envelope.get("title")

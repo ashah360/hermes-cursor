@@ -6330,7 +6330,7 @@ class TestSdkNormalizer:
 
         diffs = [e for e in envs if e["kind"] == "file_diff"]
         assert len(diffs) == 1
-        assert diffs[0]["path"] == "/private/tmp/gc-probe/repo/hello.txt"
+        assert diffs[0]["path"] == "/workspace/example-repo/hello.txt"
         assert diffs[0]["status"] == "A"  # "--- /dev/null" diff header
         assert "+hello from sdk probe" in diffs[0]["diff"]
         assert diffs[0]["added"] == 1  # linesAdded from the payload

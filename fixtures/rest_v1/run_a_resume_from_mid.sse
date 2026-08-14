@@ -346,7 +346,7 @@ data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED"}
 
 id: 1783535980837-0
 event: result
-data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/waseemshahwan/machine-smoke-test"}]}}
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/example/example-repo"}]}}
 
 id: 1783535980837-0
 event: done

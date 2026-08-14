@@ -296,19 +296,19 @@ data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","s
 
 id: 1783535948263-0
 event: tool_call
-data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"running","args":{"path":"/private/tmp/machine-smoke-test/README.md"}}
+data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"running","args":{"path":"/workspace/example-repo/README.md"}}
 
 id: 1783535948263-0
 event: interaction_update
-data: {"type":"tool-call-started","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/private/tmp/machine-smoke-test/README.md"}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
+data: {"type":"tool-call-started","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/workspace/example-repo/README.md"}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
 
 id: 1783535948358-0
 event: tool_call
-data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"completed","args":{"path":"/private/tmp/machine-smoke-test/README.md"},"result":{"success":{"content":"# smoke\n","totalLines":2,"fileSize":8,"path":"/private/tmp/machine-smoke-test/README.md","readRange":{"startLine":1,"endLine":2}}}}
+data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"completed","args":{"path":"/workspace/example-repo/README.md"},"result":{"success":{"content":"# smoke\n","totalLines":2,"fileSize":8,"path":"/workspace/example-repo/README.md","readRange":{"startLine":1,"endLine":2}}}}
 
 id: 1783535948358-0
 event: interaction_update
-data: {"type":"tool-call-completed","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/private/tmp/machine-smoke-test/README.md"},"result":{"status":"success","value":{"content":"# smoke\n","totalLines":2,"fileSize":8}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
+data: {"type":"tool-call-completed","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/workspace/example-repo/README.md"},"result":{"status":"success","value":{"content":"# smoke\n","totalLines":2,"fileSize":8}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
 
 id: 1783535948363-0
 event: interaction_update
@@ -344,11 +344,11 @@ data: {"type":"tool-call-started","callId":"tool_8a6d8606-4511-403b-b846-c00f7d1
 
 id: 1783535956877-0
 event: tool_call
-data: {"callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","name":"grep_search","status":"completed","args":{"pattern":"smoke","caseInsensitive":false,"multiline":false,"toolCallId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","offset":0},"result":{"success":{"pattern":"smoke","outputMode":"content","workspaceResults":{"/private/tmp/machine-smoke-test":{"content":{"matches":[{"file":"./README.md","matches":[{"lineNumber":1,"content":"# smoke"}]}],"totalLines":1,"totalMatchedLines":1}}}}}}
+data: {"callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","name":"grep_search","status":"completed","args":{"pattern":"smoke","caseInsensitive":false,"multiline":false,"toolCallId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","offset":0},"result":{"success":{"pattern":"smoke","outputMode":"content","workspaceResults":{"/workspace/example-repo":{"content":{"matches":[{"file":"./README.md","matches":[{"lineNumber":1,"content":"# smoke"}]}],"totalLines":1,"totalMatchedLines":1}}}}}}
 
 id: 1783535956877-0
 event: interaction_update
-data: {"type":"tool-call-completed","callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","toolCall":{"type":"grep","args":{"pattern":"smoke","offset":0},"result":{"status":"success","value":{"workspaceResults":{"/private/tmp/machine-smoke-test":{"type":"content","output":{"matches":[{"file":"./README.md"}],"totalMatches":0}}}}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-11-xi84"}
+data: {"type":"tool-call-completed","callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","toolCall":{"type":"grep","args":{"pattern":"smoke","offset":0},"result":{"status":"success","value":{"workspaceResults":{"/workspace/example-repo":{"type":"content","output":{"matches":[{"file":"./README.md"}],"totalMatches":0}}}}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-11-xi84"}
 
 id: 1783535956881-0
 event: interaction_update
@@ -711,7 +711,7 @@ data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED"}
 
 id: 1783535980837-0
 event: result
-data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/waseemshahwan/machine-smoke-test"}]}}
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/example/example-repo"}]}}
 
 id: 1783535980837-0
 event: done
