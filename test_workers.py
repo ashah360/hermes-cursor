@@ -1795,6 +1795,71 @@ def _mp_migrate_child(xdg, hermes_home, alive_dir, barrier, result_q):
         result_q.put(("err", repr(exc)))
 
 
+class TestReleaseBoundLease:
+    """The restart bridge's workers API: release strictly by POSITIVE
+    worker + agent_id + run_id match — never by session text, never by
+    timer, never an unbound (create-uncertain) lease. Idempotent and
+    generation-safe under the worker flock."""
+
+    def _leased(self, tmp_path, agent="agent-1", run="r-1"):
+        repo = tmp_path / "repo"
+        repo.mkdir(exist_ok=True)
+        record = workers.ensure_worker(str(repo), lease_id="lease-1")
+        assert workers.bind_lease(record.name, "lease-1", agent, run)
+        return record.name
+
+    def test_releases_the_exact_agent_run_match(self, tmp_path, fake_spawn):
+        name = self._leased(tmp_path)
+        assert workers.release_bound_lease(
+            name, agent_id="agent-1", run_id="r-1"
+        ) is True
+        assert workers._read_record(name).leases == {}
+
+    def test_mismatched_run_or_agent_releases_nothing(
+        self, tmp_path, fake_spawn
+    ):
+        name = self._leased(tmp_path)
+        assert not workers.release_bound_lease(
+            name, agent_id="agent-1", run_id="r-OTHER"
+        )
+        assert not workers.release_bound_lease(
+            name, agent_id="agent-OTHER", run_id="r-1"
+        )
+        assert "lease-1" in workers._read_record(name).leases
+
+    def test_unbound_lease_is_never_matched(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="lease-u")
+        # Empty identity must never wildcard onto the unbound lease.
+        assert not workers.release_bound_lease(
+            record.name, agent_id="", run_id=""
+        )
+        assert not workers.release_bound_lease(
+            record.name, agent_id="agent-1", run_id="r-1"
+        )
+        assert "lease-u" in workers._read_record(record.name).leases
+
+    def test_idempotent_and_safe_on_missing_worker(
+        self, tmp_path, fake_spawn
+    ):
+        name = self._leased(tmp_path)
+        assert workers.release_bound_lease(name, "agent-1", "r-1")
+        assert workers.release_bound_lease(name, "agent-1", "r-1") is False
+        assert workers.release_bound_lease("no-such-worker", "a", "r") is False
+
+    def test_sibling_leases_on_other_runs_survive(
+        self, tmp_path, fake_spawn
+    ):
+        name = self._leased(tmp_path)
+        # A follow-up run's lease on the same worker, bound elsewhere.
+        assert workers.acquire_lease(name, "lease-2", "sess")
+        assert workers.bind_lease(name, "lease-2", "agent-1", "r-2")
+        assert workers.release_bound_lease(name, "agent-1", "r-1")
+        remaining = workers._read_record(name).leases
+        assert set(remaining) == {"lease-2"}
+
+
 class TestMigrationLockNonRecursive:
     """Regression: the migration flock must never be re-entered through
     state_dir from helpers running UNDER it (collision noting writes the

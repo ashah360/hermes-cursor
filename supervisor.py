@@ -519,7 +519,32 @@ class SessionSupervisor:
         if self._stop_requested.is_set() and status == "cancelled":
             self._ingest_lifecycle("interrupted")
         self._settle(status, **error)
+        self._release_worker_lease(agent_id, run_id)
         return True
+
+    def _release_worker_lease(self, agent_id: str, run_id: str) -> None:
+        """Restart bridge: the in-process runner that bound this run's
+        worker lease died with the old gateway and can never release it.
+        After the SAME authoritative GET-terminal gate that settled the
+        handle (never SSE replay, never an unknown/nonterminal GET),
+        release the lease positively bound to exactly this agent+run on
+        the handle's recorded local worker. Idempotent; a mismatched,
+        unbound, or cloud-runtime lease is never touched."""
+        try:
+            entry = _handles.get(self.session_name) or {}
+            worker = str(entry.get("worker") or "")
+            if not worker or _handles.runtime_of(entry) != "local":
+                return
+            from . import workers as _workers
+
+            _workers.release_bound_lease(
+                worker, agent_id=agent_id, run_id=run_id
+            )
+        except Exception:
+            logger.warning(
+                "worker lease release for %s failed", self.session_name,
+                exc_info=True,
+            )
 
     # -- ingest boundary (RFC §4) ---------------------------------------------
 

@@ -6670,6 +6670,122 @@ def _wait_settled(name, status, timeout=10.0):
     )
 
 
+def _seed_leased_worker(name="host-w1", agent="bc-lost", run="run-9",
+                        lease_id="run-9", bound=True):
+    """A persisted worker record shaped like the live restart leak: the
+    lease's holder is the OLD gateway pid (dead), bound to agent/run."""
+    lease = {
+        "session": "lost-run",
+        "holder_pid": 2 ** 22 + 11,  # beyond pid_max — positively dead
+        "holder_birth": None,
+        "acquired_at": time.time() - 300,
+        "agent_id": agent if bound else "",
+        "run_id": run if bound else "",
+    }
+    gc_workers._write_record(gc_workers.WorkerRecord(
+        name=name, repo_path="/tmp/r", pid=4242, log_path="/dev/null",
+        started_at=time.time() - 600, verified=True, generation="gen-old",
+        leases={lease_id: lease},
+    ))
+    return name
+
+
+class TestSupervisorLeaseRelease:
+    """The restart bridge (verified live leak): the in-process runner
+    that bound the worker lease died with the old gateway; the
+    REATTACHED supervisor observes the authoritative GET terminal and
+    settles the handle — it must also release the matching bound worker
+    lease, through the same GET gate. Never on mismatch, cloud runtime,
+    or an unbound (create-uncertain) lease."""
+
+    def test_reattached_get_terminal_releases_the_bound_worker_lease(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable()          # agent bc-lost, run run-9
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert client.get_run_calls >= 1     # release rode the GET gate
+        record = gc_workers._read_record("host-w1")
+        assert record is not None
+        assert record.leases == {}           # the leak, closed
+
+    def test_mismatched_run_lease_is_retained(
+        self, clean_state, monkeypatch
+    ):
+        """The worker's lease is bound to a DIFFERENT run — terminal
+        proof for run-9 says nothing about it."""
+        name = _seed_reattachable(name="lost-mismatch")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker(run="run-OTHER", lease_id="run-OTHER")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-OTHER" in gc_workers._read_record("host-w1").leases
+
+    def test_unbound_lease_is_retained(self, clean_state, monkeypatch):
+        """Create-uncertain: an unbound lease has no proven identity —
+        settlement of ANY run releases nothing."""
+        name = _seed_reattachable(name="lost-unbound")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker(bound=False, lease_id="run-unbound")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-unbound" in gc_workers._read_record("host-w1").leases
+
+    def test_cloud_runtime_session_never_touches_worker_leases(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-cloud")
+        gc_handles.record(name, worker="host-w1", runtime="cloud")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-9" in gc_workers._read_record("host-w1").leases
+
+    def test_get_nonterminal_releases_nothing_while_supervising(
+        self, clean_state, monkeypatch
+    ):
+        """SSE replay says FINISHED but the GET authority stays RUNNING:
+        no settlement, no release — then the GET flips terminal and both
+        happen together."""
+        name = _seed_reattachable(name="lost-slow")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()],
+            statuses=("RUNNING", "FINISHED"), run_id="run-9",
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        # Only the terminal GET released it; while the authority said
+        # RUNNING the lease survived every SSE-side terminal claim.
+        assert gc_workers._read_record("host-w1").leases == {}
+        assert client.get_run_calls >= 2
+
+
 class TestSupervisorReattach:
     def test_reconciler_reattaches_ingests_and_settles_from_the_get(
         self, clean_state, monkeypatch
