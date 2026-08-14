@@ -15,13 +15,19 @@ Ask Hermes to fix a bug, build a feature, or review a repository. Hermes starts 
 
 ## Quick start
 
+You need:
+
+- Hermes Agent with plugin support.
+- A paid Cursor plan and a personal Cursor API key.
+- The Cursor GitHub app authorized for the repository you want to use.
+
 ### Install
 
 ```bash
 hermes plugins install ashah360/hermes-cursor --enable
 ```
 
-The project is called Hermes Cursor. Its internal plugin key remains `ghost_cursor` so existing installations and configuration keep working.
+Configuration uses the plugin key `ghost_cursor`.
 
 ### Add your Cursor API key
 

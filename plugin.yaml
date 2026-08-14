@@ -1,7 +1,7 @@
 name: ghost_cursor
 version: 0.6.0
-description: "Run Cursor Cloud coding agents from Hermes, on Cursor-hosted VMs or isolated workers on your own machine. Includes named sessions, live progress, follow-ups, native cancellation, restart recovery, and automatic terminal delivery."
-author: Arman
+description: "Delegate coding tasks from Hermes to Cursor Cloud on hosted VMs or isolated workers on your own machine, with named sessions, progress updates, follow-ups, cancellation, restart reattachment, and final-result delivery."
+author: Arman Hezarkhani
 kind: backend
 provides_tools:
   - cursor_create_session
