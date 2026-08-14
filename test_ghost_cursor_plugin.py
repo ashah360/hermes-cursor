@@ -5596,6 +5596,37 @@ class TestWorkerLeasePlumbing:
         assert len(releases) == 1
         assert releases[0][2] == ""  # no agent to sweep siblings for
 
+    def test_partial_create_response_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """EXACT reproduction: the create returned an agent id but an
+        empty run id. A remote agent EXISTS — releasing the lease as
+        'no agent established' is forbidden; the lease stays (unbound,
+        which protects just as hard), and no cancel is attempted (there
+        is no usable run identity to cancel with)."""
+        client = _FakeRestClient(run_id="")   # partial success
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []                    # partial identity: no bind
+        assert releases == []                 # lease conservatively kept
+        assert client.cancel_calls == []      # nothing usable to cancel
+
+    def test_network_failure_mid_create_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A network error on the create POST is AMBIGUOUS — the agent
+        may exist server-side. Only an authoritative API rejection (a
+        response) may release the pre-create lease."""
+        client = _FakeRestClient(
+            create_error=gc_rest.RestNetworkError("timeout mid-create"),
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []
+        assert releases == []                 # create-uncertain: kept
+
     def test_bind_failure_cancels_instead_of_running_unprotected(
         self, tmp_path, monkeypatch
     ):

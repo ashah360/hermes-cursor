@@ -435,6 +435,20 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _pid_exists(pid: int) -> bool:
+    """RAW pid existence (no cmdline heuristic): ANY process — ours or a
+    foreign reuse — makes this True. The teardown ownership gate needs
+    the raw view: a reused pid that no longer 'looks like a worker' must
+    still block group signals."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+
 def _agent_cli_path() -> Optional[str]:
     """The ``agent`` CLI binary, probing ~/.local/bin like the other
     cursor binaries (see runner.subprocess_env)."""
@@ -974,17 +988,32 @@ def live_workers() -> List[WorkerRecord]:
                     continue
                 current = _read_record(record.name)
                 if (
-                    current is not None
-                    and not _record_alive(current)
+                    current is None
+                    or _record_alive(current)
                     # Conflicted records are never lazily cleaned: another
                     # candidate may be alive; resolution owns them.
-                    and current.state != STATE_CONFLICT
+                    or current.state == STATE_CONFLICT
+                    # Leased records are retained UNTOUCHED: the lease
+                    # evidence must never disappear because the leader
+                    # died, and their remnants are not torn down here.
+                    or _fresh_leases(current, time.time())
                 ):
+                    continue
+                # Dead + leaseless: FULL verified teardown (the leader's
+                # death does not empty its cgroup/process group) before
+                # the record may be retired.
+                if _stop_generation(current):
                     logger.info(
                         "cleaning dead worker record %s (pid %d)",
                         current.name, current.pid,
                     )
                     _cleanup_generation(current)
+                else:
+                    _update_record_locked(
+                        current.name, current.generation,
+                        state=STATE_DRAINING,
+                        last_error="stop unverified during dead-record cleanup",
+                    )
     return records
 
 
@@ -1280,6 +1309,11 @@ def ensure_worker(
     reconcile(skip=(name,))
 
     with _worker_lock(name):
+        # Surviving leases of a replaced DEAD generation, carried into
+        # the replacement record: lease evidence never disappears merely
+        # because the leader died (they settle via explicit release /
+        # a later run's terminal proof on the same agent).
+        carried: Dict[str, Dict[str, Any]] = {}
         record = _read_record(name)
         if record is not None and record.state == STATE_CONFLICT:
             # Conflicted ownership resolves ONLY on positive proof (all
@@ -1347,6 +1381,18 @@ def ensure_worker(
                 "worker %s (pid %d, state %s) is not adoptable — replacing",
                 name, record.pid, record.state,
             )
+            carried = _fresh_leases(record, time.time())
+            if carried and _record_alive(record):
+                # A LIVE worker under an active run lease is never
+                # replaced: tearing it down would kill the run's
+                # processes. (A DEAD leader's leases are carried into
+                # the replacement generation below instead.)
+                raise WorkerError(
+                    f"worker '{name}' is protected by active run "
+                    f"lease(s) {sorted(carried)} but is not currently "
+                    "adoptable — refusing to replace it under an active "
+                    "lease; wait for the run(s) to settle, then re-send"
+                )
             if not _stop_generation(record):
                 _update_record_locked(
                     name, record.generation,
@@ -1366,6 +1412,16 @@ def ensure_worker(
         with _admission_lock():
             _enforce_capacity(name, real)
             record = _launch_generation(name, real)
+        if carried:
+            logger.info(
+                "worker %s: carrying %d surviving lease(s) from the dead "
+                "previous generation: %s",
+                name, len(carried), sorted(carried),
+            )
+            _update_record_locked(
+                name, record.generation, leases=dict(carried),
+            )
+            record = _read_record(name) or record
         _await_generation_ready(record)
         record = _read_record(name) or record
         return _install_lease_locked(record, lease_id, lease_session)
@@ -1567,16 +1623,37 @@ def _spawn_unit(
             "worker services will die at logout",
             os.environ.get("USER") or os.getuid(),
         )
-    # A remnant unit with no live record is unmanaged (the record is the
-    # authority and it is dead/absent here) — clear it so the fresh
-    # generation's name is free and no shadow worker swallows routing.
-    # The stop is VERIFIED: an unconfirmed remnant means fail closed
-    # (never start a duplicate next to an unkillable shadow).
+    # An ACTIVE unit with no live record is UNKNOWN ownership — another
+    # controller (foreign state dir, older plugin, manual start) may be
+    # running it, and we hold no InvocationID to prove it ours. It is
+    # NEVER stopped: record an explicit conflict and fail closed. The
+    # conflict self-heals through _resolve_conflict_or_raise once the
+    # unit is positively gone. Only INACTIVE residue is cleared (the
+    # verified stop of a non-active unit only resets state).
     show = _systemd_show(unit)
     if show.get("ActiveState") in ("active", "activating", "deactivating"):
-        logger.warning(
-            "stopping unmanaged remnant unit %s (record was dead/absent)",
-            unit,
+        _write_record(WorkerRecord(
+            name=name,
+            repo_path=real,
+            pid=int(show.get("MainPID") or 0),
+            log_path=str(log_path),
+            started_at=time.time(),
+            generation="",  # NOT ours — no generation identity claimed
+            unit=unit,
+            supervision="systemd",
+            state=STATE_CONFLICT,
+            last_active_at=time.time(),
+            last_error=(
+                f"unit {unit} is active with no managed record — "
+                "possibly another controller's worker; not stopping it"
+            ),
+        ))
+        raise WorkerError(
+            f"unit {unit} is already ACTIVE but this controller has no "
+            "record of it — it may belong to another controller or "
+            "profile, so it will not be stopped or replaced. Inspect it "
+            f"with `systemctl --user status {unit}` and stop it manually "
+            "if it is stale, then re-send."
         )
     if not _systemd_stop(unit):
         raise WorkerError(
@@ -1667,6 +1744,33 @@ def _stop_generation(record: WorkerRecord) -> bool:
                 )
                 return False
         return _systemd_stop(record.unit)
+    if record.pid <= 0:
+        return True  # reservation placeholder — no process ever started
+    if _pid_exists(record.pid):
+        # POSITIVE pid+birth ownership immediately before signalling: a
+        # process exists under this pid — it is only ours if the birth
+        # matches the recorded incarnation. A mismatch (kernel reused
+        # the pid, possibly for a foreign daemon leading its own group)
+        # or an UNPROVABLE birth (either side unknown) means the pgid
+        # may be foreign: never signal it.
+        birth = _pid_birth(record.pid)
+        owned = (
+            record.pid_birth is not None
+            and birth is not None
+            and birth == record.pid_birth
+            and _pid_alive(record.pid)
+        )
+        if not owned:
+            logger.warning(
+                "worker %s: pid %d exists but ownership is unproven "
+                "(recorded birth %r vs live %r) — refusing to signal a "
+                "possibly-foreign process group",
+                record.name, record.pid, record.pid_birth, birth,
+            )
+            return False
+    # No process holds the pid: the pid cannot have been reused while
+    # OUR group still has members (a pid stays reserved while it is the
+    # pgid of a live group), so the bounded group kill targets ours.
     _kill_detached(record)
     return _pgid_empty(record.pid)
 
@@ -1698,16 +1802,8 @@ def _kill_detached(record: WorkerRecord) -> None:
 # Per-RUN leases + idle reaping + capacity
 # ---------------------------------------------------------------------------
 
-# A worker with no fresh lease for this long is reaped by reconcile().
+# A worker with no lease for this long is reaped by reconcile().
 IDLE_TTL_S = 1800.0
-# An UNBOUND lease (dispatch acquired it, but no agent/run identity was
-# ever bound — the create failed, was lost, or is still in flight) stops
-# protecting the worker past this age even while its holder lives:
-# binding happens within one create round-trip.
-UNBOUND_LEASE_MAX_AGE_S = 600.0
-# An unbound lease whose HOLDER process died keeps protecting the worker
-# this long past acquisition (the settle window of a crashed dispatcher).
-LEASE_STALE_GRACE_S = 300.0
 
 
 def _plugin_config(key: str) -> Any:
@@ -1769,33 +1865,21 @@ def _holder_alive(lease: Dict[str, Any]) -> bool:
     return _pid_birth(pid) in (None, int(birth))
 
 
-def _lease_fresh(lease: Dict[str, Any], now: float) -> bool:
-    """Whether one lease still protects its worker.
-
-    A lease BOUND to real agent/run identity protects the worker until
-    an OBSERVED remote terminal releases it (the live executor's GET
-    settle authority) — never a timer, and holder death is irrelevant
-    (the run lives server-side; a restarted gateway must find the
-    worker still protected). An UNBOUND dispatch lease is transitional:
-    it expires ``UNBOUND_LEASE_MAX_AGE_S`` after acquisition even with
-    a live holder (a create that never bound within that window failed
-    or was lost), and ``LEASE_STALE_GRACE_S`` after a dead holder.
-    """
-    if str(lease.get("agent_id") or "") and str(lease.get("run_id") or ""):
-        return True
-    try:
-        acquired = float(lease.get("acquired_at") or 0.0)
-    except (TypeError, ValueError):
-        acquired = 0.0
-    if _holder_alive(lease):
-        return now - acquired < UNBOUND_LEASE_MAX_AGE_S
-    return now - acquired < LEASE_STALE_GRACE_S
-
-
 def _fresh_leases(record: WorkerRecord, now: float) -> Dict[str, Dict[str, Any]]:
+    """Every well-formed lease on the record — leases NEVER time-expire.
+
+    Model validation runs before ensure, so by the time a lease exists
+    the create POST may already have succeeded server-side even if the
+    holder crashed before binding (or before reading the response):
+    every installed run lease is CREATE-UNCERTAIN. Removal is explicit
+    :func:`release_lease` (the executor's observed remote terminal, or
+    its authoritative create rejection) only — never a timer, never
+    holder death. The orphan a crash can leave behind is a documented
+    conservative leak, settled by a later run's terminal proof on the
+    same agent (the release-time sweep)."""
     return {
         key: lease for key, lease in (record.leases or {}).items()
-        if isinstance(lease, dict) and _lease_fresh(lease, now)
+        if isinstance(lease, dict)
     }
 
 
@@ -1839,7 +1923,11 @@ def bind_lease(name: str, lease_id: str, agent_id: str, run_id: str) -> bool:
     AUTHORITATIVE outcome: False means the binding is NOT durable
     (record gone, lease gone, generation changed, or the write failed)
     and the caller must not proceed as if the worker were protected.
+    EMPTY identity is rejected: a bound lease MEANS real remote identity
+    (the caller keeps the unbound lease, which protects just as hard).
     Never raises (a failure reads as False)."""
+    if not str(agent_id or "") or not str(run_id or ""):
+        return False
     try:
         with _worker_lock(str(name)):
             record = _read_record(str(name))
@@ -1965,6 +2053,12 @@ def reconcile(
                         pass  # still conflicted — next pass
                     continue
                 if not _record_alive(record):
+                    if _fresh_leases(record, now):
+                        # Leader death alone never touches a leased
+                        # record: the run may live server-side and the
+                        # lease evidence must survive until explicit
+                        # release / the next dispatch carries it over.
+                        continue
                     if _evict_locked(record, "process dead"):
                         reaped.append(record.name)
                     continue

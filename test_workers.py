@@ -40,12 +40,26 @@ def _make_repo(path):
     return path
 
 
+class _FakeProcTable(set):
+    """A set of live pids, plus per-pid births (default 1) so the
+    pid-reuse fence is exercised deterministically."""
+
+    def __init__(self):
+        super().__init__()
+        self.births = {}
+
+
 @pytest.fixture
 def fake_procs(monkeypatch):
-    """A fake process table: pids in the set are alive. Kills and group
-    probes operate on the fake table (never signal real processes)."""
-    alive = set()
+    """A fake process table: pids in the set are alive. Kills, group
+    probes, existence and birth reads all operate on the fake table
+    (never on real processes)."""
+    alive = _FakeProcTable()
     monkeypatch.setattr(workers, "_pid_alive", lambda pid: int(pid) in alive)
+    monkeypatch.setattr(workers, "_pid_exists", lambda pid: int(pid) in alive)
+    monkeypatch.setattr(
+        workers, "_pid_birth", lambda pid: alive.births.get(int(pid), 1)
+    )
     monkeypatch.setattr(
         workers, "_kill_detached",
         lambda record: alive.discard(int(record.pid)),
@@ -1130,6 +1144,173 @@ class TestDegradedFallback:
         assert record.management_addr
 
 
+class TestForeignUnitProtection:
+    """An ACTIVE deterministic unit with no managed record is UNKNOWN
+    ownership (another controller/state-dir may own it): it is NEVER
+    stopped — the ensure fails closed with explicit conflict state, and
+    self-heals only once the unit is positively gone."""
+
+    def _seed_foreign_unit(self, repo, fake_systemd, fake_procs):
+        name = workers.worker_name_for(str(repo))
+        unit = workers._unit_name(name)
+        fake_systemd["units"][unit] = {
+            "ActiveState": "active",
+            "MainPID": "31337",
+            "InvocationID": "inv-foreign",
+        }
+        fake_procs.add(31337)
+        return name, unit
+
+    def test_active_unit_with_no_record_is_never_stopped(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name, unit = self._seed_foreign_unit(repo, fake_systemd, fake_procs)
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert unit in str(err.value)
+        assert fake_systemd["stopped"] == []            # NEVER stopped
+        record = workers._read_record(name)
+        assert record is not None
+        assert record.state == workers.STATE_CONFLICT   # explicit conflict
+
+    def test_foreign_unit_conflict_self_heals_once_the_unit_is_gone(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name, unit = self._seed_foreign_unit(repo, fake_systemd, fake_procs)
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        # While the foreign unit lives, every ensure keeps failing closed.
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        assert fake_systemd["stopped"] == []
+        # The foreign unit disappears (its owner stopped it).
+        fake_systemd["units"].pop(unit)
+        fake_procs.discard(31337)
+        record = workers.ensure_worker(str(repo))
+        assert record.state == workers.STATE_READY      # fresh spawn
+
+
+class TestDetachedPidReuse:
+    """Positive pid+birth ownership immediately before any detached
+    signal: a reused pid (same number, different birth) may lead a
+    FOREIGN process group — never signalled, record retained."""
+
+    def test_reused_pid_is_never_signalled(
+        self, tmp_path, fake_spawn, fake_procs, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert record.pid_birth == 1
+        # The leader died and the kernel reused its pid for a FOREIGN
+        # process (different birth) that started its own group.
+        fake_procs.births[record.pid] = 2
+        kills = []
+        monkeypatch.setattr(
+            workers, "_kill_detached", lambda r: kills.append(r.pid)
+        )
+        with workers._worker_lock(record.name):
+            workers._update_record_locked(
+                record.name, record.generation,
+                last_active_at=time.time() - workers.IDLE_TTL_S - 60,
+            )
+        assert workers.reconcile() == []     # nothing reaped
+        assert kills == []                   # NO signal at a foreign pgid
+        retained = workers._read_record(record.name)
+        assert retained is not None          # never silently dropped
+        assert retained.state == workers.STATE_DRAINING
+        assert record.pid in fake_procs      # the foreign process lives on
+
+    def test_matching_birth_still_stops_normally(
+        self, tmp_path, fake_spawn, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        with workers._worker_lock(record.name):
+            assert workers._stop_generation(
+                workers._read_record(record.name)
+            ) is True
+        assert record.pid not in fake_procs  # ours, verified stopped
+
+
+class TestDeadLeaderLeaseProtection:
+    """A bound lease NEVER disappears because the worker leader died:
+    reconcile and live_workers retain the record untouched; a new
+    dispatch may replace the dead generation but CARRIES the surviving
+    leases forward."""
+
+    def test_dead_leader_with_bound_lease_is_retained_untouched(
+        self, tmp_path, fake_spawn, fake_procs, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-x")
+        assert workers.bind_lease(record.name, "run-x", "agent-1", "r-1")
+        fake_procs.discard(record.pid)  # the leader died
+        kills = []
+        monkeypatch.setattr(
+            workers, "_kill_detached", lambda r: kills.append(r.pid)
+        )
+        assert workers.reconcile() == []
+        assert record.name not in {r.name for r in workers.live_workers()}
+        persisted = workers._read_record(record.name)
+        assert persisted is not None
+        assert "run-x" in persisted.leases   # the lease evidence survives
+        assert kills == []                   # remnants untouched
+
+    def test_new_dispatch_replaces_dead_leader_but_carries_leases(
+        self, tmp_path, fake_spawn, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo), lease_id="run-x")
+        assert workers.bind_lease(first.name, "run-x", "agent-1", "r-1")
+        fake_procs.discard(first.pid)
+        second = workers.ensure_worker(str(repo), lease_id="run-y")
+        assert second.generation != first.generation
+        assert {"run-x", "run-y"} <= set(second.leases)
+        lease = second.leases["run-x"]
+        assert lease["agent_id"] == "agent-1"  # binding carried verbatim
+
+    def test_live_workers_routes_dead_cleanup_through_verified_stop(
+        self, tmp_path, fake_spawn, fake_procs, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)
+        monkeypatch.setattr(workers, "_stop_generation", lambda r: False)
+        assert workers.live_workers() == []
+        retained = workers._read_record(record.name)
+        assert retained is not None          # unverified stop: retained
+        assert retained.state == workers.STATE_DRAINING
+
+    def test_replacing_a_live_leased_worker_fails_closed(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """A LIVE worker holding a lease that stopped being adoptable
+        (lost registration) is never replaced under an active lease —
+        replacing would kill the run's processes."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-x")
+        assert workers.bind_lease(record.name, "run-x", "agent-1", "r-1")
+        monkeypatch.setattr(
+            workers, "_probe_management",
+            lambda r: {"status": "not_ready", "connected": False,
+                       "claimed": False},
+        )
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo), lease_id="run-y")
+        assert "lease" in str(err.value)
+        assert workers._read_record(record.name) is not None
+
+
 class TestAtomicEnsureAndLease:
     def test_ensure_with_lease_id_installs_the_lease_atomically(
         self, tmp_path, fake_spawn
@@ -1163,6 +1344,18 @@ class TestAtomicEnsureAndLease:
         record = workers.ensure_worker(str(repo), lease_id="run-3")
         assert workers.bind_lease(record.name, "run-GONE", "a", "r") is False
         assert workers.bind_lease("no-such-worker", "run-3", "a", "r") is False
+
+    def test_bind_lease_rejects_empty_identity(self, tmp_path, fake_spawn):
+        """A bound lease MEANS real remote identity: binding with an
+        empty agent_id or run_id is rejected (the lease stays unbound —
+        which now protects just as hard — rather than recording a lie)."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-4")
+        assert workers.bind_lease(record.name, "run-4", "", "r-1") is False
+        assert workers.bind_lease(record.name, "run-4", "agent-1", "") is False
+        lease = workers._read_record(record.name).leases["run-4"]
+        assert lease["agent_id"] == "" and lease["run_id"] == ""
 
     def test_release_settles_dead_holder_siblings_of_the_same_agent(
         self, tmp_path, fake_spawn, monkeypatch
@@ -1246,46 +1439,47 @@ class TestLeasesAndReaping:
         assert persisted is not None
         assert "run-b" in persisted.leases  # conservatively retained
 
-    def test_unbound_lease_expires_after_dead_holder_grace(
+    def test_unbound_lease_with_dead_holder_still_protects(
         self, tmp_path, fake_spawn, monkeypatch
     ):
+        """Every installed run lease is CREATE-UNCERTAIN: model
+        validation happens before ensure, so by the time a lease exists
+        the create POST may already have succeeded server-side even if
+        the holder crashed before binding (or before reading the
+        response). A dead holder therefore NEVER time-expires a lease —
+        removal is explicit release or authoritative terminal proof
+        only (the documented conservative orphan leak)."""
         repo = tmp_path / "repo"
         repo.mkdir()
         record = workers.ensure_worker(str(repo), lease_id="run-u")
         monkeypatch.setattr(workers, "_holder_alive", lambda lease: False)
-        # Within the grace window the unbound lease still protects.
-        assert workers.reconcile() == []
-        # Push acquisition + activity past the stale grace AND the TTL.
+        # Age acquisition and activity far past every historical window.
         with workers._worker_lock(record.name):
             current = workers._read_record(record.name)
             aged = {
-                key: {**lease, "acquired_at": time.time()
-                      - workers.LEASE_STALE_GRACE_S - 30}
+                key: {**lease, "acquired_at": time.time() - 90000}
                 for key, lease in current.leases.items()
             }
             workers._update_record_locked(
                 record.name, current.generation,
                 leases=aged,
+                last_active_at=time.time() - workers.IDLE_TTL_S - 90000,
+            )
+        assert workers.reconcile() == []     # still protecting
+        persisted = workers._read_record(record.name)
+        assert persisted is not None
+        assert "run-u" in persisted.leases
+        # Explicit release settles it; the worker becomes reapable only
+        # after a fresh full idle TTL.
+        workers.release_lease(record.name, "run-u")
+        assert workers.reconcile() == []
+        with workers._worker_lock(record.name):
+            current = workers._read_record(record.name)
+            workers._update_record_locked(
+                record.name, current.generation,
                 last_active_at=time.time() - workers.IDLE_TTL_S - 60,
             )
         assert workers.reconcile() == [record.name]
-
-    def test_unbound_lease_with_live_holder_expires_after_max_age(
-        self, tmp_path, fake_spawn
-    ):
-        """A live gateway that acquired but never bound within the
-        window has failed or lost the create: the transitional lease
-        must not pin the worker forever."""
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        record = workers.ensure_worker(str(repo), lease_id="run-t")
-        now = time.time()
-        lease = workers._read_record(record.name).leases["run-t"]
-        assert workers._lease_fresh(lease, now) is True
-        assert workers._lease_fresh(
-            {**lease, "acquired_at": now - workers.UNBOUND_LEASE_MAX_AGE_S - 5},
-            now,
-        ) is False
 
     def test_release_bumps_the_idle_clock(self, tmp_path, fake_spawn):
         repo = tmp_path / "repo"
@@ -1460,6 +1654,10 @@ def _mp_ensure_child(repo, xdg, alive_dir, spawn_log, cap, barrier, result_q):
     workers._pid_alive = (
         lambda pid: (Path(alive_dir) / str(int(pid))).exists()
     )
+    workers._pid_exists = (
+        lambda pid: (Path(alive_dir) / str(int(pid))).exists()
+    )
+    workers._pid_birth = lambda pid: 1
     workers._kill_detached = lambda record: (
         (Path(alive_dir) / str(int(record.pid))).unlink(missing_ok=True)
     )

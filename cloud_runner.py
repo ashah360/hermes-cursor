@@ -596,6 +596,14 @@ class _CloudWorker:
         self._lease_id = f"run-{uuid.uuid4().hex[:12]}"
         self._lease_held = False
         self._remote_terminal_observed = False
+        # Create-uncertainty tracking for the lease release decision:
+        # once a create/follow-up POST goes on the wire, a remote agent
+        # may exist even if we never read the response. Releasing "no
+        # agent was established" is only safe when the create was never
+        # attempted, or the API POSITIVELY rejected it (a response was
+        # received). A network failure mid-create retains the lease.
+        self._create_attempted = False
+        self._create_rejected = False
 
     # -- plumbing ----------------------------------------------------------
 
@@ -662,8 +670,24 @@ class _CloudWorker:
         restarts and stream failures. Binding is AUTHORITATIVE —
         continuing without a bound lease is forbidden: on failure the
         run is CANCELLED rather than executed unprotected (fail
-        closed)."""
-        if not agent_id or not self._lease_held or self._worker_record is None:
+        closed).
+
+        A PARTIAL identity (agent without a usable run id) is not bound
+        and not treated as a bind failure: there is no run identity to
+        cancel with, the dispatch fails via the caller's fatal path, and
+        the UNBOUND lease keeps protecting the worker (leases never
+        time-expire)."""
+        if not self._lease_held or self._worker_record is None:
+            return
+        if not agent_id or not run_id:
+            if agent_id or run_id:
+                logger.warning(
+                    "worker %s: create returned PARTIAL identity "
+                    "(agent=%r run=%r) — lease %s stays unbound and "
+                    "keeps protecting the worker",
+                    self._worker_record.name, agent_id, run_id,
+                    self._lease_id,
+                )
             return
         if _workers.bind_lease(
             self._worker_record.name, self._lease_id, agent_id, run_id
@@ -686,8 +710,14 @@ class _CloudWorker:
         agent. Returns (agent_id, run_id, resumed, agents_ui_url)."""
         if self._resume_agent_id:
             try:
+                self._create_attempted = True
                 created = client.send_followup(self._resume_agent_id, self._task)
                 run_id = str((created.get("run") or {}).get("id") or "")
+                # Remote identity is captured the INSTANT it is known:
+                # from here "no agent was established" is a lie and the
+                # lease-release path must never claim it.
+                self._agent_id = self._resume_agent_id
+                self._run_id = run_id or self._run_id
                 self._bind_lease(self._resume_agent_id, run_id)
                 return (
                     self._resume_agent_id,
@@ -725,6 +755,7 @@ class _CloudWorker:
             if self._repo_url
             else None
         )
+        self._create_attempted = True
         created = client.create_agent(
             self._task,
             model_id=self._model_id or None,
@@ -741,6 +772,12 @@ class _CloudWorker:
         agent_id = str(agent.get("id") or "")
         run_id = str(run.get("id") or "")
         url = str(agent.get("url") or "") or f"{AGENTS_UI_BASE}/{agent_id}"
+        # Remote identity is captured the INSTANT it is known — even a
+        # PARTIAL response (agent id without a usable run id) proves a
+        # remote agent exists, so the lease-release path must never
+        # claim "no agent was established" past this point.
+        self._agent_id = agent_id or self._agent_id
+        self._run_id = run_id or self._run_id
         self._bind_lease(agent_id, run_id)
         return agent_id, run_id, False, url
 
@@ -894,14 +931,19 @@ class _CloudWorker:
         finally:
             self._settled = True
             # Release the per-run lease ONLY when a remote terminal state
-            # was actually observed, or when no agent was ever
-            # established (nothing remote can be running). An unconfirmed
-            # executor exit (exhausted reconnects, unknown remote status,
-            # unacknowledged cancel) KEEPS the lease — conservatively
-            # retained (safe leak) rather than risk reaping a worker
-            # whose run may still be live server-side.
+            # was actually observed, or when it is POSITIVELY known that
+            # no remote run can exist: the create was never attempted, or
+            # the API authoritatively rejected it (a response was
+            # received) with no identity returned. Everything else —
+            # unconfirmed executor exit, network failure mid-create,
+            # partial identity — KEEPS the lease (conservative safe leak)
+            # rather than risk reaping a worker whose run may be live
+            # server-side.
+            no_remote_possible = not self._agent_id and (
+                not self._create_attempted or self._create_rejected
+            )
             if self._lease_held and self._worker_record is not None:
-                if self._remote_terminal_observed or not self._agent_id:
+                if self._remote_terminal_observed or no_remote_possible:
                     _workers.release_lease(
                         self._worker_record.name, self._lease_id,
                         agent_id=self._agent_id,
@@ -956,6 +998,11 @@ class _CloudWorker:
         try:
             agent_id, run_id, resumed, ui_url = self._establish(client)
         except RestClientError as exc:
+            # An API RESPONSE (RestApiError) is an authoritative create
+            # rejection — no remote run exists and the lease may be
+            # released. A NETWORK failure mid-create is ambiguous (the
+            # POST may have succeeded server-side): the lease is kept.
+            self._create_rejected = isinstance(exc, RestApiError)
             model_hint = (
                 f"the requested model {self._model_id!r}"
                 if self._model_id
