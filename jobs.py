@@ -151,6 +151,11 @@ class CursorJob:
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     cursor_session_id: str = ""       # the agent-id alias, set at cloud.session
+    # The remote run id, captured at cloud.session (updated per retry
+    # attempt on the same job). Owned by THIS job — the completion
+    # delivery identity never reads the mutable handle entry, which a
+    # later run may already have overwritten.
+    latest_run_id: str = ""
     resumed: bool = False
     model: str = ""                   # actual model reported by cloud.session
     worker: str = ""                  # the "My Machines" worker (runtime=local)
@@ -638,7 +643,15 @@ class CursorJobRegistry:
         dispatcher = str(job.session_key or "")
         recipients = sorted({str(k or "") for k in subscribers} | {dispatcher})
 
-        base_id = job.session_name or job.cursor_session_id or job.job_id
+        # Per-RUN identity (see supervisor.completion_delegation_id): the
+        # gateway dedupes by (delegation_id, type), so the plain session
+        # name would let the first run's terminal delivery suppress every
+        # later follow-up completion in the same named session.
+        base_id = _supervisor.completion_delegation_id(
+            job.session_name or job.cursor_session_id or job.job_id,
+            run_id=job.latest_run_id,
+            job_id=job.job_id,
+        )
         payload_result = trim_result(result)
         base_evt = {
             "type": "async_delegation",

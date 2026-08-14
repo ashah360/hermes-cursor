@@ -39,11 +39,15 @@ jobs:
           mkdir -p hermes-agent/plugins/ghost_cursor
           cp ghost_cursor/*.py hermes-agent/plugins/ghost_cursor/
           cp ghost_cursor/test_ghost_cursor_plugin.py hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
+          cp ghost_cursor/test_workers.py hermes-agent/tests/plugins/test_ghost_cursor_workers.py
+          cp ghost_cursor/test_rest_client.py hermes-agent/tests/plugins/test_ghost_cursor_rest_client.py
           # conftest MUST keep the name `conftest.py` or pytest won't auto-load its fixtures
           cp ghost_cursor/conftest.py hermes-agent/tests/plugins/conftest.py
           cp -r ghost_cursor/fixtures hermes-agent/tests/plugins/fixtures 2>/dev/null || true
           # drop the stray copies the *.py glob pulled into the plugin dir
           rm -f hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py \
+                hermes-agent/plugins/ghost_cursor/test_workers.py \
+                hermes-agent/plugins/ghost_cursor/test_rest_client.py \
                 hermes-agent/plugins/ghost_cursor/conftest.py
 
       - name: Install deps
@@ -55,4 +59,4 @@ jobs:
 
       - name: Unit tests (hermetic; hard per-test timeout so a hang fails fast)
         working-directory: hermes-agent
-        run: uv run --with pytest --with pytest-timeout pytest tests/plugins/test_ghost_cursor_plugin.py -q -p no:cacheprovider --timeout=60 --timeout-method=thread
+        run: uv run --with pytest --with pytest-timeout pytest tests/plugins/test_ghost_cursor_plugin.py tests/plugins/test_ghost_cursor_workers.py tests/plugins/test_ghost_cursor_rest_client.py -q -p no:cacheprovider --timeout=60 --timeout-method=thread

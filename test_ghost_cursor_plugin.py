@@ -413,7 +413,9 @@ class TestFirstSendRun:
         assert len(events) == 1
         evt = events[0]
         assert evt["type"] == "async_delegation"
-        assert evt["delegation_id"] == job.session_name
+        # Per-run identity — the fake session carries no run_id, so the
+        # id falls back to this job's stable job_id.
+        assert evt["delegation_id"] == f"{job.session_name}#job-{job.job_id}"
         assert evt["session_key"] == "gw:test:1"  # routes back to the caller
         assert evt["status"] == "completed"
         assert evt["cursor_session_id"] == "s-done"
@@ -807,7 +809,9 @@ class TestCursorSendMessage:
         events = _drain_completion_queue()
         assert len(events) == 1
         assert events[0]["result"]["session_id"] == "s-send"
-        assert events[0]["delegation_id"] == name
+        assert events[0]["delegation_id"] == (
+            f"{name}#job-{second_job.job_id}"
+        )
 
     def test_send_after_run_settled_is_a_plain_followup(
         self, clean_state, monkeypatch, tmp_path
@@ -958,6 +962,57 @@ class TestCursorStatusReadOnly:
         assert job.result["session_id"] == "s-ro"
         events = _drain_completion_queue()
         assert len(events) == 1 and events[0]["status"] == "completed"
+
+    def test_detached_supervision_is_surfaced_as_a_status_warning(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Degraded supervision honesty: when the local worker runs on
+        the DETACHED fallback (user systemd unavailable), the public
+        cursor_status output says so — while running AND from the
+        persisted record after the run settles."""
+        release = threading.Event()
+
+        def replay(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {
+                "agentId": "s-det", "cwd": str(workdir), "model": "m",
+                "resumed": False, "runtime": "local", "worker": "w-det",
+                "worker_supervision": "detached",
+            })
+            release.wait(10)
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-det")
+
+        live = cursor_status("s-det")
+        assert "detached" in live
+        assert "restart" in live  # says WHAT is degraded, not just a flag
+
+        release.set()
+        assert job.done_event.wait(10)
+        _drain_completion_queue()
+        gc_jobs.registry._reset_for_tests()  # persisted-record path
+        settled = cursor_status("s-det")
+        assert "detached" in settled
+
+    def test_systemd_supervision_shows_no_degradation_warning(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        def replay(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {
+                "agentId": "s-sysd", "cwd": str(workdir), "model": "m",
+                "resumed": False, "runtime": "local", "worker": "w-sysd",
+                "worker_supervision": "systemd",
+            })
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("s-sysd")
+        assert job.done_event.wait(10)
+        _drain_completion_queue()
+        assert "detached" not in cursor_status("s-sysd")
 
     def test_finished_job_status_shows_summary_peek_without_diffs(
         self, clean_state, monkeypatch, tmp_path
@@ -2060,7 +2115,7 @@ class TestProgressSubscriptions:
         completions = _completion_events(collected)
         assert len(completions) == 1
         assert completions[0]["status"] == "completed"
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#job-{job.job_id}"
         assert len(_digest_events(collected)) >= 2
 
     def test_interrupt_and_reprompt_carries_subscription_and_numbering(
@@ -2780,10 +2835,13 @@ class TestMultiSubscriberDelivery:
         by_key = {c["session_key"]: c for c in completions}
         assert set(by_key) == {"gw:alice", "gw:bob"}
         # Distinct delegation_ids (TUI dedup): the dispatcher keeps the
-        # plain session name, other subscribers get the hash suffix.
-        assert by_key["gw:alice"]["delegation_id"] == name
+        # per-run base id, other subscribers get the hash suffix AFTER it.
+        assert by_key["gw:alice"]["delegation_id"] == (
+            f"{name}#job-{job.job_id}"
+        )
         assert by_key["gw:bob"]["delegation_id"] == (
-            f"{name}@{gc_progress.subscriber_suffix('gw:bob')}"
+            f"{name}#job-{job.job_id}"
+            f"@{gc_progress.subscriber_suffix('gw:bob')}"
         )
         # Identical payloads apart from routing.
         assert by_key["gw:alice"]["status"] == "completed"
@@ -2854,7 +2912,7 @@ class TestMultiSubscriberDelivery:
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         assert completions[0]["session_key"] == ""
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#job-{job.job_id}"
 
     # -- legacy scalar migration ---------------------------------------------
 
@@ -3302,6 +3360,26 @@ class TestRegistration:
             assert entry["schema"] is schema
             assert entry["schema"]["parameters"]["required"] == required
             assert callable(entry["handler"])
+
+    def test_supervisor_reconciler_starts_before_worker_cleanup(
+        self, monkeypatch
+    ):
+        """Startup ordering: cloud reattach/digests/terminal delivery
+        (the supervisor reconciler) must never wait behind the
+        synchronous local-worker cleanup pass — supervisor first, lazy
+        worker reconcile second."""
+        order = []
+        monkeypatch.setattr(
+            gc_supervisor, "start_reconciler",
+            lambda: order.append("supervisor"),
+        )
+        monkeypatch.setattr(
+            gc_workers, "reconcile",
+            lambda *a, **kw: (order.append("workers"), [])[1],
+        )
+        ctx = SimpleNamespace(register_tool=lambda **kw: None)
+        register(ctx)
+        assert order == ["supervisor", "workers"]
 
     def test_send_schema_steers_delegation(self):
         desc = CURSOR_SEND_SCHEMA["description"].lower()
@@ -4024,6 +4102,51 @@ class TestCursorCreateSession:
         assert gc_handles.resolve("Fix payment webhook retries") == (
             "Fix payment webhook retries"
         )
+
+    def test_subdir_repo_records_the_canonical_worktree_toplevel(
+        self, clean_state, tmp_path
+    ):
+        """Canonical identity at the session layer: creating from a
+        SUBDIRECTORY of a checkout records the worktree toplevel — /repo
+        and /repo/subdir are ONE session/worker identity."""
+        import os as _os
+        import subprocess as _subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        cursor_create_session(repo=str(sub), title="Canonical identity")
+        entry = gc_handles.get("Canonical identity")
+        assert entry["repo"] == _os.path.realpath(str(repo))
+
+    def test_cloud_runtime_create_preserves_the_given_subdir_path(
+        self, clean_state, tmp_path
+    ):
+        """Cloud parity (origin/main): canonical worktree identity is a
+        LOCAL-runtime concern. A runtime=cloud session created from a
+        checkout subdirectory records exactly the resolved path the user
+        gave — never rewritten to the worktree toplevel."""
+        import subprocess as _subprocess
+        from pathlib import Path as _Path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        cursor_create_session(
+            repo=str(sub), title="Cloud parity", runtime="cloud"
+        )
+        entry = gc_handles.get("Cloud parity")
+        assert entry["repo"] == str(_Path(str(sub)).resolve())
 
     def test_title_whitespace_is_trimmed_and_collapsed(
         self, clean_state, tmp_path
@@ -4787,7 +4910,7 @@ def _install_fake_rest(monkeypatch, client, worker=None):
     )
     monkeypatch.setattr(
         gc_workers, "ensure_worker",
-        lambda repo: worker or _worker_record(repo=str(repo)),
+        lambda repo, **kw: worker or _worker_record(repo=str(repo)),
     )
     monkeypatch.setattr(gc_workers, "mark_verified", lambda name: None)
     # The per-process model-catalog cache must not leak across tests.
@@ -4803,6 +4926,38 @@ def _run_cloud_events(tmp_path, **kw):
 
 
 class TestCloudRunner:
+    def test_cloud_runtime_run_does_not_canonicalize_a_local_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Cloud parity (origin/main): run_cloud with runtime=cloud and a
+        LOCAL subdirectory path dispatches from exactly that resolved
+        path — canonicalization to the worktree toplevel applies only to
+        runtime=local (where it keys worker identity/admission)."""
+        import subprocess as _subprocess
+        from pathlib import Path as _Path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        derived_from = []
+        monkeypatch.setattr(
+            gc_cloud, "derive_repo_ref",
+            lambda path: (
+                derived_from.append(str(path))
+                or ("https://github.com/example/repo", "main")
+            ),
+        )
+        events = _run_cloud_events(sub, runtime="cloud")
+        assert events[-1][0] == "cloud.result"
+        assert derived_from == [str(_Path(str(sub)).resolve())]
+
     def test_happy_path_yields_session_messages_result(
         self, tmp_path, monkeypatch
     ):
@@ -4919,7 +5074,7 @@ class TestCloudRunner:
         client = _FakeRestClient()
         _install_fake_rest(monkeypatch, client)
 
-        def boom(repo):
+        def boom(repo, **kw):
             raise gc_workers.WorkerError("the 'agent' CLI is not on PATH")
 
         monkeypatch.setattr(gc_workers, "ensure_worker", boom)
@@ -4933,7 +5088,9 @@ class TestCloudRunner:
         _install_fake_rest(monkeypatch, client)
         monkeypatch.setattr(
             gc_workers, "ensure_worker",
-            lambda repo: pytest.fail("cloud runtime must not touch workers"),
+            lambda repo, **kw: pytest.fail(
+                "cloud runtime must not touch workers"
+            ),
         )
         events = _run_cloud_events(tmp_path, runtime="cloud")
         assert events[0][1]["worker"] == ""
@@ -5452,6 +5609,198 @@ _FABLE_THINKING_HIGH_SELECTION = {
         {"id": "effort", "value": "high"},
     ],
 }
+
+
+class TestWorkerLeasePlumbing:
+    """run_cloud's per-run worker-lease lifecycle: installed atomically
+    at ensure, bound the instant the create returned, released ONLY on
+    an observed remote terminal, conservatively retained otherwise."""
+
+    def _install_leased(self, monkeypatch, client):
+        """Fake rest + a fake ensure_worker that INSTALLS the requested
+        lease (mirroring the atomic path), with bind/release captured."""
+        _install_fake_rest(monkeypatch, client)
+        ensure_kwargs = {}
+
+        def ensure(repo, **kw):
+            ensure_kwargs.update(kw)
+            record = _worker_record(repo=str(repo))
+            if kw.get("lease_id"):
+                record.leases = {kw["lease_id"]: {"session": ""}}
+            return record
+
+        monkeypatch.setattr(gc_workers, "ensure_worker", ensure)
+        binds, releases = [], []
+        monkeypatch.setattr(
+            gc_workers, "bind_lease",
+            lambda name, lease_id, agent_id, run_id: (
+                binds.append((name, lease_id, agent_id, run_id)) or True
+            ),
+        )
+        monkeypatch.setattr(
+            gc_workers, "release_lease",
+            lambda name, lease_id, agent_id="": releases.append(
+                (name, lease_id, agent_id)
+            ),
+        )
+        return ensure_kwargs, binds, releases
+
+    def test_dispatch_leases_binds_then_releases_on_observed_terminal(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient()
+        ensure_kwargs, binds, releases = self._install_leased(
+            monkeypatch, client
+        )
+        events = _run_cloud_events(tmp_path)
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+        lease_id = ensure_kwargs.get("lease_id")
+        assert lease_id, "ensure must be asked for an atomic lease"
+        assert binds == [("test-worker", lease_id, "bc-fake-1", "run-1")]
+        # Terminal proof observed (GET FINISHED) -> released, with the
+        # agent id so same-agent stale leases are settled too.
+        assert releases == [("test-worker", lease_id, "bc-fake-1")]
+
+    def test_sse_finished_with_get_unavailable_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """SSE result FINISHED is NOT authoritative (a cancelled run's
+        replay can say FINISHED). With the settle GET unavailable, the
+        user-facing result may keep origin/main's display fallback —
+        but no remote terminal was OBSERVED, so the bound lease must
+        survive the executor's exit."""
+        client = _FakeRestClient()
+
+        def get_down(agent_id, run_id):
+            raise gc_rest.RestNetworkError("api unreachable at settle")
+
+        client.get_run = get_down
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        # origin/main display semantics preserved: the SSE result still
+        # settles the user-facing run status.
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+        assert len(binds) == 1     # the run WAS protected
+        assert releases == []      # …and stays protected (safe leak)
+
+    def test_sse_finished_with_nonterminal_get_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """The GET authority says RUNNING while the (lying) SSE replay
+        said FINISHED: nothing terminal was observed — retain."""
+        client = _FakeRestClient(statuses=("RUNNING",))
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert events[-1][0] == "cloud.error"  # authority wins the display
+        assert len(binds) == 1
+        assert releases == []
+
+    def test_unconfirmed_executor_exit_retains_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """Exhausted reconnects on a still-RUNNING run: the executor
+        gives up but has NO terminal proof — the lease must be retained
+        (the documented safe leak), never released."""
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.0)
+        client = _FakeRestClient(
+            streams=[[gc_rest.RestApiError(
+                "cursor api GET stream -> 409 conflict: stream_unavailable",
+                status_code=409,
+            )]],
+            statuses=("RUNNING",),  # never terminal
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert events[-1][0] == "cloud.error"
+        assert len(binds) == 1     # the run WAS protected
+        assert releases == []      # …and stays protected (safe leak)
+
+    def test_create_failure_before_any_agent_releases_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(
+            create_error=gc_rest.RestApiError("boom", status_code=500),
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []
+        # No agent was ever established: nothing remote can be running,
+        # so the pre-create lease is released (not leaked).
+        assert len(releases) == 1
+        assert releases[0][2] == ""  # no agent to sweep siblings for
+
+    def test_partial_create_response_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """EXACT reproduction: the create returned an agent id but an
+        empty run id. A remote agent EXISTS — releasing the lease as
+        'no agent established' is forbidden; the lease stays (unbound,
+        which protects just as hard), and no cancel is attempted (there
+        is no usable run identity to cancel with)."""
+        client = _FakeRestClient(run_id="")   # partial success
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []                    # partial identity: no bind
+        assert releases == []                 # lease conservatively kept
+        assert client.cancel_calls == []      # nothing usable to cancel
+
+    def test_network_failure_mid_create_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """A network error on the create POST is AMBIGUOUS — the agent
+        may exist server-side. Only an authoritative API rejection (a
+        response) may release the pre-create lease."""
+        client = _FakeRestClient(
+            create_error=gc_rest.RestNetworkError("timeout mid-create"),
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []
+        assert releases == []                 # create-uncertain: kept
+
+    def test_bind_failure_cancels_instead_of_running_unprotected(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(statuses=("CANCELLED",))
+        # The stream stays silent until the cancel actually lands — the
+        # run cannot slip through to a natural finish.
+        client.streams = [[lambda: client.cancelled.wait(5) and None or None]]
+        _, _, releases = self._install_leased(monkeypatch, client)
+        monkeypatch.setattr(
+            gc_workers, "bind_lease",
+            lambda name, lease_id, agent_id, run_id: False,
+        )
+        events = _run_cloud_events(tmp_path)
+        assert events[-1] == ("cloud.result", {"status": "cancelled"})
+        assert client.cancel_calls, "the remote run must be cancelled"
+        # CANCELLED is observed terminal proof — the lease settles.
+        assert len(releases) == 1
+
+    def test_cloud_runtime_never_touches_leases(self, tmp_path, monkeypatch):
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        for fn in ("ensure_worker", "bind_lease", "release_lease"):
+            monkeypatch.setattr(
+                gc_workers, fn,
+                lambda *a, _fn=fn, **kw: pytest.fail(
+                    f"cloud runtime must not call workers.{_fn}"
+                ),
+            )
+        events = _run_cloud_events(tmp_path, runtime="cloud")
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+
+    def test_session_event_surfaces_degraded_supervision(
+        self, tmp_path, monkeypatch
+    ):
+        record = _worker_record()
+        record.supervision = "detached"
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client, worker=record)
+        events = _run_cloud_events(tmp_path)
+        assert events[0][1]["worker_supervision"] == "detached"
 
 
 class TestModelTranslation:
@@ -6328,6 +6677,374 @@ def _wait_settled(name, status, timeout=10.0):
     )
 
 
+class TestCompletionIdentity:
+    """The gateway dedupes async_delegation events by (delegation_id,
+    type). With the plain session name as the id, the FIRST run's
+    terminal delivery consumed the id forever and every later follow-up
+    completion in the same named session was silently suppressed
+    (verified live at e0dc27d). Terminal identity is per-RUN:
+    ``<session>#run-<run_id>`` when the remote run is known — stable for
+    retries/replay of the SAME run, distinct across runs — with
+    deterministic attempt/job fallbacks. Display fields keep the plain
+    session name."""
+
+    def test_followup_completion_gets_a_distinct_per_run_id(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        def replay1(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {"agentId": "s-fu", "cwd": str(workdir),
+                                     "model": "m", "run_id": "run-1"})
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay1)
+        _start_run("t", repo=str(tmp_path))
+        job1 = _job_for("s-fu")
+        assert job1.done_event.wait(10)
+        name = job1.session_name
+        first = _completion_events(_drain_completion_queue())
+        assert len(first) == 1
+
+        def replay2(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {"agentId": "s-fu", "cwd": str(workdir),
+                                     "model": "m", "resumed": True,
+                                     "run_id": "run-2"})
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay2)
+        cursor_send_message(name, "again")
+        job2 = gc_jobs.registry.get_by_name(name)
+        assert job2 is not job1
+        assert job2.done_event.wait(10)
+        second = _completion_events(_drain_completion_queue())
+        assert len(second) == 1  # the follow-up's terminal turn ARRIVES
+
+        # Distinct per-run ids; display session unchanged.
+        assert first[0]["delegation_id"] == f"{name}#run-run-1"
+        assert second[0]["delegation_id"] == f"{name}#run-run-2"
+        assert second[0]["result"]["session"] == name
+        assert f"cursor_send_message('{name}'" in second[0]["summary"]
+
+    def test_reattached_followup_completion_gets_a_distinct_per_run_id(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-fu", run="run-1")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-1"
+        )
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        first = _completion_events(_drain_completion_queue())
+        assert len(first) == 1
+        assert first[0]["delegation_id"] == f"{name}#run-run-1"
+
+        # A follow-up re-prompted the session; that gateway died too and
+        # the NEXT reconcile pass settles run-2 the same way.
+        gc_handles.record(name, status="running", latest_run_id="run-2")
+        gc_handles.record_supervision(
+            name, phase="streaming", current_attempt_id="att-2", attempt_n=2
+        )
+        client2 = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-2"
+        )
+        _install_supervisor_client(monkeypatch, client2)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        second = _completion_events(_drain_completion_queue())
+        assert len(second) == 1
+        assert second[0]["delegation_id"] == f"{name}#run-run-2"
+
+    def test_replaying_the_same_run_delivery_keeps_ids_stable(
+        self, clean_state, monkeypatch
+    ):
+        """Same run replayed => same ids (gateway dedupe still prevents
+        duplicates); a follow-up run changes them; the subscriber suffix
+        rides AFTER the run identity."""
+        name = _seed_reattachable(name="lost-replay", run="run-7")
+        gc_handles.set_subscriber(name, "gw:bob", 3600.0)
+        sup = gc_supervisor.SessionSupervisor(name)
+        sup._run_id = "run-7"
+        sup._deliver_completion("completed", "", [])
+        sup._deliver_completion("completed", "", [])
+        replayed = _completion_events(_drain_completion_queue())
+        ids = [e["delegation_id"] for e in replayed]
+        assert len(ids) == 4
+        assert sorted(ids[:2]) == sorted(ids[2:])   # replay-stable
+        assert f"{name}#run-run-7" in ids
+        suffix = gc_progress.subscriber_suffix("gw:bob")
+        assert f"{name}#run-run-7@{suffix}" in ids  # suffix AFTER run id
+
+        sup._run_id = "run-8"
+        sup._deliver_completion("completed", "", [])
+        followup = _completion_events(_drain_completion_queue())
+        new_ids = {e["delegation_id"] for e in followup}
+        assert new_ids == {
+            f"{name}#run-run-8", f"{name}#run-run-8@{suffix}",
+        }
+        assert new_ids.isdisjoint(set(ids))
+
+    def test_pre_agent_failure_falls_back_to_the_job_identity(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """No cloud.session ever arrived (preflight died after the run
+        was armed): no run identity exists — the id falls back to the
+        stable job id, never a timestamp/random-at-delivery. Exercised
+        at the jobs layer: the public send path reports in-window
+        pre-agent failures in-turn by design."""
+        release = threading.Event()
+
+        def failing_replay(task, workdir, cancel_check=None,
+                           agent_id=None, **kw):
+            assert release.wait(10)
+            raise gc_cloud.CloudRunnerError("worker preflight failed")
+            yield  # pragma: no cover — generator shape
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", failing_replay)
+        job, _ = gc_jobs.registry.dispatch(
+            runner=gc._execute_cursor_run,
+            task="t", repo=str(tmp_path),
+            inactivity_timeout_s=30.0, max_wall_s=60.0,
+            session_name="Prefail", session_key="",
+        )
+        job.arm_delivery()  # armed BEFORE the failure lands
+        release.set()
+        assert job.done_event.wait(10)
+        assert job.latest_run_id == ""  # no run identity ever existed
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["delegation_id"] == f"Prefail#job-{job.job_id}"
+
+
+def _seed_leased_worker(name="host-w1", agent="bc-lost", run="run-9",
+                        lease_id="run-9", bound=True):
+    """A persisted worker record shaped like the live restart leak: the
+    lease's holder is the OLD gateway pid (dead), bound to agent/run."""
+    lease = {
+        "session": "lost-run",
+        "holder_pid": 2 ** 22 + 11,  # beyond pid_max — positively dead
+        "holder_birth": None,
+        "acquired_at": time.time() - 300,
+        "agent_id": agent if bound else "",
+        "run_id": run if bound else "",
+    }
+    gc_workers._write_record(gc_workers.WorkerRecord(
+        name=name, repo_path="/tmp/r", pid=4242, log_path="/dev/null",
+        started_at=time.time() - 600, verified=True, generation="gen-old",
+        leases={lease_id: lease},
+    ))
+    return name
+
+
+class TestSupervisorLeaseRelease:
+    """The restart bridge (verified live leak): the in-process runner
+    that bound the worker lease died with the old gateway; the
+    REATTACHED supervisor observes the authoritative GET terminal and
+    settles the handle — it must also release the matching bound worker
+    lease, through the same GET gate. Never on mismatch, cloud runtime,
+    or an unbound (create-uncertain) lease."""
+
+    def test_reattached_get_terminal_releases_the_bound_worker_lease(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable()          # agent bc-lost, run run-9
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert client.get_run_calls >= 1     # release rode the GET gate
+        record = gc_workers._read_record("host-w1")
+        assert record is not None
+        assert record.leases == {}           # the leak, closed
+
+    def test_mismatched_run_lease_is_retained(
+        self, clean_state, monkeypatch
+    ):
+        """The worker's lease is bound to a DIFFERENT run — terminal
+        proof for run-9 says nothing about it."""
+        name = _seed_reattachable(name="lost-mismatch")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker(run="run-OTHER", lease_id="run-OTHER")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-OTHER" in gc_workers._read_record("host-w1").leases
+
+    def test_unbound_lease_is_retained(self, clean_state, monkeypatch):
+        """Create-uncertain: an unbound lease has no proven identity —
+        settlement of ANY run releases nothing."""
+        name = _seed_reattachable(name="lost-unbound")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker(bound=False, lease_id="run-unbound")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-unbound" in gc_workers._read_record("host-w1").leases
+
+    def test_cloud_runtime_session_never_touches_worker_leases(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-cloud")
+        gc_handles.record(name, worker="host-w1", runtime="cloud")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        assert "run-9" in gc_workers._read_record("host-w1").leases
+
+    def test_crash_between_release_and_settle_leaves_a_retryable_handle(
+        self, clean_state, monkeypatch
+    ):
+        """Durability ordering: authoritative GET terminal → exact lease
+        release → durable settle. A crash in between must leave the
+        lease ALREADY RELEASED and the handle still live/retryable —
+        settled-first would strand the lease forever (terminal handles
+        are never reattached)."""
+        name = _seed_reattachable(name="lost-crash")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        real_settle = gc_supervisor.SessionSupervisor._settle
+        crashed = []
+
+        def crashing_settle(self, status, error=""):
+            if not crashed:
+                crashed.append(1)
+                raise RuntimeError("gateway died between release and settle")
+            return real_settle(self, status, error)
+
+        monkeypatch.setattr(
+            gc_supervisor.SessionSupervisor, "_settle", crashing_settle
+        )
+
+        gc_supervisor.reconcile_once()
+        assert _wait_until(lambda: crashed and not gc_supervisor.has_live(name))
+        # The invariant under test: the lease release LANDED before the
+        # (crashed) settlement…
+        assert gc_workers._read_record("host-w1").leases == {}
+        # …and the handle is NOT terminal — the retry path survives.
+        assert (gc_handles.get(name) or {}).get("status") == "running"
+
+        # Restart: the next reconcile pass re-attaches (release is now a
+        # no-op) and settles exactly once.
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert gc_workers._read_record("host-w1").leases == {}
+
+    def test_release_write_failure_defers_settlement_until_it_lands(
+        self, clean_state, monkeypatch
+    ):
+        """A matching lease exists but the release write fails once: the
+        supervisor must NOT terminal-settle/deliver yet (settling would
+        remove the only retry path). The next supervision cycle releases
+        successfully, THEN settles — exactly once."""
+        name = _seed_reattachable(name="lost-flaky")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        order = []
+        real_release = gc_workers.release_bound_lease
+
+        def flaky_release(name_, agent_id="", run_id=""):
+            if not any(kind == "release" for kind, _ in order):
+                order.append(("release", "failed"))
+                return "failed"
+            result = real_release(name_, agent_id=agent_id, run_id=run_id)
+            order.append(("release", result))
+            return result
+
+        monkeypatch.setattr(gc_workers, "release_bound_lease", flaky_release)
+        real_settle = gc_supervisor.SessionSupervisor._settle
+
+        def recording_settle(self, status, error=""):
+            order.append(("settle", status))
+            return real_settle(self, status, error)
+
+        monkeypatch.setattr(
+            gc_supervisor.SessionSupervisor, "_settle", recording_settle
+        )
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+
+        # Exact semantics: failed release first; settlement only AFTER
+        # the successful release — never before.
+        assert order[0] == ("release", "failed")
+        release_ok = order.index(("release", "released"))
+        first_settle = next(
+            i for i, (kind, _) in enumerate(order) if kind == "settle"
+        )
+        assert first_settle > release_ok
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert gc_workers._read_record("host-w1").leases == {}
+
+    def test_missing_worker_record_never_blocks_settlement(
+        self, clean_state, monkeypatch
+    ):
+        """No worker record at all = positively nothing to release — a
+        no-op that must not stall the terminal settlement."""
+        name = _seed_reattachable(name="lost-noworker")
+        gc_handles.record(name, worker="host-gone")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+
+    def test_get_nonterminal_releases_nothing_while_supervising(
+        self, clean_state, monkeypatch
+    ):
+        """SSE replay says FINISHED but the GET authority stays RUNNING:
+        no settlement, no release — then the GET flips terminal and both
+        happen together."""
+        name = _seed_reattachable(name="lost-slow")
+        gc_handles.record(name, worker="host-w1")
+        _seed_leased_worker()
+        client = _FakeRestClient(
+            streams=[_happy_stream()],
+            statuses=("RUNNING", "FINISHED"), run_id="run-9",
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        # Only the terminal GET released it; while the authority said
+        # RUNNING the lease survived every SSE-side terminal claim.
+        assert gc_workers._read_record("host-w1").leases == {}
+        assert client.get_run_calls >= 2
+
+
 class TestSupervisorReattach:
     def test_reconciler_reattaches_ingests_and_settles_from_the_get(
         self, clean_state, monkeypatch
@@ -6363,7 +7080,7 @@ class TestSupervisorReattach:
         evt = completions[0]
         assert evt["status"] == "completed"
         assert evt["session_key"] == ""
-        assert evt["delegation_id"] == name
+        assert evt["delegation_id"] == f"{name}#run-run-9"  # per-run id
         assert "all done" in evt["summary"]
 
     def test_replayed_finished_never_beats_the_gets_cancelled(
@@ -6416,8 +7133,10 @@ class TestSupervisorReattach:
         assert len(completions) == 2
         by_key = {e["session_key"]: e for e in completions}
         assert set(by_key) == {"", "alice"}
-        assert by_key[""]["delegation_id"] == name
-        assert by_key["alice"]["delegation_id"] != name  # suffixed copy
+        assert by_key[""]["delegation_id"] == f"{name}#run-run-9"
+        assert by_key["alice"]["delegation_id"].startswith(
+            f"{name}#run-run-9@"
+        )  # suffixed copy, suffix AFTER the run identity
 
         # A second reconcile pass finds nothing live: settled is settled.
         assert gc_supervisor.reconcile_once() == []

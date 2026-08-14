@@ -99,6 +99,7 @@ from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
 from . import supervisor as _supervisor
+from . import workers as _workers
 
 logger = logging.getLogger(__name__)
 
@@ -904,6 +905,13 @@ def _run_attempt(
                     job.model = str(obj.get("model") or "")
                     job.worker = str(obj.get("worker") or "")
                     job.agents_ui_url = str(obj.get("agents_ui_url") or "")
+                    # THIS job's run identity (completion delivery id) —
+                    # a retry attempt on the same job overwrites it; a
+                    # LATER run in the session never can (immutable per
+                    # job, unlike the handle's latest_run_id).
+                    job.latest_run_id = (
+                        str(obj.get("run_id") or "") or job.latest_run_id
+                    )
                 # Supervision phase: the agent exists and events flow
                 # (RFC §1 — the durable record a reconciler re-attaches to).
                 _supervisor.mark_streaming(job.session_name or sid)
@@ -919,6 +927,12 @@ def _run_attempt(
                     cursor_session_id=sid,
                     runtime=str(obj.get("runtime") or job.runtime),
                     worker=str(obj.get("worker") or "") or None,
+                    # "systemd" | "detached" — persisted so status can
+                    # honestly surface DEGRADED (detached) supervision
+                    # even after this process is gone.
+                    worker_supervision=(
+                        str(obj.get("worker_supervision") or "") or None
+                    ),
                     agents_ui_url=str(obj.get("agents_ui_url") or "") or None,
                     repo_url=str(obj.get("repo_url") or "") or None,
                     starting_ref=str(obj.get("starting_ref") or "") or None,
@@ -1259,6 +1273,17 @@ def _send_to_session(
             "status": "failed",
             "error": f"session '{name}' has no repo recorded",
         }
+    # Canonicalize LOCAL-runtime paths on the way out: handles recorded
+    # before the canonical-identity change may hold a subdir; the local
+    # dispatch key (worker naming/admission and execution cwd) must be
+    # the worktree toplevel. Cloud sessions keep origin/main's recorded
+    # repo/dispatch path untouched.
+    if (
+        runtime == "local"
+        and _cloud.normalize_github_url(repo) is None
+        and os.path.isdir(repo)
+    ):
+        repo = _workers.canonical_repo_path(repo)
     # runtime=cloud sessions may record a github URL as their repo — no
     # local checkout to verify. Local paths must still exist.
     if _cloud.normalize_github_url(repo) is None and not os.path.isdir(repo):
@@ -1519,7 +1544,15 @@ def cursor_create_session(
             workdir = _runner.resolve_repo(target_repo)
         except _runner.HarnessError as exc:
             return f"cannot create session: {exc}"
-        workdir_str = str(workdir)
+        if chosen_runtime == "local":
+            # Canonical worktree identity: /repo and /repo/subdir are ONE
+            # session/admission/worker identity (sibling git worktrees
+            # stay distinct — rev-parse returns the worktree root).
+            # LOCAL-runtime-only: it keys local worker naming/admission;
+            # cloud sessions preserve origin/main's recorded path.
+            workdir_str = _workers.canonical_repo_path(str(workdir))
+        else:
+            workdir_str = str(workdir)
         try:
             # Eager git introspection (local checkouts): a repo without a
             # github origin (or on a detached HEAD) can never dispatch, so
@@ -1647,6 +1680,20 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
     )
 
 
+def _supervision_note(entry: Optional[Dict[str, Any]]) -> str:
+    """The degraded-supervision warning for a session whose local worker
+    runs on the detached fallback (user systemd unavailable) — empty for
+    supervised (or cloud/workerless) sessions. Honesty requirement: users
+    must know restart durability is degraded."""
+    if str((entry or {}).get("worker_supervision") or "") != "detached":
+        return ""
+    return (
+        "warning: this session's local worker is running DETACHED "
+        "(user systemd unavailable — degraded supervision): it survives "
+        "gateway restarts, but nothing restarts it if it crashes."
+    )
+
+
 def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
     """Read-only snapshot for a cursor session (see CURSOR_STATUS_SCHEMA).
 
@@ -1692,6 +1739,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             last_prompt_seq=_handles.last_prompt_seq(entry),
             runtime=str(snap.get("runtime") or _handles.runtime_of(entry)),
             worker=str(snap.get("worker") or ""),
+            note=_supervision_note(entry),
             agents_ui_url=str(
                 snap.get("agents_ui_url")
                 or (entry or {}).get("agents_ui_url")
@@ -1719,10 +1767,11 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             files=[],
             bullets=bullets,
             error=str(entry.get("status_note") or ""),
-            note=(
+            note="\n".join(filter(None, (
                 "not tracked live in this process — showing the persisted "
-                "record. cursor_send_message continues the session."
-            ),
+                "record. cursor_send_message continues the session.",
+                _supervision_note(entry),
+            ))),
             last_prompt_seq=_handles.last_prompt_seq(entry),
             runtime=_handles.runtime_of(entry),
             worker=str(entry.get("worker") or ""),
@@ -1948,10 +1997,21 @@ def register(ctx) -> None:
     supervisor re-attached, so digests resume and the completion still
     delivers — then every 60s.
 
-    Nothing to arrange at process exit: workers are DETACHED by design
-    (they survive restarts and are reused), and runs live server-side.
+    Nothing to arrange at process exit: workers survive restarts by
+    design (transient user systemd services, or detached processes on
+    the degraded path) and runs live server-side.
+
+    Worker cleanup is LAZY (no timer): one reconcile pass here at init
+    retires dead generations and reaps idle leaseless workers; every
+    local dispatch runs another pass before capacity admission.
     """
+    # Supervisor FIRST: reattach of live sessions (digests + terminal
+    # delivery) must never wait behind the synchronous worker cleanup.
     _supervisor.start_reconciler()
+    try:
+        _workers.reconcile()
+    except Exception:  # reconcile never raises by contract — belt+braces
+        logger.exception("ghost_cursor worker reconcile at init failed")
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),

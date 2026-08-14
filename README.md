@@ -40,15 +40,17 @@ Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the age
 
 Sessions are real cloud agents either way — the agent loop always runs on Cursor's side, which is exactly why every session **syncs natively to cursor.com/agents, the web app, and mobile**. With `runtime="local"`, tool calls (terminal, edits) execute on this machine through a "My Machines" worker:
 
-- The plugin spawns `agent worker start` **detached** (own session, pidfile + log under the state dir) the first time a repo needs one, and reattaches to live workers on plugin init — **gateway restarts don't kill runs or workers**.
-- One worker per repo checkout; names are `<hostname>-<8-char path hash>` so two worktrees of the same repo (same git origin) stay distinguishable.
+- The plugin starts `agent worker start` as a **transient user systemd service** (`cursor-worker-<name>.service`, `KillMode=control-group`, bounded TERM→KILL stop) the first time a worktree needs one, and re-adopts live workers on later dispatches — **gateway restarts don't kill runs or workers**. Without user systemd it falls back to a detached process group and says so (`worker_supervision: detached`).
+- **One worker per canonical worktree**: identity is `realpath(git rev-parse --show-toplevel)`, so `/repo` and `/repo/subdir` share one worker while sibling git worktrees stay distinct. Names are `<hostname>-<8-char path hash>`.
+- Every worker gets its **own `CURSOR_DATA_DIR`** and localhost management endpoint under the machine-global state dir (`$XDG_STATE_HOME/ghost_cursor/workers`), so concurrent worktrees never fight over Cursor's global `worker.lock`. `CURSOR_API_KEY` reaches a supervised worker only via a 0600 `EnvironmentFile` — never argv.
+- **Active runs are protected by per-run leases**: a lease is installed atomically with the hand-out, bound to the agent/run the instant the create returns, and released only when the executor observes the run's remote terminal state. Leaseless workers are reaped lazily after an idle TTL (default 30 min, `plugins.ghost_cursor.worker_idle_ttl_s`); the worker cap defaults to 10 (`plugins.ghost_cursor.max_workers`), reclaiming only idle leaseless workers.
 - Routing match is threefold: the worker belongs to the API key's cursor account, the name matches, and the worker's registered repo (its checkout's git origin) matches the target. No match → the create is rejected server-side, no silent fallback to a cursor-hosted VM.
 
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 - `httpx` importable (already a Hermes dependency)
-- the `agent` CLI on PATH for `runtime="local"` (`curl https://cursor.com/install -fsS | bash`) — the plugin spawns and manages the detached worker for you
+- the `agent` CLI on PATH for `runtime="local"` (`curl https://cursor.com/install -fsS | bash`) — the plugin spawns and manages the worker for you
 - `CURSOR_API_KEY` exported (create one at the [Cursor dashboard](https://cursor.com/dashboard))
 - The target repo should be a git repo (enables the diff fallback)
 
@@ -132,7 +134,7 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 | `progress.py` | Progress subscriptions — per-run digest timers, `cursor_subscribe` plumbing, completion-queue delivery guards |
 | `rest_client.py` | Typed httpx client for the Cursor REST v1 API — error mapping, GET-only retries, SSE parser |
 | `cloud_runner.py` | REST+SSE transport — agent create/follow-up, SSE consumption with Last-Event-ID re-attach, watchdogs, native cancel, terminal settle via GET runs/{id} |
-| `workers.py` | Detached "My Machines" worker manager for runtime=local — spawn, readiness, routability |
+| `workers.py` | "My Machines" worker controller for runtime=local — canonical worktree identity, per-worker data-dir isolation, transient systemd supervision (detached fallback), per-run leases, lazy idle reaping |
 | `events.py` | Canonical envelope builders + cloud-event → envelope mapping |
 | `jobs.py` | Background job tracking + completion/digest delivery into the agent loop |
 | `handles.py` | Session-handle persistence (name → agent id, repo, runtime, subscribers) |

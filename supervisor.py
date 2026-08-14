@@ -252,6 +252,33 @@ def _subscriber_suffix(session_key: str) -> str:
     return hashlib.sha1(str(session_key or "").encode("utf-8")).hexdigest()[:8]
 
 
+def completion_delegation_id(
+    session_name: str, run_id: str = "", attempt_id: str = "", job_id: str = ""
+) -> str:
+    """The stable per-RUN delegation identity for terminal completion
+    delivery (shared by the in-process jobs path and this module's
+    reattached path).
+
+    The gateway dedupes async_delegation events by (delegation_id,
+    type): with the plain session name as the id, the FIRST run's
+    terminal delivery consumed it forever and every later follow-up
+    completion in the same NAMED session was silently suppressed.
+    Keyed by the remote run when known — stable across retries/replay
+    of the SAME run (dedupe still collapses genuine duplicates,
+    including an in-process delivery replayed by a reattached
+    supervisor), distinct across runs — with the supervision attempt or
+    the local job id as deterministic fallbacks. Never a timestamp or
+    delivery-time randomness. Display fields keep the plain name."""
+    base = str(session_name or "")
+    if str(run_id or ""):
+        return f"{base}#run-{run_id}"
+    if str(attempt_id or ""):
+        return f"{base}#attempt-{attempt_id}"
+    if str(job_id or ""):
+        return f"{base}#job-{job_id}"
+    return base
+
+
 class SessionSupervisor:
     """One re-attached session's supervisor loop (RFC §1).
 
@@ -269,6 +296,9 @@ class SessionSupervisor:
         self._thread: Optional[threading.Thread] = None
 
         self._attempt_id = ""
+        # The remote run this supervisor re-attached to — the completion
+        # delivery identity (set in _supervise once resolved).
+        self._run_id = ""
         self._cancel_sent = False
         self._attached_monotonic = time.monotonic()
         # Ingest state.
@@ -354,6 +384,7 @@ class SessionSupervisor:
         run_id = str(entry.get("latest_run_id") or "")
         if not run_id:
             run_id = self._latest_run_id(client, agent_id)
+        self._run_id = run_id
         if not run_id:
             self._settle(
                 "failed",
@@ -516,10 +547,46 @@ class SessionSupervisor:
             if status == "failed"
             else {}
         )
+        if not self._release_worker_lease(agent_id, run_id):
+            # The run IS terminal but the local lease release did not
+            # land. Durably settling now would strand the lease forever
+            # (terminal handles are never reattached) — stay live and
+            # let the next supervision cycle retry release-then-settle.
+            return False
         if self._stop_requested.is_set() and status == "cancelled":
             self._ingest_lifecycle("interrupted")
         self._settle(status, **error)
         return True
+
+    def _release_worker_lease(self, agent_id: str, run_id: str) -> bool:
+        """Restart bridge: the in-process runner that bound this run's
+        worker lease died with the old gateway and can never release it.
+        Runs after the SAME authoritative GET-terminal observation that
+        settlement uses (never SSE replay, never an unknown/nonterminal
+        GET) and BEFORE the durable settle — release must land (or be a
+        provable no-op) first, or settling removes the retry path.
+
+        Returns True when settlement may proceed: the lease was
+        released, or there is positively nothing to release (no local
+        worker recorded, cloud runtime, no matching bound lease — a
+        mismatched or unbound lease is never touched). False means the
+        release write failed and the caller must retry later."""
+        try:
+            entry = _handles.get(self.session_name) or {}
+            worker = str(entry.get("worker") or "")
+            if not worker or _handles.runtime_of(entry) != "local":
+                return True
+            from . import workers as _workers
+
+            return _workers.release_bound_lease(
+                worker, agent_id=agent_id, run_id=run_id
+            ) != "failed"
+        except Exception:
+            logger.warning(
+                "worker lease release for %s failed", self.session_name,
+                exc_info=True,
+            )
+            return False
 
     # -- ingest boundary (RFC §4) ---------------------------------------------
 
@@ -791,14 +858,17 @@ class SessionSupervisor:
             "result": result,
             "cursor_session_id": str(entry.get("cursor_session_id") or ""),
         }
+        base_id = completion_delegation_id(
+            name, run_id=self._run_id, attempt_id=self._attempt_id
+        )
         for session_key in recipients:
             _enqueue_completion_event({
                 **base_evt,
                 "session_key": session_key,
                 "delegation_id": (
-                    name
+                    base_id
                     if session_key == dispatcher
-                    else f"{name}@{_subscriber_suffix(session_key)}"
+                    else f"{base_id}@{_subscriber_suffix(session_key)}"
                 ),
             })
 
