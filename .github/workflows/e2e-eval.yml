@@ -22,13 +22,9 @@ jobs:
       GHOST_CURSOR_TEST_MODEL: gpt-5.4-nano
       GHOST_CURSOR_JUDGE_MODEL: gpt-5.4-nano
       GHOST_CURSOR_E2E: "1"
-      # Sessions need a checkout with a real GitHub origin remote (the cloud
-      # runtime derives repo url + starting ref from it). The repo must be one
-      # the CURSOR_API_KEY account's GitHub connection can see — cursor's
-      # create verifies the branch server-side, and a public repo outside that
-      # connection is REJECTED (verified live: this repo 400s, the smoke repo
-      # works). Override via the GHOST_CURSOR_E2E_REPO repository variable.
-      GHOST_CURSOR_E2E_REPO: ${{ vars.GHOST_CURSOR_E2E_REPO || 'https://github.com/waseemshahwan/machine-smoke-test' }}
+      # Configure this repository variable with a GitHub repo visible to the
+      # Cursor account behind CURSOR_API_KEY.
+      GHOST_CURSOR_E2E_REPO: ${{ vars.GHOST_CURSOR_E2E_REPO }}
       GHOST_CURSOR_E2E_BRANCH: ${{ vars.GHOST_CURSOR_E2E_BRANCH || 'main' }}
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -52,6 +48,7 @@ jobs:
           set -euo pipefail
           "$HOME/.local/bin/agent" --version
           test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY secret missing"; exit 1; }
+          test -n "$GHOST_CURSOR_E2E_REPO" || { echo "GHOST_CURSOR_E2E_REPO repository variable missing"; exit 1; }
 
       - name: Install plugin + eval into the Hermes tree
         run: |

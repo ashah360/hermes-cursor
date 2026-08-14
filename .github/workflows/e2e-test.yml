@@ -21,13 +21,9 @@ jobs:
     env:
       GHOST_CURSOR_TEST_MODEL: gpt-5.4-nano
       GHOST_CURSOR_E2E: "1"
-      # Sessions need a checkout with a real GitHub origin remote (the cloud
-      # runtime derives repo url + starting ref from it). The repo must be one
-      # the CURSOR_API_KEY account's GitHub connection can see — cursor's
-      # create verifies the branch server-side, and a public repo outside that
-      # connection is REJECTED (verified live: this repo 400s, the smoke repo
-      # works). Override via the GHOST_CURSOR_E2E_REPO repository variable.
-      GHOST_CURSOR_E2E_REPO: ${{ vars.GHOST_CURSOR_E2E_REPO || 'https://github.com/waseemshahwan/machine-smoke-test' }}
+      # Configure this repository variable with a GitHub repo visible to the
+      # Cursor account behind CURSOR_API_KEY.
+      GHOST_CURSOR_E2E_REPO: ${{ vars.GHOST_CURSOR_E2E_REPO }}
       GHOST_CURSOR_E2E_BRANCH: ${{ vars.GHOST_CURSOR_E2E_BRANCH || 'main' }}
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
     steps:
@@ -50,26 +46,8 @@ jobs:
           set -euo pipefail
           "$HOME/.local/bin/agent" --version
           test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY secret missing"; exit 1; }
+          test -n "$GHOST_CURSOR_E2E_REPO" || { echo "GHOST_CURSOR_E2E_REPO repository variable missing"; exit 1; }
 
-      - name: Worker preflight — spawn a detached worker like the plugin does
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          d="$RUNNER_TEMP/worker-preflight/repo"; mkdir -p "$d"; cd "$d"
-          git -c user.email=e@e -c user.name=e init -q -b "$GHOST_CURSOR_E2E_BRANCH"
-          git remote add origin "$GHOST_CURSOR_E2E_REPO"
-          touch .gitkeep
-          git -c user.email=e@e -c user.name=e add .
-          git -c user.email=e@e -c user.name=e commit -q -m seed
-          log="$RUNNER_TEMP/worker-preflight/worker.log"
-          setsid agent worker start --verbose --name "preflight-$RANDOM" --worker-dir "$d" >"$log" 2>&1 < /dev/null &
-          pid=$!
-          for i in $(seq 1 60); do
-            grep -q "Worker is now running" "$log" 2>/dev/null && { echo "worker ready"; head -20 "$log"; kill "$pid" 2>/dev/null || true; exit 0; }
-            kill -0 "$pid" 2>/dev/null || { echo "worker DIED during startup — log:"; cat "$log"; exit 1; }
-            sleep 1
-          done
-          echo "worker never reported ready — log:"; cat "$log"; exit 1
 
       - name: Install plugin + tests into the Hermes tree
         run: |
@@ -98,17 +76,3 @@ jobs:
           set -euo pipefail
           uv run --with pytest --with pytest-timeout --with httpx pytest tests/plugins/e2e/test_e2e.py -q -v \
             -p no:cacheprovider --timeout=300 --timeout-method=thread
-
-      - name: Spawn diagnostics (temporary — GHOST_CURSOR_SPAWN_DIAG)
-        if: always()
-        run: |
-          echo "=== diag files ==="
-          for f in "$RUNNER_TEMP"/gc-spawn-diag-*.txt; do
-            [ -e "$f" ] || { echo "(none)"; break; }
-            echo "--- $f"; cat "$f"
-          done
-          echo "=== plugin worker logs ==="
-          find /tmp/pytest-of-runner -path '*ghost_cursor/workers*' -name '*.log' \
-            -exec sh -c 'echo "--- $1 ($(wc -c < "$1") bytes)"; tail -c 2000 "$1"' _ {} \; 2>/dev/null || true
-          echo "=== surviving agent processes ==="
-          ps -eo pid,stat,etime,command | grep -i agent | grep -v grep || echo "(none)"

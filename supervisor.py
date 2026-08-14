@@ -1,4 +1,4 @@
-"""Task-backed session supervisor (RFC: docs/rfcs/session-supervisor.md).
+"""Task-backed durable session supervisor.
 
 Supervision state is durable and owned by a supervisor, not the tool call:
 every dispatched session carries a ``supervision`` record on its handle
@@ -960,10 +960,8 @@ def _adopt_legacy_handle(name: str, entry: Dict[str, Any]) -> bool:
 
     A handle whose top-level status is ``running`` but whose supervision
     record is missing/null/empty-phase predates the supervisor deploy —
-    EXACTLY the handle the reconciler exists to re-attach; skipping it
-    (the incident: two healthy pre-supervisor cloud runs left orphaned
-    after a gateway restart) defeats the point. Seed a live supervision
-    record — fresh attempt identity, delivery cursors left empty, no
+    EXACTLY the handle the reconciler exists to re-attach. Seed a live
+    supervision record — fresh attempt identity, delivery cursors left empty, no
     persisted Last-Event-ID (the adopted stream attaches from the live
     tail) — and let the normal re-attach path own it: the supervisor's
     GET authority streams a RUNNING run and settles a terminal one

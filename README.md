@@ -1,165 +1,199 @@
-# ghost_cursor
+# Hermes Cursor
 
-A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that lets your agent **delegate coding tasks to the [Cursor](https://cursor.com) agent** — and watch it work in real time.
+[![CI](https://github.com/ashah360/hermes-cursor/actions/workflows/unit.yml/badge.svg)](https://github.com/ashah360/hermes-cursor/actions/workflows/unit.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Registers seven session tools that run Cursor **cloud agents** against a target repo over the **Cursor REST v1 API + SSE event stream** — on this machine (`runtime="local"`, a plugin-managed "My Machines" worker) or on a cursor-hosted VM (`runtime="cloud"`) — stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
+Hermes Cursor lets [Hermes Agent](https://github.com/NousResearch/hermes-agent) delegate coding work to Cursor Cloud Agents and keep the job inside the conversation where it started.
 
-Because it's an ordinary Hermes tool call inside a real session, the result **persists in the transcript and reloads for free** — and interrupts map to a native `run.cancel()`.
+Ask Hermes to fix a bug, build a feature, or review a repository. Hermes starts a named Cursor session in the background, sends progress back to chat, and delivers the result when the run finishes. You can run the work on a Cursor-hosted VM or route it to your own machine through Cursor's My Machines runtime.
 
-## Why REST + SSE
+- Keep talking to Hermes while Cursor works.
+- Watch progress without disturbing the run.
+- Continue the same Cursor session with follow-up instructions.
+- Open the session in Cursor's Agents UI at any time.
+- Run separate Git worktrees in parallel on your own machine.
 
-Earlier versions drove `cursor-agent` over ACP (JSON-RPC on stdio), scraped `--print` stdout, and then rode the python `cursor-sdk` (which spawned a local sidecar bridge). The REST v1 API replaces all of them with a direct, supported contract:
+## Quick start
 
-| | stdout scraping | ACP (v0.4) | cursor-sdk (v0.5) | REST + SSE (this plugin) |
-|---|---|---|---|---|
-| Event format | freeform JSON, inferred | typed `session/update` | typed `SDKMessage` | typed SSE events (`assistant` / `tool_call` / `result`) |
-| Cancellation | `kill -9` the process | native `session/cancel` | native `run.cancel()` | `POST …/runs/{id}/cancel` |
-| Resume | none | `session/load` (best effort) | `Agent.resume` | follow-up `POST …/agents/{id}/runs` |
-| Network drop mid-run | run lost | run lost | `run.observe` re-attach | `Last-Event-ID` reconnect |
-| Local process state | one process per run | one process per run | sidecar bridge to babysit | **none** — agent state lives server-side |
+You need:
 
-Because agent state lives entirely on Cursor's side, a dropped stream — or a restarted plugin process — re-attaches to a run that is still executing instead of losing it, and there is no bridge process to go stale. Terminal truth comes from the `result` SSE event confirmed by a final `GET runs/{id}` — never from the lossy simplified status stream.
+- Hermes Agent with plugin support.
+- A paid Cursor plan and a personal Cursor API key.
+- The Cursor GitHub app authorized for the repository you want to use.
 
-The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
-
-## What you get (v0.6 — cloud-machine runtime)
-
-Seven named-session tools. The handle is a **meaningful session title** (e.g. `Fix payment webhook retries`) provided by the caller to `cursor_create_session`; cursor agent ids from older runs resolve as aliases.
-
-- **`cursor_create_session(title?, repo?, model?, runtime?)`** — registers a named session and dispatches **nothing** (the cloud agent is created lazily on the first message). `title` is a concise phrase (roughly 3–8 words, plain words with spaces, max 80 chars) describing the task; it becomes the handle everywhere, including the agent's name on cursor.com. A taken title fails the create with the existing entry's status and age; an omitted title falls back to `<repo-basename> session` (numeric suffix past collisions). `runtime="local"` (default) routes execution to a plugin-managed "My Machines" worker on this machine; `runtime="cloud"` uses a cursor-hosted VM. `repo` is a local path either way — the plugin derives the GitHub origin URL + branch itself.
-- **`cursor_send_message(session, message, ...)`** — all work goes through this. The first message on a fresh session is the task; later messages are follow-ups with full prior context. Honest semantics: there is **no mid-run queue** — sending into a live run cancels it natively and re-prompts the same session. Returns immediately; the run executes in the background and the final result is delivered as a message on every terminal state.
-- **`cursor_status(session)`** — **strictly read-only**: status, elapsed, last-activity age, files changed so far, recent events. Polling never cancels (tested property).
-- **`cursor_events(session, offset?, limit?, kind?)`** — pages the per-session JSONL event log (reasoning, tool calls, file diffs, content).
-- **`cursor_stop(session)`** — native cancel; acks "stopped" only after the run is observed terminal.
-- **`cursor_list(scope?)`** — TSV of session handles with repo, runtime, and status.
-- **`cursor_subscribe(session, interval_s)`** — subscribe the **calling Hermes session** to periodic progress digests while a run is active. Subscriptions are per Hermes session per cursor session — multiple Hermes sessions can watch one run, each at its own cadence, each getting its own copy of every digest **and** the completion. `cursor_send_message` auto-subscribes the caller (explicit `update_interval_s` param > persisted interval > 180s default, `0` disables); `interval_s=0` removes only the caller's subscription. The final result is always delivered to every subscriber — and to the dispatching session even if it unsubscribed.
-
-Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state, **same-repo concurrency guard** (a second run on a repo with an active run is rejected; different repos run in parallel), **handle persistence** across restarts (a JSON table under `<HERMES_HOME>/state/`), and a **`check_fn`** so the tools only appear when the transport is available.
-
-## The worker model (runtime="local")
-
-Sessions are real cloud agents either way — the agent loop always runs on Cursor's side, which is exactly why every session **syncs natively to cursor.com/agents, the web app, and mobile**. With `runtime="local"`, tool calls (terminal, edits) execute on this machine through a "My Machines" worker:
-
-- The plugin starts `agent worker start` as a **transient user systemd service** (`cursor-worker-<name>.service`, `KillMode=control-group`, bounded TERM→KILL stop) the first time a worktree needs one, and re-adopts live workers on later dispatches — **gateway restarts don't kill runs or workers**. Without user systemd it falls back to a detached process group and says so (`worker_supervision: detached`).
-- **One worker per canonical worktree**: identity is `realpath(git rev-parse --show-toplevel)`, so `/repo` and `/repo/subdir` share one worker while sibling git worktrees stay distinct. Names are `<hostname>-<8-char path hash>`.
-- Every worker gets its **own `CURSOR_DATA_DIR`** and localhost management endpoint under the machine-global state dir (`$XDG_STATE_HOME/ghost_cursor/workers`), so concurrent worktrees never fight over Cursor's global `worker.lock`. `CURSOR_API_KEY` reaches a supervised worker only via a 0600 `EnvironmentFile` — never argv.
-- **Active runs are protected by per-run leases**: a lease is installed atomically with the hand-out, bound to the agent/run the instant the create returns, and released only when the executor observes the run's remote terminal state. Leaseless workers are reaped lazily after an idle TTL (default 30 min, `plugins.ghost_cursor.worker_idle_ttl_s`); the worker cap defaults to 10 (`plugins.ghost_cursor.max_workers`), reclaiming only idle leaseless workers.
-- Routing match is threefold: the worker belongs to the API key's cursor account, the name matches, and the worker's registered repo (its checkout's git origin) matches the target. No match → the create is rejected server-side, no silent fallback to a cursor-hosted VM.
-
-## Requirements
-
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- `httpx` importable (already a Hermes dependency)
-- the `agent` CLI on PATH for `runtime="local"` (`curl https://cursor.com/install -fsS | bash`) — the plugin spawns and manages the worker for you
-- `CURSOR_API_KEY` exported (create one at the [Cursor dashboard](https://cursor.com/dashboard))
-- The target repo should be a git repo (enables the diff fallback)
-
-## Install
-
-Drop the plugin into your Hermes plugins directory and enable it:
+### Install
 
 ```bash
-# 1. copy the plugin
-mkdir -p ~/.hermes/plugins/ghost_cursor
-cp __init__.py rest_client.py cloud_runner.py workers.py progress.py events.py runner.py jobs.py handles.py eventlog.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
+hermes plugins install ashah360/hermes-cursor --enable
+```
 
-# 2. enable it in ~/.hermes/config.yaml
-#    plugins:
-#      enabled:
-#        - ghost_cursor
+Configuration uses the plugin key `ghost_cursor`.
 
-# 3. restart the gateway so the tools load
+### Add your Cursor API key
+
+Create a key in the [Cursor dashboard](https://cursor.com/dashboard), then find the Hermes environment file:
+
+```bash
+hermes config env-path
+```
+
+Add the key to that file:
+
+```dotenv
+CURSOR_API_KEY=your_cursor_api_key
+```
+
+The Cursor account behind the key must have access to the target repository through its GitHub connection.
+
+Restart the Hermes process that will use the plugin. For the messaging gateway:
+
+```bash
 hermes gateway restart
 ```
 
-Verify it registered:
+For the CLI, exit and start a new Hermes session.
+
+### Optional: enable local execution
+
+Install the Cursor Agent CLI on the machine running Hermes:
 
 ```bash
-# cursor_create_session / cursor_send_message / cursor_status / cursor_stop /
-# cursor_events / cursor_list / cursor_subscribe should show up as tools once
-# httpx is importable
+curl -fsSL https://cursor.com/install | bash
 ```
 
-## Usage
+You only need this for `runtime="local"`. Hosted runs do not require the local Cursor CLI. Your Cursor account must also have access to My Machines.
 
-In practice you just talk to your agent normally — when a task is coding work, it creates a session and dispatches:
+## Use it
 
-> "Add a `subtract(a, b)` function to `calc.py`"
+Talk to Hermes normally:
 
-```
-cursor_create_session(repo="/path/to/repo",
-                      title="Add subtract to calc")   → session: Add subtract to calc
-cursor_send_message("Add subtract to calc", task)     → runs in background
-  … completion auto-delivers with a summary + files changed + diffs
-```
+> Use Cursor on a hosted VM to fix the flaky webhook tests in this repository. Add a regression test and report what changed.
 
-Follow-ups go to the same name and keep full prior context:
+Or send work to your own machine:
 
-```
-cursor_send_message("Add subtract to calc", "now add divide in the same style")
-```
+> Use Cursor Cloud on my local machine for this task. Create a separate worktree, run the backend test suite, and keep me updated every minute.
 
-Because the session is a real cloud agent, it also appears in Cursor's Agents UI (web + mobile) — you can open the same conversation there and watch or continue it.
+Hermes creates the Cursor session, sends the task, monitors it, and posts the final result back into the conversation.
 
-## Steering a running task
+## Choose where the work runs
 
-Cursor has no true mid-prompt queue — a second prompt cancels and replaces the current one. So sending into a live run is an honest **interrupt + re-prompt with context**: the in-flight step is discarded (the ack says so), and the run continues from your new instruction with everything it already knew. Work already written to the tree survives.
+| | `runtime="cloud"` | `runtime="local"` |
+|---|---|---|
+| Execution | Cursor-hosted VM | The machine running Hermes |
+| Repository | GitHub clone | Existing local checkout or worktree |
+| Best for | Isolated changes and ordinary coding tasks | Large builds, local services, warm caches, and private test infrastructure |
+| Cursor Agent CLI on the Hermes machine | Not required | Required |
+| Visible in Cursor's Agents UI | Yes | Yes |
 
-## Timeouts — inactivity, not wall clock
+Local mode is still a Cursor Cloud Agent. Cursor owns the agent conversation; its terminal and file operations are routed to a managed worker on your machine. The worker can run commands and edit files in the selected checkout with your user permissions.
 
-Timeouts are **inactivity-based**: a run that keeps streaming events (reasoning, tool calls, content) is alive and is never killed for total elapsed time. Only a *silent* run is treated as hung.
+Hermes Cursor isolates each local worktree in its own worker runtime. Separate worktrees can run concurrently without sharing Cursor's global worker lock. A local dispatch fails clearly if its selected worker cannot be reached; it never falls back silently to a hosted VM. Active work is protected from cleanup, idle workers are retired automatically, and workers survive Hermes gateway restarts when user systemd is available. If systemd is unavailable, status output clearly marks the worker as using degraded detached supervision.
 
-- **`inactivity_timeout_s`** — abort after this many seconds with **no stream events**; any streamed activity resets the clock. Default **600** (10 min of silence); **0 disables** the watchdog.
-- **`max_wall_s`** — optional hard ceiling on **total** run time, a safety net for runaways that stream forever without finishing. Default **0 (disabled)**.
+## Sessions and follow-ups
 
-Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last stream event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the cloud runner.
+A named session is a continuing conversation with one Cursor agent:
 
-The old `timeout` parameter is kept as a deprecated alias for `inactivity_timeout_s`.
-
-## How live progress works (no core patch)
-
-A registry-dispatched tool handler isn't handed the calling `AIAgent`, but Hermes installs the agent's `_touch_activity` as a thread-local activity callback right before each tool dispatch. `_resolve_progress_callback()` reads that thread-local, walks `__self__` back to the live agent, and uses its `tool_progress_callback`. Each emission is:
-
-```
-tool_progress_callback("reasoning.available", "cursor_edit", <json-envelope>, None)
+```text
+Fix payment webhook retries
+├── reproduce the failure and implement the fix
+├── add the missing regression test
+└── address review feedback
 ```
 
-which the api_server session-chat-stream forwards mid-turn as `event: tool.progress`. The JSON `delta` is a canonical envelope — `content` / `tool_use` / `tool_result` / `lifecycle` / `file_diff` — that a UI keys on (`tool_name == "cursor_edit"`, `source: "ghost"`) to render live tool cards and diffs.
+Each follow-up keeps the existing Cursor context and produces its own completion message.
 
-## Files
+Sending a follow-up while a run is still active interrupts that run; it does not queue behind it. Changes already written to the working tree remain, but the in-flight step is cancelled and replaced with the new instruction. Wait for the current run to finish if you do not want to interrupt it.
 
-| File | Role |
+## Progress and control
+
+Hermes automatically subscribes the calling conversation to progress updates when it sends a task. The final result is delivered separately on every outcome: completed, failed, cancelled, or timed out.
+
+The plugin provides seven tools:
+
+| Tool | What it does |
 |---|---|
-| `__init__.py` | Plugin entry — registers the seven tools, resolves the progress callback, builds results |
-| `progress.py` | Progress subscriptions — per-run digest timers, `cursor_subscribe` plumbing, completion-queue delivery guards |
-| `rest_client.py` | Typed httpx client for the Cursor REST v1 API — error mapping, GET-only retries, SSE parser |
-| `cloud_runner.py` | REST+SSE transport — agent create/follow-up, SSE consumption with Last-Event-ID re-attach, watchdogs, native cancel, terminal settle via GET runs/{id} |
-| `workers.py` | "My Machines" worker controller for runtime=local — canonical worktree identity, per-worker data-dir isolation, transient systemd supervision (detached fallback), per-run leases, lazy idle reaping |
-| `events.py` | Canonical envelope builders + cloud-event → envelope mapping |
-| `jobs.py` | Background job tracking + completion/digest delivery into the agent loop |
-| `handles.py` | Session-handle persistence (name → agent id, repo, runtime, subscribers) |
-| `eventlog.py` | Per-session JSONL event log |
-| `render.py` | Plain-text rendering for tool outputs |
-| `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |
-| `plugin.yaml` | Plugin manifest |
-| `test_ghost_cursor_plugin.py` | Tests |
+| `cursor_create_session` | Create a named session and choose the repository, model, and runtime. |
+| `cursor_send_message` | Start work or send a contextual follow-up. |
+| `cursor_status` | Read the current state without affecting the run. |
+| `cursor_events` | Inspect reasoning, tool activity, content, and file changes. |
+| `cursor_stop` | Cancel the active run through Cursor. |
+| `cursor_list` | List recorded Cursor sessions. |
+| `cursor_subscribe` | Change progress-update frequency for the current Hermes conversation. |
+
+Hermes normally chooses and calls these tools for you.
+
+## Repository requirements
+
+Cursor must be able to access the repository through GitHub.
+
+For local execution, use a Git checkout with a GitHub `origin` and a named branch. Push a newly-created branch before the first run so Cursor can validate it:
+
+```bash
+git push -u origin HEAD
+```
+
+For hosted execution, Hermes Cursor accepts either a GitHub-backed local checkout or a `github.com` repository URL.
+
+## Configuration
+
+All settings are optional:
+
+```yaml
+plugins:
+  ghost_cursor:
+    model: null                 # use Cursor's default model
+    inactivity_timeout_s: 600  # stop after this much stream silence; 0 disables
+    max_wall_s: 0              # total run limit; 0 disables
+    max_workers: 10            # local worker capacity
+    worker_idle_ttl_s: 1800    # local worker idle lifetime in seconds
+```
+
+A tool argument overrides the configured default for that run.
+
+Progress updates default to every 180 seconds. Ask Hermes for a different interval, pass `update_interval_s` with the task, or use `cursor_subscribe`. Setting the interval to `0` stops progress updates for that Hermes conversation but does not disable the final result.
+
+## What survives a restart
+
+Cursor runs independently of Hermes. If the gateway restarts, Hermes Cursor reconnects to active runs and resumes terminal delivery. In local mode, systemd-supervised workers also survive the restart and are adopted by the new gateway process.
+
+## Troubleshooting
+
+### The tools do not appear
+
+```bash
+hermes plugins list
+```
+
+Confirm that `ghost_cursor` is installed and enabled, then restart the gateway or start a new CLI session.
+
+### Cursor reports a missing branch
+
+Push the current branch to GitHub:
+
+```bash
+git push -u origin HEAD
+```
+
+### The local worker asks for authentication
+
+Make sure `CURSOR_API_KEY` is in the file reported by `hermes config env-path`, then restart Hermes.
+
+### Local worker capacity is full
+
+Wait for a local run to finish, stop one with `cursor_stop`, or raise `plugins.ghost_cursor.max_workers` if your Cursor plan and machine support more workers. Hermes Cursor never evicts a worker that still has protected work.
+
+### A follow-up cancelled the current run
+
+That is the expected interrupt behavior. Wait for a run to finish before sending the next instruction if you want sequential execution.
+
+## Update
+
+```bash
+hermes plugins update ghost_cursor
+```
+
+Restart the gateway or CLI process after updating.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## CI
-
-Three GitHub Actions workflows (`.github/workflows/`):
-
-- **`unit`** (every push/PR, blocking) — the hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
-- **`e2e-test`** / **`e2e-eval`** (**manual dispatch only**) — the real deal: **no mocks**. They install real Hermes and drive the real Cursor REST API end to end (every handle shape, plus an LLM-as-judge quality pass). Every run creates **real cloud agents against the `CURSOR_API_KEY` account** — real usage cost, real sessions in that account's Agents UI — so they never fire automatically. Trigger from the Actions tab (or `gh workflow run e2e-test`) before releases or after transport changes. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic.
-
-Set the repo secret **`CURSOR_API_KEY`** for the e2e jobs — the account must have **private workers enabled** (an account can register workers yet still 403 on machine-routed agent creation; that split is the entitlement signature, not a code bug). Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env (default `gpt-5.4-nano` — cheap + fast; verify the slug against `GET /v1/models`). Set the **`GHOST_CURSOR_E2E_REPO`** repository variable to a GitHub repo the key's GitHub connection can see (cursor verifies the branch server-side at create).
-
-Reproduce the e2e env locally with `Dockerfile.e2e`:
-
-```bash
-docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
-docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
-```
+[MIT](LICENSE)

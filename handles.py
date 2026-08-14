@@ -256,7 +256,7 @@ def set_subscriber(
 
 
 # ---------------------------------------------------------------------------
-# Supervision record (RFC: docs/rfcs/session-supervisor.md §1)
+# Durable supervision record
 # ---------------------------------------------------------------------------
 # Each entry grows a ``supervision`` sub-record owned by the supervisor loop
 # (supervisor.py) — the durable state that makes gateway restarts a

@@ -1,8 +1,8 @@
-# Reproduce the ghost_cursor e2e environment locally — real Hermes + real
+# Reproduce the Hermes Cursor e2e environment locally — real Hermes + real
 # REST API (httpx), no mocks. Mirrors what the GitHub Actions e2e job does.
 #
-#   docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
-#   docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
+#   docker build -t hermes-cursor-e2e -f Dockerfile.e2e .
+#   docker run --rm -e CURSOR_API_KEY=sk-... hermes-cursor-e2e
 #
 # (Or mount your key file / pass it however you prefer.)
 FROM python:3.11-slim
