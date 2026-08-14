@@ -920,6 +920,12 @@ def _run_attempt(
                     cursor_session_id=sid,
                     runtime=str(obj.get("runtime") or job.runtime),
                     worker=str(obj.get("worker") or "") or None,
+                    # "systemd" | "detached" — persisted so status can
+                    # honestly surface DEGRADED (detached) supervision
+                    # even after this process is gone.
+                    worker_supervision=(
+                        str(obj.get("worker_supervision") or "") or None
+                    ),
                     agents_ui_url=str(obj.get("agents_ui_url") or "") or None,
                     repo_url=str(obj.get("repo_url") or "") or None,
                     starting_ref=str(obj.get("starting_ref") or "") or None,
@@ -1260,10 +1266,16 @@ def _send_to_session(
             "status": "failed",
             "error": f"session '{name}' has no repo recorded",
         }
-    # Canonicalize local paths on the way out: handles recorded before
-    # the canonical-identity change may hold a subdir; the dispatch key
-    # (and execution cwd) must be the worktree toplevel.
-    if _cloud.normalize_github_url(repo) is None and os.path.isdir(repo):
+    # Canonicalize LOCAL-runtime paths on the way out: handles recorded
+    # before the canonical-identity change may hold a subdir; the local
+    # dispatch key (worker naming/admission and execution cwd) must be
+    # the worktree toplevel. Cloud sessions keep origin/main's recorded
+    # repo/dispatch path untouched.
+    if (
+        runtime == "local"
+        and _cloud.normalize_github_url(repo) is None
+        and os.path.isdir(repo)
+    ):
         repo = _workers.canonical_repo_path(repo)
     # runtime=cloud sessions may record a github URL as their repo — no
     # local checkout to verify. Local paths must still exist.
@@ -1525,10 +1537,15 @@ def cursor_create_session(
             workdir = _runner.resolve_repo(target_repo)
         except _runner.HarnessError as exc:
             return f"cannot create session: {exc}"
-        # Canonical worktree identity: /repo and /repo/subdir are ONE
-        # session/admission/worker identity (sibling git worktrees stay
-        # distinct — rev-parse returns the worktree root).
-        workdir_str = _workers.canonical_repo_path(str(workdir))
+        if chosen_runtime == "local":
+            # Canonical worktree identity: /repo and /repo/subdir are ONE
+            # session/admission/worker identity (sibling git worktrees
+            # stay distinct — rev-parse returns the worktree root).
+            # LOCAL-runtime-only: it keys local worker naming/admission;
+            # cloud sessions preserve origin/main's recorded path.
+            workdir_str = _workers.canonical_repo_path(str(workdir))
+        else:
+            workdir_str = str(workdir)
         try:
             # Eager git introspection (local checkouts): a repo without a
             # github origin (or on a detached HEAD) can never dispatch, so
@@ -1656,6 +1673,20 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
     )
 
 
+def _supervision_note(entry: Optional[Dict[str, Any]]) -> str:
+    """The degraded-supervision warning for a session whose local worker
+    runs on the detached fallback (user systemd unavailable) — empty for
+    supervised (or cloud/workerless) sessions. Honesty requirement: users
+    must know restart durability is degraded."""
+    if str((entry or {}).get("worker_supervision") or "") != "detached":
+        return ""
+    return (
+        "warning: this session's local worker is running DETACHED "
+        "(user systemd unavailable — degraded supervision): it survives "
+        "gateway restarts, but nothing restarts it if it crashes."
+    )
+
+
 def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
     """Read-only snapshot for a cursor session (see CURSOR_STATUS_SCHEMA).
 
@@ -1701,6 +1732,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             last_prompt_seq=_handles.last_prompt_seq(entry),
             runtime=str(snap.get("runtime") or _handles.runtime_of(entry)),
             worker=str(snap.get("worker") or ""),
+            note=_supervision_note(entry),
             agents_ui_url=str(
                 snap.get("agents_ui_url")
                 or (entry or {}).get("agents_ui_url")
@@ -1728,10 +1760,11 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             files=[],
             bullets=bullets,
             error=str(entry.get("status_note") or ""),
-            note=(
+            note="\n".join(filter(None, (
                 "not tracked live in this process — showing the persisted "
-                "record. cursor_send_message continues the session."
-            ),
+                "record. cursor_send_message continues the session.",
+                _supervision_note(entry),
+            ))),
             last_prompt_seq=_handles.last_prompt_seq(entry),
             runtime=_handles.runtime_of(entry),
             worker=str(entry.get("worker") or ""),
@@ -1965,11 +1998,13 @@ def register(ctx) -> None:
     retires dead generations and reaps idle leaseless workers; every
     local dispatch runs another pass before capacity admission.
     """
+    # Supervisor FIRST: reattach of live sessions (digests + terminal
+    # delivery) must never wait behind the synchronous worker cleanup.
+    _supervisor.start_reconciler()
     try:
         _workers.reconcile()
     except Exception:  # reconcile never raises by contract — belt+braces
         logger.exception("ghost_cursor worker reconcile at init failed")
-    _supervisor.start_reconciler()
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),

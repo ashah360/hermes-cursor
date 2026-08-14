@@ -1204,9 +1204,14 @@ def run_cloud(
         derived_url, derived_ref = workdir_str, None
     else:
         workdir = resolve_repo(repo)
-        # Canonical worktree identity: worker naming, admission, and the
-        # execution cwd all key the worktree TOPLEVEL, never a subdir.
-        workdir_str = _workers.canonical_repo_path(str(workdir))
+        if runtime == "local":
+            # Canonical worktree identity: worker naming, admission, and
+            # the execution cwd all key the worktree TOPLEVEL, never a
+            # subdir. LOCAL-runtime-only — cloud runs preserve the
+            # caller's path exactly (origin/main parity).
+            workdir_str = _workers.canonical_repo_path(str(workdir))
+        else:
+            workdir_str = str(workdir)
         if repo_url and starting_ref:
             derived_url, derived_ref = repo_url, starting_ref
         else:

@@ -959,6 +959,57 @@ class TestCursorStatusReadOnly:
         events = _drain_completion_queue()
         assert len(events) == 1 and events[0]["status"] == "completed"
 
+    def test_detached_supervision_is_surfaced_as_a_status_warning(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Degraded supervision honesty: when the local worker runs on
+        the DETACHED fallback (user systemd unavailable), the public
+        cursor_status output says so — while running AND from the
+        persisted record after the run settles."""
+        release = threading.Event()
+
+        def replay(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {
+                "agentId": "s-det", "cwd": str(workdir), "model": "m",
+                "resumed": False, "runtime": "local", "worker": "w-det",
+                "worker_supervision": "detached",
+            })
+            release.wait(10)
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-det")
+
+        live = cursor_status("s-det")
+        assert "detached" in live
+        assert "restart" in live  # says WHAT is degraded, not just a flag
+
+        release.set()
+        assert job.done_event.wait(10)
+        _drain_completion_queue()
+        gc_jobs.registry._reset_for_tests()  # persisted-record path
+        settled = cursor_status("s-det")
+        assert "detached" in settled
+
+    def test_systemd_supervision_shows_no_degradation_warning(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        def replay(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {
+                "agentId": "s-sysd", "cwd": str(workdir), "model": "m",
+                "resumed": False, "runtime": "local", "worker": "w-sysd",
+                "worker_supervision": "systemd",
+            })
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("s-sysd")
+        assert job.done_event.wait(10)
+        _drain_completion_queue()
+        assert "detached" not in cursor_status("s-sysd")
+
     def test_finished_job_status_shows_summary_peek_without_diffs(
         self, clean_state, monkeypatch, tmp_path
     ):
@@ -3303,6 +3354,26 @@ class TestRegistration:
             assert entry["schema"]["parameters"]["required"] == required
             assert callable(entry["handler"])
 
+    def test_supervisor_reconciler_starts_before_worker_cleanup(
+        self, monkeypatch
+    ):
+        """Startup ordering: cloud reattach/digests/terminal delivery
+        (the supervisor reconciler) must never wait behind the
+        synchronous local-worker cleanup pass — supervisor first, lazy
+        worker reconcile second."""
+        order = []
+        monkeypatch.setattr(
+            gc_supervisor, "start_reconciler",
+            lambda: order.append("supervisor"),
+        )
+        monkeypatch.setattr(
+            gc_workers, "reconcile",
+            lambda *a, **kw: (order.append("workers"), [])[1],
+        )
+        ctx = SimpleNamespace(register_tool=lambda **kw: None)
+        register(ctx)
+        assert order == ["supervisor", "workers"]
+
     def test_send_schema_steers_delegation(self):
         desc = CURSOR_SEND_SCHEMA["description"].lower()
         assert "prefer this" in desc
@@ -4045,6 +4116,30 @@ class TestCursorCreateSession:
         cursor_create_session(repo=str(sub), title="Canonical identity")
         entry = gc_handles.get("Canonical identity")
         assert entry["repo"] == _os.path.realpath(str(repo))
+
+    def test_cloud_runtime_create_preserves_the_given_subdir_path(
+        self, clean_state, tmp_path
+    ):
+        """Cloud parity (origin/main): canonical worktree identity is a
+        LOCAL-runtime concern. A runtime=cloud session created from a
+        checkout subdirectory records exactly the resolved path the user
+        gave — never rewritten to the worktree toplevel."""
+        import subprocess as _subprocess
+        from pathlib import Path as _Path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        cursor_create_session(
+            repo=str(sub), title="Cloud parity", runtime="cloud"
+        )
+        entry = gc_handles.get("Cloud parity")
+        assert entry["repo"] == str(_Path(str(sub)).resolve())
 
     def test_title_whitespace_is_trimmed_and_collapsed(
         self, clean_state, tmp_path
@@ -4824,6 +4919,38 @@ def _run_cloud_events(tmp_path, **kw):
 
 
 class TestCloudRunner:
+    def test_cloud_runtime_run_does_not_canonicalize_a_local_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Cloud parity (origin/main): run_cloud with runtime=cloud and a
+        LOCAL subdirectory path dispatches from exactly that resolved
+        path — canonicalization to the worktree toplevel applies only to
+        runtime=local (where it keys worker identity/admission)."""
+        import subprocess as _subprocess
+        from pathlib import Path as _Path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        derived_from = []
+        monkeypatch.setattr(
+            gc_cloud, "derive_repo_ref",
+            lambda path: (
+                derived_from.append(str(path))
+                or ("https://github.com/example/repo", "main")
+            ),
+        )
+        events = _run_cloud_events(sub, runtime="cloud")
+        assert events[-1][0] == "cloud.result"
+        assert derived_from == [str(_Path(str(sub)).resolve())]
+
     def test_happy_path_yields_session_messages_result(
         self, tmp_path, monkeypatch
     ):
