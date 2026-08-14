@@ -65,6 +65,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -221,17 +222,38 @@ def _profile_state_dirs() -> List[Path]:
     return [root / "state" / "ghost_cursor" / "workers" for root in roots]
 
 
-# Migration is idempotent but cheap to skip: one pass per target dir per
-# process (tests re-point XDG_STATE_HOME per test and reset this).
-_migrated_dirs: set = set()
-# Targets whose migration pass is RUNNING in this process right now —
-# the structural re-entry guard (see state_dir).
-_migrating_dirs: set = set()
+class _MigrationGate:
+    """In-process coordination for one target's one-shot migration pass.
+
+    ``done`` records a SUCCESSFUL pass only. While a pass is ``running``,
+    every other thread WAITS on the condition (never reads worker state
+    ahead of legacy ownership migration); only the owner thread itself —
+    a true recursive call from a migration writer — passes through with
+    the already-resolved target. On failure, waiters are woken, ``done``
+    stays false, and the next :func:`state_dir` call attempts the
+    migration again."""
+
+    __slots__ = ("cond", "running", "owner", "done")
+
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.running = False
+        self.owner: Optional[int] = None
+        self.done = False
+
+
+_migration_gates: Dict[str, _MigrationGate] = {}
+_migration_gates_mutex = threading.Lock()
+
+
+def _migration_gate(key: str) -> _MigrationGate:
+    with _migration_gates_mutex:
+        return _migration_gates.setdefault(key, _MigrationGate())
 
 
 def _reset_migration_for_tests() -> None:
-    _migrated_dirs.clear()
-    _migrating_dirs.clear()
+    with _migration_gates_mutex:
+        _migration_gates.clear()
 
 
 def state_dir() -> Path:
@@ -243,34 +265,67 @@ def state_dir() -> Path:
     reads profile A's live unit as an unmanaged remnant and stops it.
     Session handles stay profile-local. Pre-v2 profile-local records are
     migrated here by ADOPTION (copied, never killed) on first use.
+
+    Concurrency: the migration pass runs at most once at a time per
+    target in this process; other threads BLOCK until it settles, then
+    observe the outcome. A failed pass is logged, the target stays
+    usable (degraded), and the next call re-attempts — success alone
+    marks the target migrated. The pass itself runs OUTSIDE the
+    condition, so waiting threads never interact with the cross-process
+    migration flock (no lock-order coupling, no deadlock).
     """
     base = os.environ.get("XDG_STATE_HOME", "").strip() or str(
         Path.home() / ".local" / "state"
     )
     target = Path(base) / "ghost_cursor" / "workers"
-    key = str(target)
-    if key not in _migrated_dirs and key not in _migrating_dirs:
-        # The in-progress sentinel makes migration structurally
-        # NON-RECURSIVE: any helper that resolves state_dir while the
-        # migration flock is held gets the target back immediately
-        # instead of re-entering (and self-deadlocking on) the flock.
-        _migrating_dirs.add(key)
+    gate = _migration_gate(str(target))
+    me = threading.get_ident()
+    attempted = False
+    while True:
+        with gate.cond:
+            while True:
+                if gate.done:
+                    return target
+                if gate.running:
+                    if gate.owner == me:
+                        # True same-thread recursion from a migration
+                        # writer: hand back the already-resolved target
+                        # (migration helpers receive the target and do
+                        # not resolve state_dir; this is belt+braces
+                        # against re-entering the held flock).
+                        return target
+                    gate.cond.wait()
+                    continue
+                if attempted:
+                    # OUR pass failed this call: the target is usable
+                    # (degraded, logged) and stays retryable — the next
+                    # state_dir call attempts the migration again.
+                    return target
+                gate.running = True
+                gate.owner = me
+                break
+        ok = False
         try:
-            _migrate_profile_records_serialized(target)
-            # Marked done only AFTER the pass completed (a crash
-            # mid-pass in this process re-runs the idempotent
-            # migration on the next call).
-            _migrated_dirs.add(key)
+            # Outside the condition: waiters block on gate.cond only,
+            # never on the cross-process flock held in here.
+            ok = _migrate_profile_records_serialized(target)
         finally:
-            _migrating_dirs.discard(key)
-    return target
+            with gate.cond:
+                gate.running = False
+                gate.owner = None
+                if ok:
+                    gate.done = True
+                gate.cond.notify_all()
+        attempted = True
 
 
-def _migrate_profile_records_serialized(target: Path) -> None:
+def _migrate_profile_records_serialized(target: Path) -> bool:
     """One migration pass, CROSS-PROCESS serialized by a machine-global
     flock: two processes migrating the same profiles concurrently could
     otherwise interleave read-modify-write of the collision-evidence
-    file and lose a candidate. Never raises."""
+    file and lose a candidate. Returns True only when the pass genuinely
+    completed — lock/write/migration failures are logged and return
+    False so the caller leaves the target retryable. Never raises."""
     try:
         lock_path = target / "locks" / "migration.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -283,8 +338,10 @@ def _migrate_profile_records_serialized(target: Path) -> None:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+        return True
     except Exception:
         logger.warning("worker record migration failed", exc_info=True)
+        return False
 
 
 def _conflict_path(target: Path, name: str) -> Path:

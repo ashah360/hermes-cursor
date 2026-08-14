@@ -1728,7 +1728,7 @@ def _mp_ensure_child(repo, xdg, alive_dir, spawn_log, cap, barrier, result_q):
     import time as _time
 
     os.environ["XDG_STATE_HOME"] = xdg
-    workers._migrated_dirs.clear()
+    workers._reset_migration_for_tests()
     workers.READY_TIMEOUT_S = 10.0
     workers._READY_POLL_S = 0.01
     workers._systemd_available = lambda: False
@@ -1779,7 +1779,7 @@ def _mp_migrate_child(xdg, hermes_home, alive_dir, barrier, result_q):
     process, racing its sibling."""
     os.environ["XDG_STATE_HOME"] = xdg
     os.environ["HERMES_HOME"] = hermes_home
-    workers._migrated_dirs.clear()
+    workers._reset_migration_for_tests()
     workers._pid_alive = (
         lambda pid: (Path(alive_dir) / str(int(pid))).exists()
     )
@@ -1849,6 +1849,107 @@ class TestMigrationLockNonRecursive:
         candidates = workers._read_conflict_candidates(name)
         assert candidates is not None
         assert {int(c["pid"]) for c in candidates} == {9941, 9942}
+
+
+class TestMigrationThreadCoordination:
+    """In-process coordination around the one-shot migration pass: a
+    second thread must never see the target before legacy ownership
+    migration completed — it WAITS, then observes the outcome. Failure
+    leaves the target retryable (next call attempts migration again);
+    success is recorded only when the pass actually succeeded."""
+
+    def test_second_thread_blocks_until_the_active_migration_finishes(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        passes = []
+        real = workers._migrate_profile_records_serialized
+
+        def slow(target):
+            passes.append(threading.get_ident())
+            entered.set()
+            assert release.wait(10)
+            return real(target)
+
+        monkeypatch.setattr(
+            workers, "_migrate_profile_records_serialized", slow
+        )
+        workers._reset_migration_for_tests()
+
+        results = {}
+        thread_a = threading.Thread(
+            target=lambda: results.__setitem__("a", workers.state_dir()),
+            daemon=True,
+        )
+        thread_a.start()
+        assert entered.wait(10)
+        thread_b = threading.Thread(
+            target=lambda: results.__setitem__("b", workers.state_dir()),
+            daemon=True,
+        )
+        thread_b.start()
+        # B must be BLOCKED behind A's in-flight migration — not handed
+        # the target while legacy ownership is still being migrated.
+        time.sleep(0.3)
+        assert "b" not in results
+        release.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        assert not thread_a.is_alive() and not thread_b.is_alive()
+        # Both observed the SAME migrated target; the pass ran ONCE.
+        assert results["a"] == results["b"]
+        assert len(passes) == 1
+
+    def test_failed_migration_is_retried_on_the_next_call(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        legacy = hermes_home / "state" / "ghost_cursor" / "workers"
+        legacy.mkdir(parents=True, exist_ok=True)
+        (legacy / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 9951,
+            "log_path": str(legacy / f"{name}.log"),
+            "started_at": 1000.0,
+            "verified": True,
+        }))
+        fake_procs.add(9951)
+
+        calls = []
+        real_inner = workers._migrate_profile_records
+
+        def flaky(target):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("disk exploded mid-migration")
+            return real_inner(target)
+
+        monkeypatch.setattr(workers, "_migrate_profile_records", flaky)
+        workers._reset_migration_for_tests()
+
+        # First call: the pass fails — state_dir still returns a usable
+        # target (degraded), but migration is NOT marked complete and
+        # the legacy record was not adopted.
+        target = workers.state_dir()
+        assert len(calls) == 1
+        assert not (target / f"{name}.json").exists()
+
+        # Next call: the migration is ATTEMPTED AGAIN and succeeds —
+        # the legacy record is adopted.
+        assert workers.state_dir() == target
+        assert len(calls) == 2
+        assert (target / f"{name}.json").exists()
+
+        # And now it is genuinely one-shot: no further passes.
+        workers.state_dir()
+        assert len(calls) == 2
 
 
 class TestConcurrentMigration:
