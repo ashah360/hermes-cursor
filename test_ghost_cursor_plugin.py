@@ -4025,6 +4025,27 @@ class TestCursorCreateSession:
             "Fix payment webhook retries"
         )
 
+    def test_subdir_repo_records_the_canonical_worktree_toplevel(
+        self, clean_state, tmp_path
+    ):
+        """Canonical identity at the session layer: creating from a
+        SUBDIRECTORY of a checkout records the worktree toplevel — /repo
+        and /repo/subdir are ONE session/worker identity."""
+        import os as _os
+        import subprocess as _subprocess
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(
+            ["git", "init", "-q", str(repo)], check=True, capture_output=True
+        )
+        sub = repo / "src" / "api"
+        sub.mkdir(parents=True)
+
+        cursor_create_session(repo=str(sub), title="Canonical identity")
+        entry = gc_handles.get("Canonical identity")
+        assert entry["repo"] == _os.path.realpath(str(repo))
+
     def test_title_whitespace_is_trimmed_and_collapsed(
         self, clean_state, tmp_path
     ):
@@ -4787,7 +4808,7 @@ def _install_fake_rest(monkeypatch, client, worker=None):
     )
     monkeypatch.setattr(
         gc_workers, "ensure_worker",
-        lambda repo: worker or _worker_record(repo=str(repo)),
+        lambda repo, **kw: worker or _worker_record(repo=str(repo)),
     )
     monkeypatch.setattr(gc_workers, "mark_verified", lambda name: None)
     # The per-process model-catalog cache must not leak across tests.
@@ -4919,7 +4940,7 @@ class TestCloudRunner:
         client = _FakeRestClient()
         _install_fake_rest(monkeypatch, client)
 
-        def boom(repo):
+        def boom(repo, **kw):
             raise gc_workers.WorkerError("the 'agent' CLI is not on PATH")
 
         monkeypatch.setattr(gc_workers, "ensure_worker", boom)
@@ -4933,7 +4954,9 @@ class TestCloudRunner:
         _install_fake_rest(monkeypatch, client)
         monkeypatch.setattr(
             gc_workers, "ensure_worker",
-            lambda repo: pytest.fail("cloud runtime must not touch workers"),
+            lambda repo, **kw: pytest.fail(
+                "cloud runtime must not touch workers"
+            ),
         )
         events = _run_cloud_events(tmp_path, runtime="cloud")
         assert events[0][1]["worker"] == ""
@@ -5452,6 +5475,133 @@ _FABLE_THINKING_HIGH_SELECTION = {
         {"id": "effort", "value": "high"},
     ],
 }
+
+
+class TestWorkerLeasePlumbing:
+    """run_cloud's per-run worker-lease lifecycle: installed atomically
+    at ensure, bound the instant the create returned, released ONLY on
+    an observed remote terminal, conservatively retained otherwise."""
+
+    def _install_leased(self, monkeypatch, client):
+        """Fake rest + a fake ensure_worker that INSTALLS the requested
+        lease (mirroring the atomic path), with bind/release captured."""
+        _install_fake_rest(monkeypatch, client)
+        ensure_kwargs = {}
+
+        def ensure(repo, **kw):
+            ensure_kwargs.update(kw)
+            record = _worker_record(repo=str(repo))
+            if kw.get("lease_id"):
+                record.leases = {kw["lease_id"]: {"session": ""}}
+            return record
+
+        monkeypatch.setattr(gc_workers, "ensure_worker", ensure)
+        binds, releases = [], []
+        monkeypatch.setattr(
+            gc_workers, "bind_lease",
+            lambda name, lease_id, agent_id, run_id: (
+                binds.append((name, lease_id, agent_id, run_id)) or True
+            ),
+        )
+        monkeypatch.setattr(
+            gc_workers, "release_lease",
+            lambda name, lease_id, agent_id="": releases.append(
+                (name, lease_id, agent_id)
+            ),
+        )
+        return ensure_kwargs, binds, releases
+
+    def test_dispatch_leases_binds_then_releases_on_observed_terminal(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient()
+        ensure_kwargs, binds, releases = self._install_leased(
+            monkeypatch, client
+        )
+        events = _run_cloud_events(tmp_path)
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+        lease_id = ensure_kwargs.get("lease_id")
+        assert lease_id, "ensure must be asked for an atomic lease"
+        assert binds == [("test-worker", lease_id, "bc-fake-1", "run-1")]
+        # Terminal proof observed (GET FINISHED) -> released, with the
+        # agent id so same-agent stale leases are settled too.
+        assert releases == [("test-worker", lease_id, "bc-fake-1")]
+
+    def test_unconfirmed_executor_exit_retains_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """Exhausted reconnects on a still-RUNNING run: the executor
+        gives up but has NO terminal proof — the lease must be retained
+        (the documented safe leak), never released."""
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.0)
+        client = _FakeRestClient(
+            streams=[[gc_rest.RestApiError(
+                "cursor api GET stream -> 409 conflict: stream_unavailable",
+                status_code=409,
+            )]],
+            statuses=("RUNNING",),  # never terminal
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert events[-1][0] == "cloud.error"
+        assert len(binds) == 1     # the run WAS protected
+        assert releases == []      # …and stays protected (safe leak)
+
+    def test_create_failure_before_any_agent_releases_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(
+            create_error=gc_rest.RestApiError("boom", status_code=500),
+        )
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        with pytest.raises(gc_cloud.CloudRunnerError):
+            _run_cloud_events(tmp_path)
+        assert binds == []
+        # No agent was ever established: nothing remote can be running,
+        # so the pre-create lease is released (not leaked).
+        assert len(releases) == 1
+        assert releases[0][2] == ""  # no agent to sweep siblings for
+
+    def test_bind_failure_cancels_instead_of_running_unprotected(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient(statuses=("CANCELLED",))
+        # The stream stays silent until the cancel actually lands — the
+        # run cannot slip through to a natural finish.
+        client.streams = [[lambda: client.cancelled.wait(5) and None or None]]
+        _, _, releases = self._install_leased(monkeypatch, client)
+        monkeypatch.setattr(
+            gc_workers, "bind_lease",
+            lambda name, lease_id, agent_id, run_id: False,
+        )
+        events = _run_cloud_events(tmp_path)
+        assert events[-1] == ("cloud.result", {"status": "cancelled"})
+        assert client.cancel_calls, "the remote run must be cancelled"
+        # CANCELLED is observed terminal proof — the lease settles.
+        assert len(releases) == 1
+
+    def test_cloud_runtime_never_touches_leases(self, tmp_path, monkeypatch):
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        for fn in ("ensure_worker", "bind_lease", "release_lease"):
+            monkeypatch.setattr(
+                gc_workers, fn,
+                lambda *a, _fn=fn, **kw: pytest.fail(
+                    f"cloud runtime must not call workers.{_fn}"
+                ),
+            )
+        events = _run_cloud_events(tmp_path, runtime="cloud")
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+
+    def test_session_event_surfaces_degraded_supervision(
+        self, tmp_path, monkeypatch
+    ):
+        record = _worker_record()
+        record.supervision = "detached"
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client, worker=record)
+        events = _run_cloud_events(tmp_path)
+        assert events[0][1]["worker_supervision"] == "detached"
 
 
 class TestModelTranslation:
