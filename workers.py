@@ -224,10 +224,14 @@ def _profile_state_dirs() -> List[Path]:
 # Migration is idempotent but cheap to skip: one pass per target dir per
 # process (tests re-point XDG_STATE_HOME per test and reset this).
 _migrated_dirs: set = set()
+# Targets whose migration pass is RUNNING in this process right now —
+# the structural re-entry guard (see state_dir).
+_migrating_dirs: set = set()
 
 
 def _reset_migration_for_tests() -> None:
     _migrated_dirs.clear()
+    _migrating_dirs.clear()
 
 
 def state_dir() -> Path:
@@ -245,10 +249,42 @@ def state_dir() -> Path:
     )
     target = Path(base) / "ghost_cursor" / "workers"
     key = str(target)
-    if key not in _migrated_dirs:
-        _migrated_dirs.add(key)
-        _migrate_profile_records(target)
+    if key not in _migrated_dirs and key not in _migrating_dirs:
+        # The in-progress sentinel makes migration structurally
+        # NON-RECURSIVE: any helper that resolves state_dir while the
+        # migration flock is held gets the target back immediately
+        # instead of re-entering (and self-deadlocking on) the flock.
+        _migrating_dirs.add(key)
+        try:
+            _migrate_profile_records_serialized(target)
+            # Marked done only AFTER the pass completed (a crash
+            # mid-pass in this process re-runs the idempotent
+            # migration on the next call).
+            _migrated_dirs.add(key)
+        finally:
+            _migrating_dirs.discard(key)
     return target
+
+
+def _migrate_profile_records_serialized(target: Path) -> None:
+    """One migration pass, CROSS-PROCESS serialized by a machine-global
+    flock: two processes migrating the same profiles concurrently could
+    otherwise interleave read-modify-write of the collision-evidence
+    file and lose a candidate. Never raises."""
+    try:
+        lock_path = target / "locks" / "migration.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            _migrate_profile_records(target)
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+    except Exception:
+        logger.warning("worker record migration failed", exc_info=True)
 
 
 def _conflict_path(target: Path, name: str) -> Path:
@@ -299,10 +335,12 @@ def _note_migration_conflict(
         for c in candidates
     ]:
         candidates.append({**incoming, "_source": str(source)})
-    conflict_file.write_text(json.dumps({
+    tmp = conflict_file.with_name(conflict_file.name + ".tmp")
+    tmp.write_text(json.dumps({
         "noted_at": time.time(),
         "candidates": candidates,
     }), "utf-8")
+    tmp.replace(conflict_file)  # evidence lands atomically or not at all
     # The authoritative record becomes an explicit conflict marker
     # (v2-shaped so the state survives the read path), keeping the
     # first-seen candidate's identity fields for diagnosis only.
@@ -310,6 +348,9 @@ def _note_migration_conflict(
         marker = _parse_record(candidates[0])
     except Exception:
         marker = _parse_record(incoming)
+    # Written to the passed target directly: this runs UNDER the held
+    # migration lock and must never resolve state_dir (re-entry there
+    # would self-deadlock on the migration flock).
     _write_record(WorkerRecord(**{
         **asdict(marker),
         "state": STATE_CONFLICT,
@@ -319,7 +360,7 @@ def _note_migration_conflict(
             f"{sorted(int(c.get('pid') or 0) for c in candidates)}) — "
             "no winner picked; see the .conflict.json evidence"
         ),
-    }))
+    }), directory=target)
     logger.error(
         "worker %s: migration COLLISION across profiles (candidate pids "
         "%s) — conflict state recorded, nothing adopted or stopped",
@@ -377,7 +418,9 @@ def _migrate_profile_records(target: Path) -> None:
                                 )
                         continue
                     target.mkdir(parents=True, exist_ok=True)
-                    dest.write_text(path.read_text("utf-8"), "utf-8")
+                    tmp = dest.with_name(dest.name + ".migrating.tmp")
+                    tmp.write_text(path.read_text("utf-8"), "utf-8")
+                    tmp.replace(dest)  # adopted atomically or not at all
                     logger.info(
                         "migrated profile-local worker record %s (from %s) "
                         "to the machine-global control dir (adopted, not "
@@ -414,6 +457,8 @@ def _pid_alive(pid: int) -> bool:
     back to the existence check rather than declaring a live worker dead).
     """
     try:
+        if int(pid) <= 0:
+            return False  # 0/negative address process GROUPS — never probe
         os.kill(int(pid), 0)
     except (ProcessLookupError, ValueError):
         return False
@@ -441,6 +486,8 @@ def _pid_exists(pid: int) -> bool:
     the raw view: a reused pid that no longer 'looks like a worker' must
     still block group signals."""
     try:
+        if int(pid) <= 0:
+            return False  # 0/negative address process GROUPS — never probe
         os.kill(int(pid), 0)
         return True
     except (ProcessLookupError, ValueError):
@@ -918,11 +965,20 @@ def _parse_record(data: Dict[str, Any]) -> WorkerRecord:
     )
 
 
-def _write_record(record: WorkerRecord) -> None:
+def _write_record(
+    record: WorkerRecord, directory: Optional[Path] = None
+) -> None:
     """Persist ``record`` atomically. Callers hold the worker's flock for
     any read-modify-write; new-generation writes happen inside
-    ``ensure_worker``'s lock hold."""
-    path = _record_path(record.name)
+    ``ensure_worker``'s lock hold.
+
+    ``directory`` bypasses :func:`state_dir` resolution — REQUIRED for
+    writers running under the held migration lock (state_dir would
+    re-enter the migration and self-deadlock on its own flock)."""
+    if directory is not None:
+        path = Path(directory) / f"{record.name}.json"
+    else:
+        path = _record_path(record.name)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(asdict(record)), "utf-8")
@@ -1405,13 +1461,15 @@ def ensure_worker(
                     "retry shortly"
                 )
             _cleanup_generation(record)
-        # Admission: capacity reservation, management-port reservation,
-        # spawn, and the record write are ONE machine-global critical
-        # section (two distinct worktree spawns at limit-1 must not both
-        # pass). The bounded ready-wait below runs outside it.
+        # Admission: capacity check + the RESERVATION record write are
+        # ONE short machine-global critical section (two distinct
+        # worktree spawns at limit-1 must not both pass). The slow spawn
+        # and the bounded ready-wait run OUTSIDE it — the on-disk
+        # reservation (SPAWNING, flock held) keeps claiming the slot.
         with _admission_lock():
             _enforce_capacity(name, real)
-            record = _launch_generation(name, real)
+            record = _reserve_generation(name, real)
+        record = _launch_generation(record)
         if carried:
             logger.info(
                 "worker %s: carrying %d surviving lease(s) from the dead "
@@ -1522,65 +1580,105 @@ def _install_lease_locked(
     return _read_record(record.name) or record
 
 
-def _launch_generation(name: str, real: str) -> WorkerRecord:
-    """Start a fresh generation and write its authoritative record
-    (caller holds the flock AND the admission lock).
+def _reserve_generation(name: str, real: str) -> WorkerRecord:
+    """Write a fresh generation's capacity RESERVATION record (caller
+    holds the flock AND the admission lock).
 
-    Isolation: a deterministic per-worker ``CURSOR_DATA_DIR`` (the CLI's
-    worker.lock lives inside it, so no two worktrees ever contend) and a
-    per-worker localhost management endpoint. Supervision: a transient
-    user systemd service when the user manager is available (gateway-
-    independent lifetime, MainPID/InvocationID identity, bounded full-
-    cgroup stop), else the clearly-surfaced degraded detached fallback.
-    Each generation logs to its OWN file (``<name>-<gen>.log``) so
-    readiness evidence is structurally generation-scoped.
-    """
+    ``pid 0`` marks "no process yet". The reservation itself claims the
+    capacity slot: other processes' capacity checks count a SPAWNING
+    record whose worker flock is held, so the actual (slow) spawn runs
+    OUTSIDE the machine-global admission lock without over-admission.
+    Isolation is fixed here: a deterministic per-worker
+    ``CURSOR_DATA_DIR`` (the CLI's worker.lock lives inside it, so no
+    two worktrees ever contend) and a per-worker localhost management
+    endpoint. Each generation logs to its OWN file
+    (``<name>-<gen>.log``) so readiness evidence is structurally
+    generation-scoped."""
     minted = _mint_generation()
     log_path = state_dir() / f"{name}-{minted}.log"
     data_dir = _data_dir_for(name)
     data_dir.mkdir(parents=True, exist_ok=True)
     addr = f"127.0.0.1:{_alloc_management_port(name)}"
-
-    if _systemd_available():
-        supervision = "systemd"
-        unit = _unit_name(name)
-        pid, generation = _spawn_unit(unit, name, real, log_path, data_dir, addr)
-    else:
-        supervision = "detached"
-        unit = ""
-        generation = minted
-        logger.warning(
-            "worker %s: user systemd unavailable — DEGRADED detached "
-            "supervision (no cgroup containment; stop is a bounded "
-            "process-group kill)", name,
-        )
-        pid = _spawn_worker(
-            name, real, log_path,
-            data_dir=str(data_dir), management_addr=addr,
-        )
-
     record = WorkerRecord(
         name=name,
         repo_path=real,
-        pid=pid,
+        pid=0,
         log_path=str(log_path),
         started_at=time.time(),
         verified=False,
-        generation=generation,
-        unit=unit,
-        supervision=supervision,
+        generation=minted,
+        unit="",
+        supervision="detached",
         data_dir=str(data_dir),
         management_addr=addr,
         state=STATE_SPAWNING,
-        pid_birth=_pid_birth(pid),
+        pid_birth=None,
         last_active_at=time.time(),
     )
     _write_record(record)
+    return record
+
+
+def _launch_generation(record: WorkerRecord) -> WorkerRecord:
+    """Start the reserved generation's process and persist its live
+    identity (caller holds the flock, NOT the admission lock).
+
+    Supervision: a transient user systemd service when the user manager
+    is available (gateway-independent lifetime, MainPID/InvocationID
+    identity, bounded full-cgroup stop), else the clearly-surfaced
+    degraded detached fallback. A failed spawn marks the reservation
+    FAILED so it stops claiming capacity and is lazily retired."""
+    name, real = record.name, record.repo_path
+    log_path = Path(record.log_path)
+    try:
+        if _systemd_available():
+            supervision = "systemd"
+            unit = _unit_name(name)
+            pid, generation = _spawn_unit(
+                unit, name, real, log_path,
+                Path(record.data_dir), record.management_addr,
+            )
+        else:
+            supervision = "detached"
+            unit = ""
+            generation = record.generation
+            logger.warning(
+                "worker %s: user systemd unavailable — DEGRADED detached "
+                "supervision (no cgroup containment; stop is a bounded "
+                "process-group kill)", name,
+            )
+            pid = _spawn_worker(
+                name, real, log_path,
+                data_dir=record.data_dir,
+                management_addr=record.management_addr,
+            )
+    except Exception as exc:
+        # The reservation must not linger as a capacity claim (fenced:
+        # a conflict record written meanwhile is never overwritten).
+        _update_record_locked(
+            name, record.generation,
+            state=STATE_FAILED, last_error=str(exc)[:500],
+        )
+        raise
+    if not _update_record_locked(
+        name, record.generation,
+        pid=pid,
+        generation=generation,
+        unit=unit,
+        supervision=supervision,
+        pid_birth=_pid_birth(pid),
+        state=STATE_SPAWNING,
+        last_active_at=time.time(),
+    ):
+        raise WorkerError(
+            f"worker '{name}' changed generation during its own spawn — "
+            "retry the dispatch"
+        )
     logger.info(
         "spawned worker %s (pid %d, generation %s, %s) for %s",
         name, pid, generation, supervision, real,
     )
-    return record
+    return _read_record(name) or record
 
 
 def _await_generation_ready(record: WorkerRecord) -> None:
@@ -2125,16 +2223,45 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
     limit = _max_workers()
     now = time.time()
     others = [r for r in live_workers() if r.name != spawning_name]
+    # BUSY spawning reservations claim their slot BEFORE a live process
+    # exists: a SPAWNING record without a live pid whose worker flock is
+    # HELD is another process's in-flight spawn (spawners hold their
+    # flock end-to-end). A free-flock one is a crashed spawner's stale
+    # reservation — claims nothing (the lazy reconcile retires it).
+    reserved_names: set = set()
+    directory = state_dir()
+    seen = {r.name for r in others}
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            if path.name.endswith(".conflict.json"):
+                continue
+            stem = path.stem
+            if stem == spawning_name or stem in seen:
+                continue
+            candidate = _read_record(stem)
+            if (
+                candidate is None
+                or candidate.state != STATE_SPAWNING
+                or _record_alive(candidate)
+            ):
+                continue
+            with _try_worker_lock(stem) as acquired:
+                if acquired:
+                    continue  # stale reservation — no live spawner
+            reserved_names.add(stem)
+            others.append(candidate)
     if len(others) < limit:
         return
     idle = sorted(
         (
             r for r in others
             # Legacy workers may serve runs this controller cannot see,
-            # and CONFLICTED workers must never have a candidate stopped
-            # — neither is ever a reclaim candidate.
+            # CONFLICTED workers must never have a candidate stopped,
+            # and BUSY reservations are another spawner's in-flight
+            # claim — none is ever a reclaim candidate.
             if r.supervision != "legacy"
             and r.state != STATE_CONFLICT
+            and r.name not in reserved_names
             and not _fresh_leases(r, now)
         ),
         key=lambda r: float(r.last_active_at or r.started_at),
@@ -2163,6 +2290,10 @@ def _enforce_capacity(spawning_name: str, real: str) -> None:
             for r in live_workers()
             if r.name != spawning_name
             and (r.supervision == "legacy" or _fresh_leases(r, time.time()))
+        ) + sorted(
+            f"{r.name} ({r.repo_path}, spawning)"
+            for r in others
+            if r.name in reserved_names
         )
         raise WorkerError(
             f"worker capacity exhausted: {len(busy)} of {limit} workers "

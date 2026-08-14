@@ -1566,6 +1566,92 @@ class TestCapacity:
             assert workers._max_workers() == 10
 
 
+class TestSpawningReservationCapacity:
+    """Admission startup accounting: a generation being spawned by
+    ANOTHER process (reservation record on disk, its worker flock held)
+    claims a capacity slot BEFORE its process exists — a concurrent
+    ensure can never over-admit past the cap. Stale reservations (flock
+    free: the spawner crashed) claim nothing and are lazily retired."""
+
+    def _seed_reservation(self, repo):
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "version": workers.RECORD_VERSION,
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 0,                      # no process yet — reserving
+            "log_path": str(directory / f"{name}-det-res.log"),
+            "started_at": time.time(),
+            "generation": "det-reserved",
+            "state": workers.STATE_SPAWNING,
+            "last_active_at": time.time(),
+        }))
+        return name
+
+    def test_busy_spawning_reservation_claims_its_capacity_slot(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        import fcntl
+
+        monkeypatch.setattr(workers, "_max_workers", lambda: 1)
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        name_a = self._seed_reservation(repo_a)
+        lock_path = workers.state_dir() / "locks" / f"{name_a}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # the in-flight spawner's hold
+            with pytest.raises(workers.WorkerError) as err:
+                workers.ensure_worker(str(repo_b))
+            assert "capacity" in str(err.value)
+            assert workers._read_record(name_a) is not None  # untouched
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        # The spawner crashed (flock free): the stale reservation claims
+        # nothing and the next dispatch lazily retires it.
+        record_b = workers.ensure_worker(str(repo_b))
+        assert record_b.state == workers.STATE_READY
+        assert workers._read_record(name_a) is None
+
+    def test_spawn_runs_outside_the_global_admission_lock(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        """The (slow) spawn must not serialize every other worktree's
+        admission behind it: during the spawn the machine-global
+        admission lock is FREE."""
+        import fcntl
+
+        observed = {}
+
+        def probing_spawn(name, repo_path, log_path, **kw):
+            path = workers.state_dir() / "locks" / "admission.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    observed["admission_free"] = True
+                except OSError:
+                    observed["admission_free"] = False
+            finally:
+                os.close(fd)
+            fake_procs.add(4321)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"registering...\n{workers.READY_LINE}\n")
+            return 4321
+
+        monkeypatch.setattr(workers, "_spawn_worker", probing_spawn)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        workers.ensure_worker(str(repo))
+        assert observed["admission_free"] is True
+
+
 class TestCanonicalAliasAdoption:
     """Migration from pre-canonical naming: a live worker recorded under
     a SUBDIRECTORY-derived name must be adopted for the canonical
@@ -1685,6 +1771,159 @@ def _mp_ensure_child(repo, xdg, alive_dir, spawn_log, cap, barrier, result_q):
         result_q.put(("ok", record.pid, record.generation))
     except workers.WorkerError as exc:
         result_q.put(("err", str(exc), ""))
+
+
+def _mp_migrate_child(xdg, hermes_home, alive_dir, barrier, result_q):
+    """Child body for the concurrent-migration proof (fork start
+    method): re-runs the pre-v2 profile migration from scratch in this
+    process, racing its sibling."""
+    os.environ["XDG_STATE_HOME"] = xdg
+    os.environ["HERMES_HOME"] = hermes_home
+    workers._migrated_dirs.clear()
+    workers._pid_alive = (
+        lambda pid: (Path(alive_dir) / str(int(pid))).exists()
+    )
+    workers._pid_exists = (
+        lambda pid: (Path(alive_dir) / str(int(pid))).exists()
+    )
+    workers._pid_birth = lambda pid: 1
+    barrier.wait(timeout=10)
+    try:
+        names = sorted(r.name for r in workers.live_workers())
+        result_q.put(("ok", names))
+    except Exception as exc:  # noqa: BLE001
+        result_q.put(("err", repr(exc)))
+
+
+class TestMigrationLockNonRecursive:
+    """Regression: the migration flock must never be re-entered through
+    state_dir from helpers running UNDER it (collision noting writes the
+    conflict marker record via _write_record → _record_path, which must
+    not resolve state_dir into a second migration attempt — flock
+    conflicts across open-file-descriptions even within one process)."""
+
+    def test_collision_migration_does_not_self_deadlock(
+        self, tmp_path, fake_procs
+    ):
+        import threading
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        for directory, pid in (
+            (hermes_home / "state" / "ghost_cursor" / "workers", 9941),
+            (
+                hermes_home / "profiles" / "beta" / "state"
+                / "ghost_cursor" / "workers",
+                9942,
+            ),
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{name}.json").write_text(json.dumps({
+                "name": name,
+                "repo_path": os.path.realpath(str(repo)),
+                "pid": pid,
+                "log_path": str(directory / f"{name}.log"),
+                "started_at": 1000.0,
+                "verified": True,
+            }))
+        fake_procs.update({9941, 9942})
+        workers._reset_migration_for_tests()
+
+        done = threading.Event()
+
+        def migrate():
+            # The collision path runs during the FIRST state_dir
+            # resolution of this process — live_workers triggers it.
+            workers.live_workers()
+            done.set()
+
+        thread = threading.Thread(target=migrate, daemon=True)
+        thread.start()
+        assert done.wait(timeout=15), (
+            "migration deadlocked on its own migration lock "
+            "(state_dir re-entry under the held flock)"
+        )
+        # And the collision was still recorded correctly.
+        candidates = workers._read_conflict_candidates(name)
+        assert candidates is not None
+        assert {int(c["pid"]) for c in candidates} == {9941, 9942}
+
+
+class TestConcurrentMigration:
+    """Legacy migration is cross-process serialized and atomic: two
+    processes migrating the same profiles concurrently can neither lose
+    collision evidence nor adopt/overwrite past each other."""
+
+    def test_concurrent_collision_migration_preserves_both_candidates(
+        self, tmp_path, fake_procs
+    ):
+        import multiprocessing
+
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        # Two profiles claim the SAME worker name with DIFFERENT live
+        # pids — the collision every process must preserve, not race.
+        seeds = (
+            (hermes_home / "state" / "ghost_cursor" / "workers", 9931),
+            (
+                hermes_home / "profiles" / "beta" / "state"
+                / "ghost_cursor" / "workers",
+                9932,
+            ),
+        )
+        for directory, pid in seeds:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{name}.json").write_text(json.dumps({
+                "name": name,
+                "repo_path": os.path.realpath(str(repo)),
+                "pid": pid,
+                "log_path": str(directory / f"{name}.log"),
+                "started_at": 1000.0,
+                "verified": True,
+            }))
+        alive_dir = tmp_path / "alive"
+        alive_dir.mkdir()
+        (alive_dir / "9931").touch()
+        (alive_dir / "9932").touch()
+        fake_procs.update({9931, 9932})
+
+        ctx = multiprocessing.get_context("fork")
+        barrier = ctx.Barrier(2)
+        result_q = ctx.Queue()
+        children = [
+            ctx.Process(
+                target=_mp_migrate_child,
+                args=(
+                    os.environ["XDG_STATE_HOME"],
+                    str(hermes_home), str(alive_dir), barrier, result_q,
+                ),
+            )
+            for _ in range(2)
+        ]
+        for child in children:
+            child.start()
+        for child in children:
+            child.join(timeout=30)
+            assert child.exitcode == 0
+        results = [result_q.get(timeout=5) for _ in children]
+        assert all(kind == "ok" for kind, _ in results), results
+
+        # The collision survived the race: BOTH candidates preserved,
+        # the record an explicit conflict, nothing adopted or lost.
+        candidates = workers._read_conflict_candidates(name)
+        assert candidates is not None
+        assert {int(c["pid"]) for c in candidates} == {9931, 9932}
+        record = workers._read_record(name)
+        assert record is not None
+        assert record.state == workers.STATE_CONFLICT
+        # Both source profile records still exist (adoption never
+        # deletes originals; nothing was overwritten past the lock).
+        for directory, _pid in seeds:
+            assert (directory / f"{name}.json").exists()
 
 
 class TestMultiProcessAdmission:
