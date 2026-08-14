@@ -1,14 +1,26 @@
 """Tests for workers.py — the worker controller, with a faked process
 table (``_pid_alive``) and a faked spawner (``_spawn_worker``)."""
 
+import hashlib
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from plugins.ghost_cursor import workers
+
+
+def _raw_name(path):
+    """The PRE-canonical naming scheme: a hash of the raw dispatch path
+    (subdir included), same host slug as today's worker_name_for."""
+    digest = hashlib.sha256(
+        os.path.realpath(str(path)).encode("utf-8")
+    ).hexdigest()[:8]
+    host_slug = workers.worker_name_for(str(path)).rsplit("-", 1)[0]
+    return f"{host_slug}-{digest}"
 
 
 def _git(*args, cwd):
@@ -430,6 +442,1112 @@ class TestLiveWorkersAndCleanup:
         # idempotent
         workers.mark_verified(record.name)
         assert workers._read_record(record.name).verified
+
+
+class TestMachineGlobalControlDir:
+    """Worker records/locks/data roots are MACHINE-global (unit names and
+    the one-worker-per-worktree invariant are machine-global); session
+    handles stay profile-local. Pre-v2 profile-local records migrate by
+    adoption — never by killing live workers."""
+
+    def test_state_dir_is_independent_of_hermes_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+        dir_a = workers.state_dir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+        dir_b = workers.state_dir()
+        assert dir_a == dir_b
+        assert str(tmp_path / "xdg") in str(dir_a)
+
+    def test_profile_local_records_migrate_by_adoption(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        # A pre-v2 record left in the PROFILE-local location.
+        legacy_dir = workers._profile_state_dir()
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 8811,
+            "log_path": str(legacy_dir / f"{name}.log"),
+            "started_at": 1000.0,
+            "verified": True,
+        }))
+        fake_procs.add(8811)
+        workers._reset_migration_for_tests()
+
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 8811          # adopted from the profile dir
+        assert len(fake_spawn) == 0        # never killed, never respawned
+        assert record.supervision == "legacy"
+        # The record now lives in the machine-global control dir.
+        assert (workers.state_dir() / f"{name}.json").exists()
+
+
+class TestMultiProfileMigration:
+    def _seed(self, directory, name, repo, pid):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name, "repo_path": os.path.realpath(str(repo)),
+            "pid": pid, "log_path": str(directory / f"{name}.log"),
+            "started_at": 1000.0, "verified": True,
+        }))
+
+    def test_discovers_default_profile_and_named_profiles(
+        self, tmp_path, fake_procs
+    ):
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        name_a = workers.worker_name_for(str(repo_a))
+        name_b = workers.worker_name_for(str(repo_b))
+        self._seed(
+            hermes_home / "state" / "ghost_cursor" / "workers",
+            name_a, repo_a, 9911,
+        )
+        self._seed(
+            hermes_home / "profiles" / "beta" / "state" / "ghost_cursor" / "workers",
+            name_b, repo_b, 9912,
+        )
+        fake_procs.update({9911, 9912})
+        workers._reset_migration_for_tests()
+
+        names = {r.name for r in workers.live_workers()}
+        assert {name_a, name_b} <= names  # both profiles adopted
+
+    def test_live_live_collision_is_an_explicit_conflict_with_no_winner(
+        self, tmp_path, fake_procs, fake_spawn, monkeypatch
+    ):
+        """Two profiles hold the SAME worker name with DIFFERENT live
+        pids: first-record-wins would leave one live worker untracked
+        and later permit duplication. The collision must become an
+        explicit machine-global CONFLICT — no winner, no stop, no
+        overwrite, no spawn — until one candidate is provably dead."""
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        self._seed(
+            hermes_home / "state" / "ghost_cursor" / "workers",
+            name, repo, 9921,
+        )
+        self._seed(
+            hermes_home / "profiles" / "beta" / "state" / "ghost_cursor" / "workers",
+            name, repo, 9922,
+        )
+        fake_procs.update({9921, 9922})  # BOTH candidates are alive
+        kills = []
+        monkeypatch.setattr(
+            workers, "_kill_detached", lambda record: kills.append(record.pid)
+        )
+        stops = []
+        monkeypatch.setattr(
+            workers, "_systemd_stop", lambda unit: stops.append(unit) or True
+        )
+        workers._reset_migration_for_tests()
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo), lease_id="run-x")
+        assert "conflict" in str(err.value).lower()
+        assert "9921" in str(err.value) and "9922" in str(err.value)
+        assert kills == [] and stops == []      # neither candidate stopped
+        assert len(fake_spawn) == 0             # no duplicate spawn
+        record = workers._read_record(name)
+        assert record.state == workers.STATE_CONFLICT
+        # Ownership evidence for BOTH candidates is preserved.
+        candidates = workers._read_conflict_candidates(name)
+        assert {c["pid"] for c in candidates} == {9921, 9922}
+
+        # Resolution: one candidate provably dead -> the survivor is
+        # adopted safely and dispatch works again.
+        fake_procs.discard(9922)
+        resolved = workers.ensure_worker(str(repo), lease_id="run-x")
+        assert resolved.pid == 9921
+        assert resolved.state != workers.STATE_CONFLICT
+        assert kills == [] and stops == []      # still nothing stopped
+        assert workers._read_conflict_candidates(name) is None
+
+
+class TestLegacyProtection:
+    """A legacy (generation-0) worker may be serving a pre-v2 run this
+    controller cannot see (no leases, possibly another profile) — it is
+    never TTL-reaped and never capacity-reclaimed while alive."""
+
+    def _legacy_record(self, repo, pid, fake_procs):
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": pid,
+            "log_path": str(directory / f"{name}.log"),
+            "started_at": 5.0,  # ancient — far past any TTL
+            "verified": True,
+        }))
+        fake_procs.add(pid)
+        return name
+
+    def test_active_legacy_worker_survives_the_reaper(
+        self, tmp_path, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = self._legacy_record(repo, 8821, fake_procs)
+        assert workers.reconcile() == []
+        assert workers._read_record(name) is not None
+
+    def test_dead_legacy_worker_is_still_cleaned(self, tmp_path, fake_procs):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = self._legacy_record(repo, 8822, fake_procs)
+        fake_procs.discard(8822)
+        assert workers.reconcile() == [name]
+
+    def test_capacity_never_reclaims_a_live_legacy_worker(
+        self, tmp_path, fake_procs, fake_spawn, monkeypatch
+    ):
+        monkeypatch.setattr(workers, "_max_workers", lambda: 1)
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        name_a = self._legacy_record(repo_a, 8823, fake_procs)
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo_b))
+        assert workers._read_record(name_a) is not None
+
+
+class TestRecordV2AndFencing:
+    """Durable versioned records: legacy adoption, generation fencing,
+    cross-process (flock) spawn serialization."""
+
+    def test_legacy_v1_record_is_adopted_not_replaced(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name,
+            "repo_path": os.path.realpath(str(repo)),
+            "pid": 7777,
+            "log_path": str(directory / f"{name}.log"),
+            "started_at": 12345.0,
+            "verified": True,
+        }))
+        fake_procs.add(7777)
+
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 7777              # adopted, not killed
+        assert len(fake_spawn) == 0            # no respawn
+        assert record.supervision == "legacy"
+        assert record.generation == "legacy-7777"
+        assert record.verified                 # v1 proof carries over
+
+    def test_stale_generation_cannot_overwrite_current_record(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        current_gen = record.generation
+        assert current_gen
+
+        with workers._worker_lock(record.name):
+            ok = workers._update_record_locked(
+                record.name, "gen-someone-else", last_error="stale writer"
+            )
+        assert ok is False
+        persisted = workers._read_record(record.name)
+        assert persisted.generation == current_gen
+        assert persisted.last_error != "stale writer"
+
+    def test_concurrent_ensure_spawns_exactly_one_worker(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        import threading as _threading
+        import time as _time
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        calls = []
+
+        def slow_spawn(name, repo_path, log_path, **kw):
+            _time.sleep(0.2)  # hold the lock long enough for a real race
+            pid = 5000 + len(calls)
+            calls.append(name)
+            fake_procs.add(pid)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as fh:
+                fh.write(f"registering...\n{workers.READY_LINE}\n")
+            return pid
+
+        monkeypatch.setattr(workers, "_spawn_worker", slow_spawn)
+        results, errors = [], []
+
+        def ensure():
+            try:
+                results.append(workers.ensure_worker(str(repo)))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [_threading.Thread(target=ensure) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors
+        assert len(calls) == 1                     # exactly one spawn
+        assert {r.pid for r in results} == {5000}  # both got the winner
+
+
+class TestGenerationScopedReadiness:
+    def test_respawn_rejects_previous_generations_ready_line(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        """A dead worker's log keeps its old 'Worker is now running' line;
+        the respawned generation must NOT be declared ready by it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        log = workers.state_dir() / f"{name}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # Evidence from a PREVIOUS incarnation, within tail range.
+        log.write_text(f"old boot...\n{workers.READY_LINE}\nStopping worker\n")
+
+        def spawn_never_ready(name, repo_path, log_path, **kw):
+            fake_procs.add(6001)
+            with open(log_path, "a") as fh:
+                fh.write("registering fresh generation...\n")
+            return 6001
+
+        monkeypatch.setattr(workers, "_spawn_worker", spawn_never_ready)
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "did not report ready" in str(err.value)
+
+    def test_respawn_accepts_own_generations_ready_line(
+        self, tmp_path, monkeypatch, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        log = workers.state_dir() / f"{name}.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"old boot...\n{workers.READY_LINE}\n")
+
+        def spawn_ready(name, repo_path, log_path, **kw):
+            fake_procs.add(6002)
+            with open(log_path, "a") as fh:
+                fh.write(f"fresh boot...\n{workers.READY_LINE}\n")
+            return 6002
+
+        monkeypatch.setattr(workers, "_spawn_worker", spawn_ready)
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 6002
+        assert record.state == "ready"
+
+
+class TestDataRootIsolation:
+    """Every worker gets its own deterministic CURSOR_DATA_DIR and its
+    own management endpoint — no two workers share either."""
+
+    def test_distinct_worktrees_get_distinct_data_roots_and_ports(
+        self, tmp_path, fake_spawn
+    ):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a))
+        rec_b = workers.ensure_worker(str(repo_b))
+        assert rec_a.data_dir and rec_b.data_dir
+        assert rec_a.data_dir != rec_b.data_dir
+        assert rec_a.data_dir == str(workers.state_dir() / "data" / rec_a.name)
+        assert rec_a.management_addr and rec_b.management_addr
+        assert rec_a.management_addr != rec_b.management_addr
+        assert rec_a.management_addr.startswith("127.0.0.1:")
+        # The spawner was handed the SAME isolation parameters.
+        assert fake_spawn[0]["data_dir"] == rec_a.data_dir
+        assert fake_spawn[0]["management_addr"] == rec_a.management_addr
+
+    def test_spawn_command_isolates_data_dir_and_management(self):
+        argv, env = workers._spawn_command(
+            "/usr/bin/agent", "w-name", "/repo",
+            data_dir="/state/data/w-name",
+            management_addr="127.0.0.1:42700",
+        )
+        assert argv[:4] == ["/usr/bin/agent", "worker", "start", "--name"]
+        assert "--worker-dir" in argv and "/repo" in argv
+        assert "--management-addr" in argv
+        assert argv[argv.index("--management-addr") + 1] == "127.0.0.1:42700"
+        assert env["CURSOR_DATA_DIR"] == "/state/data/w-name"
+        assert "LD_LIBRARY_PATH" not in env  # loader vars still stripped
+
+
+class TestSystemdSupervision:
+    def test_spawns_transient_service_with_deterministic_identity(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert record.supervision == "systemd"
+        assert record.unit == f"cursor-worker-{record.name}.service"
+        assert record.pid == 9000                # MainPID is authoritative
+        assert record.generation == "inv-0001"   # InvocationID = generation
+        assert record.state == workers.STATE_READY
+        started = fake_systemd["started"][0]
+        assert started["unit"] == record.unit
+        assert started["env"]["CURSOR_DATA_DIR"] == record.data_dir
+
+    def test_adopted_after_restart_without_respawn(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        # A fresh plugin process (nothing in memory) re-ensures: the
+        # persisted record + live unit are adopted, not respawned.
+        second = workers.ensure_worker(str(repo))
+        assert second.pid == first.pid
+        assert second.generation == first.generation
+        assert len(fake_systemd["started"]) == 1
+
+    def test_stop_generation_stops_the_unit(self, tmp_path, fake_systemd):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        stops_before = len(fake_systemd["stopped"])
+        with workers._worker_lock(record.name):
+            workers._stop_generation(record)
+        # Full-cgroup teardown goes through the unit — exactly one stop.
+        assert fake_systemd["stopped"][stops_before:] == [record.unit]
+
+    def test_dead_unit_respawns_new_generation(self, tmp_path, fake_systemd, fake_procs):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        fake_procs.discard(first.pid)  # the service died
+        fake_systemd["units"].pop(first.unit, None)
+        second = workers.ensure_worker(str(repo))
+        assert second.generation != first.generation
+        assert second.pid != first.pid
+        assert not second.verified  # routing proof does NOT carry over
+
+
+class TestSystemdOwnershipVerification:
+    def test_systemd_run_command_construction(self):
+        cmd = workers._systemd_run_command(
+            "cursor-worker-w.service",
+            ["/usr/bin/agent", "worker", "start", "--name", "w"],
+            {"CURSOR_DATA_DIR": "/state/data/w", "CURSOR_API_KEY": "cursor-key",
+             "PATH": "/usr/bin", "HOME": "/home/u", "IRRELEVANT": "x"},
+            "/repo",
+            Path("/state/w-gen.log"),
+        )
+        assert cmd[:2] == ["systemd-run", "--user"]
+        assert "--unit=cursor-worker-w.service" in cmd
+        assert "--collect" in cmd
+        assert "--service-type=exec" in cmd
+        assert "--property=KillMode=control-group" in cmd
+        assert f"--property=TimeoutStopSec={workers.STOP_TIMEOUT_S}" in cmd
+        assert "--property=Restart=no" in cmd
+        assert "--property=StandardOutput=append:/state/w-gen.log" in cmd
+        assert "--working-directory=/repo" in cmd
+        assert "--setenv=CURSOR_DATA_DIR=/state/data/w" in cmd
+        assert "--setenv=IRRELEVANT=x" not in cmd  # only the allowlist
+        # The secret NEVER rides in argv (see TestAuthSecrecy).
+        assert not any("cursor-key" in part for part in cmd)
+        # The payload argv rides verbatim after the `--` separator.
+        assert cmd[cmd.index("--"):] == [
+            "--", "/usr/bin/agent", "worker", "start", "--name", "w",
+        ]
+
+    def test_identity_mismatch_fails_closed_without_stopping_foreign_unit(
+        self, tmp_path, fake_systemd
+    ):
+        """A live unit whose InvocationID differs from the persisted
+        generation may belong to ANOTHER generation/controller: it is
+        never adopted AND never stopped — the record turns conflict and
+        the dispatch fails closed for operator/reconciler resolution."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        fake_systemd["units"][first.unit] = {
+            "ActiveState": "active",
+            "MainPID": str(first.pid),        # keep pid: only invocation
+            "InvocationID": "inv-imposter",   # identity differs
+        }
+        stops_before = len(fake_systemd["stopped"])
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "conflict" in str(err.value)
+        assert len(fake_systemd["stopped"]) == stops_before  # NOT stopped
+        retained = workers._read_record(first.name)
+        assert retained is not None
+        assert retained.state == workers.STATE_CONFLICT
+
+    def test_missing_invocation_id_is_not_valid_fencing(
+        self, tmp_path, fake_systemd
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        fake_systemd["units"][first.unit] = {
+            "ActiveState": "active",
+            "MainPID": str(first.pid),
+            "InvocationID": "",               # no identity — no fencing
+        }
+        stops_before = len(fake_systemd["stopped"])
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        assert len(fake_systemd["stopped"]) == stops_before
+
+    def test_stop_path_refuses_active_unit_with_missing_invocation(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        """Missing live InvocationID is UNKNOWN ownership, exactly like a
+        mismatch: the stop path must never issue systemctl stop against
+        an active unit it cannot positively prove it owns."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # our leader died…
+        # …and the active unit exposes NO invocation id (unprovable).
+        fake_systemd["units"][record.unit] = {
+            "ActiveState": "active",
+            "MainPID": "424242",
+            "InvocationID": "",
+        }
+        stops_before = len(fake_systemd["stopped"])
+        with workers._worker_lock(record.name):
+            assert workers._stop_generation(record) is False
+        assert len(fake_systemd["stopped"]) == stops_before  # NOT stopped
+        # The ensure path fails closed the same way: record retained.
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        assert workers._read_record(record.name) is not None
+
+    def test_unverified_stop_fails_closed_and_retains_the_record(
+        self, tmp_path, fake_systemd, fake_procs, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # leader died…
+        # …but the stop CANNOT be verified (cgroup still has members).
+        monkeypatch.setattr(workers, "_systemd_stop", lambda unit: False)
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "confirmed stopped" in str(err.value)
+        retained = workers._read_record(record.name)
+        assert retained is not None          # never an untracked remnant
+        assert retained.state == workers.STATE_DRAINING
+        assert "stop unverified" in retained.last_error
+        assert len(fake_systemd["started"]) == 1  # no duplicate spawn
+
+
+class TestVerifiedStopEvidence:
+    """_unit_stopped succeeds only on POSITIVE inactive/not-found
+    evidence from the real systemctl seam; unknown show output is
+    UNKNOWN, never 'stopped'."""
+
+    @staticmethod
+    def _proc(rc, stdout="", stderr=""):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(returncode=rc, stdout=stdout, stderr=stderr)
+
+    def test_failed_show_is_unknown_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(1, "", "dbus gone"),
+        )
+        assert workers._unit_stopped("cursor-worker-x.service") is False
+
+    def test_positive_evidence_accepts_inactive_and_not_found(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=inactive\nLoadState=loaded\nMainPID=0\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is True
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=inactive\nLoadState=not-found\nMainPID=0\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is True
+
+    def test_active_show_is_not_stopped(self, monkeypatch):
+        monkeypatch.setattr(
+            workers, "_run_systemctl",
+            lambda args, timeout=None: self._proc(
+                0, "ActiveState=active\nLoadState=loaded\nMainPID=42\n"
+            ),
+        )
+        assert workers._unit_stopped("u.service") is False
+
+    def test_systemd_stop_unconfirmed_on_nonzero_stop_and_unknown_show(
+        self, monkeypatch
+    ):
+        def run(args, timeout=None):
+            if "stop" in args:
+                return self._proc(1, "", "Job for u.service failed")
+            if "show" in args:
+                return self._proc(1, "", "Failed to get properties")
+            return self._proc(0)
+
+        monkeypatch.setattr(workers, "_run_systemctl", run)
+        assert workers._systemd_stop("u.service") is False
+
+
+class TestDeadLeaderTeardown:
+    def test_dead_leader_with_surviving_descendants_fails_closed(
+        self, tmp_path, fake_spawn, fake_procs, monkeypatch
+    ):
+        """A dead detached leader whose process GROUP still has members
+        (tmux/MCP children) must go through full teardown; the record is
+        never deleted over live descendants."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)  # leader died…
+        # …but descendants keep the process group alive and unkillable.
+        monkeypatch.setattr(workers, "_kill_detached", lambda record: None)
+        monkeypatch.setattr(workers, "_pgid_empty", lambda pgid: False)
+
+        with pytest.raises(workers.WorkerError):
+            workers.ensure_worker(str(repo))
+        retained = workers._read_record(record.name)
+        assert retained is not None
+        assert retained.state == workers.STATE_DRAINING
+
+    def test_dead_systemd_leader_still_stops_through_the_unit(
+        self, tmp_path, fake_systemd, fake_procs
+    ):
+        """Even with the leader pid gone, the unit's cgroup may hold
+        descendants — cleanup must route through systemctl stop."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        fake_procs.discard(record.pid)
+        stops_before = len(fake_systemd["stopped"])
+        assert workers.reconcile() == [record.name]
+        assert record.unit in fake_systemd["stopped"][stops_before:]
+
+
+class TestReadyReuseRevalidation:
+    def test_disconnected_ready_worker_is_replaced(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(
+            workers, "_probe_management",
+            lambda record: {"status": "not_ready", "connected": False,
+                            "claimed": False},
+        )
+        second = workers.ensure_worker(str(repo))
+        assert second.generation != first.generation  # replaced
+        assert len(fake_spawn) == 2
+
+    def test_claimed_but_connected_worker_is_still_handed_out(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """claimed=true means BUSY, not unhealthy — the claimed-vs-
+        connected distinction must be preserved."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(
+            workers, "_probe_management",
+            lambda record: {"status": "not_ready", "connected": True,
+                            "claimed": True},
+        )
+        second = workers.ensure_worker(str(repo))
+        assert second.generation == first.generation  # reused
+        assert len(fake_spawn) == 1
+
+    def test_unreachable_endpoint_is_not_proven_connected(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """A READY record whose management endpoint is unreachable is
+        NOT proven connected: the dispatch fails with an actionable
+        retry — the worker is kept, never handed out, never killed."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        first = workers.ensure_worker(str(repo))
+        monkeypatch.setattr(workers, "_probe_management", lambda record: None)
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "unreachable" in str(err.value) or "not proven" in str(err.value)
+        retained = workers._read_record(first.name)
+        assert retained is not None
+        assert retained.generation == first.generation  # kept, not killed
+
+    def test_legacy_record_without_endpoint_is_still_adoptable(
+        self, tmp_path, fake_procs, monkeypatch
+    ):
+        """Legacy generation-0 records predate the management endpoint:
+        adoption stands on process liveness (the migration promise)."""
+        monkeypatch.setattr(workers, "_probe_management", lambda record: None)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        name = workers.worker_name_for(str(repo))
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{name}.json").write_text(json.dumps({
+            "name": name, "repo_path": os.path.realpath(str(repo)),
+            "pid": 8899, "log_path": str(directory / f"{name}.log"),
+            "started_at": 1000.0, "verified": True,
+        }))
+        fake_procs.add(8899)
+        record = workers.ensure_worker(str(repo))
+        assert record.pid == 8899
+        assert record.supervision == "legacy"
+
+
+class TestDegradedFallback:
+    def test_no_user_systemd_falls_back_to_detached_and_says_so(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert record.supervision == "detached"
+        assert record.unit == ""
+        # Isolation still applies on the degraded path.
+        assert record.data_dir
+        assert record.management_addr
+
+
+class TestAtomicEnsureAndLease:
+    def test_ensure_with_lease_id_installs_the_lease_atomically(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(
+            str(repo), lease_id="run-1", lease_session="sess-a"
+        )
+        assert "run-1" in record.leases
+        persisted = workers._read_record(record.name)
+        assert "run-1" in persisted.leases
+        assert persisted.leases["run-1"]["session"] == "sess-a"
+        assert persisted.leases["run-1"]["holder_pid"] == os.getpid()
+        assert persisted.leases["run-1"]["agent_id"] == ""  # not yet bound
+
+    def test_bind_lease_attaches_remote_identity(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-2")
+        assert workers.bind_lease(record.name, "run-2", "agent-9", "r-9")
+        lease = workers._read_record(record.name).leases["run-2"]
+        assert lease["agent_id"] == "agent-9"
+        assert lease["run_id"] == "r-9"
+
+    def test_bind_lease_is_authoritative_about_failure(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-3")
+        assert workers.bind_lease(record.name, "run-GONE", "a", "r") is False
+        assert workers.bind_lease("no-such-worker", "run-3", "a", "r") is False
+
+    def test_release_settles_dead_holder_siblings_of_the_same_agent(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """Runs on ONE agent are sequential: this run's observed terminal
+        is terminal proof for every EARLIER run of the same agent. A
+        bound lease left by a crashed gateway is settled when a later
+        run on the same agent releases — but a sibling with a LIVE
+        holder (still executing) is untouched."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-old")
+        assert workers.bind_lease(record.name, "run-old", "agent-X", "r-1")
+        assert workers.acquire_lease(record.name, "run-live", session="s")
+        assert workers.bind_lease(record.name, "run-live", "agent-X", "r-2")
+        assert workers.acquire_lease(record.name, "run-new", session="s")
+        assert workers.bind_lease(record.name, "run-new", "agent-X", "r-3")
+        # run-old's holder died (crashed gateway); run-live's holder lives.
+        dead = {"run-old"}
+        monkeypatch.setattr(
+            workers, "_holder_alive",
+            lambda lease: lease.get("session_marker") not in dead,
+        )
+        with workers._worker_lock(record.name):
+            current = workers._read_record(record.name)
+            leases = dict(current.leases)
+            for key in leases:
+                leases[key] = {**leases[key], "session_marker": key}
+            workers._update_record_locked(
+                record.name, current.generation, leases=leases
+            )
+
+        workers.release_lease(record.name, "run-new", agent_id="agent-X")
+        remaining = set(workers._read_record(record.name).leases)
+        assert remaining == {"run-live"}  # stale settled, live retained
+
+
+class TestLeasesAndReaping:
+    def _age(self, name, seconds):
+        with workers._worker_lock(name):
+            record = workers._read_record(name)
+            workers._update_record_locked(
+                name, record.generation,
+                last_active_at=time.time() - seconds,
+            )
+
+    def test_idle_leaseless_worker_is_reaped_after_ttl(
+        self, tmp_path, fake_spawn, fake_procs
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        self._age(record.name, workers.IDLE_TTL_S + 60)
+        assert workers.reconcile() == [record.name]
+        assert workers._read_record(record.name) is None
+        assert record.pid not in fake_procs  # actually stopped
+
+    def test_recent_leaseless_worker_is_not_reaped(
+        self, tmp_path, fake_spawn
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo))
+        assert workers.reconcile() == []
+        assert workers._read_record(record.name) is not None
+
+    def test_bound_lease_shields_from_ttl_even_with_dead_holder(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """The governing invariant: a lease BOUND to agent/run identity
+        NEVER expires because the gateway pid died — the run lives
+        server-side and only observed terminal proof releases it."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-b")
+        assert workers.bind_lease(record.name, "run-b", "agent-1", "r-1")
+        monkeypatch.setattr(workers, "_holder_alive", lambda lease: False)
+        self._age(record.name, workers.IDLE_TTL_S + 3600)
+        assert workers.reconcile() == []
+        persisted = workers._read_record(record.name)
+        assert persisted is not None
+        assert "run-b" in persisted.leases  # conservatively retained
+
+    def test_unbound_lease_expires_after_dead_holder_grace(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-u")
+        monkeypatch.setattr(workers, "_holder_alive", lambda lease: False)
+        # Within the grace window the unbound lease still protects.
+        assert workers.reconcile() == []
+        # Push acquisition + activity past the stale grace AND the TTL.
+        with workers._worker_lock(record.name):
+            current = workers._read_record(record.name)
+            aged = {
+                key: {**lease, "acquired_at": time.time()
+                      - workers.LEASE_STALE_GRACE_S - 30}
+                for key, lease in current.leases.items()
+            }
+            workers._update_record_locked(
+                record.name, current.generation,
+                leases=aged,
+                last_active_at=time.time() - workers.IDLE_TTL_S - 60,
+            )
+        assert workers.reconcile() == [record.name]
+
+    def test_unbound_lease_with_live_holder_expires_after_max_age(
+        self, tmp_path, fake_spawn
+    ):
+        """A live gateway that acquired but never bound within the
+        window has failed or lost the create: the transitional lease
+        must not pin the worker forever."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-t")
+        now = time.time()
+        lease = workers._read_record(record.name).leases["run-t"]
+        assert workers._lease_fresh(lease, now) is True
+        assert workers._lease_fresh(
+            {**lease, "acquired_at": now - workers.UNBOUND_LEASE_MAX_AGE_S - 5},
+            now,
+        ) is False
+
+    def test_release_bumps_the_idle_clock(self, tmp_path, fake_spawn):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        record = workers.ensure_worker(str(repo), lease_id="run-r")
+        self._age(record.name, workers.IDLE_TTL_S + 60)
+        workers.release_lease(record.name, "run-r")
+        # Just-released -> full TTL of idle patience again.
+        assert workers.reconcile() == []
+        assert workers._read_record(record.name) is not None
+
+
+class TestLazyReconcileHook:
+    def test_ensure_reaps_idle_workers_before_capacity_evaluation(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        """The lazy-cleanup guarantee: with NO timer, the next dispatch
+        itself must clean positively-owned idle/leaseless workers before
+        capacity is evaluated — an idle-past-TTL worker never costs a
+        fresh dispatch its slot."""
+        monkeypatch.setattr(workers, "_max_workers", lambda: 1)
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a))
+        with workers._worker_lock(rec_a.name):
+            workers._update_record_locked(
+                rec_a.name, rec_a.generation,
+                last_active_at=time.time() - workers.IDLE_TTL_S - 60,
+            )
+        rec_b = workers.ensure_worker(str(repo_b), lease_id="run-n")
+        assert rec_b.name != rec_a.name
+        assert workers._read_record(rec_a.name) is None  # lazily reaped
+
+
+class TestCapacity:
+    def test_at_cap_reclaims_least_recently_active_leaseless_worker(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        monkeypatch.setattr(workers, "_max_workers", lambda: 2)
+        repos = []
+        for key in ("a", "b", "c"):
+            repo = tmp_path / key
+            repo.mkdir()
+            repos.append(repo)
+        rec_a = workers.ensure_worker(str(repos[0]))
+        rec_b = workers.ensure_worker(str(repos[1]))
+        # Make A the least recently active (but NOT idle-past-TTL: this
+        # is capacity pressure, not the TTL reaper).
+        with workers._worker_lock(rec_a.name):
+            workers._update_record_locked(
+                rec_a.name, rec_a.generation,
+                last_active_at=time.time() - 120,
+            )
+        rec_c = workers.ensure_worker(str(repos[2]))
+        assert workers._read_record(rec_a.name) is None      # reclaimed
+        assert workers._read_record(rec_b.name) is not None  # kept
+        assert workers._read_record(rec_c.name) is not None
+
+    def test_at_cap_with_all_slots_leased_fails_honestly(
+        self, tmp_path, fake_spawn, monkeypatch
+    ):
+        # Config-driven cap (exercises the _plugin_config -> _max_workers
+        # parsing path rather than patching _max_workers directly).
+        monkeypatch.setattr(
+            workers, "_plugin_config",
+            lambda key: 1 if key == "max_workers" else None,
+        )
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        rec_a = workers.ensure_worker(str(repo_a), lease_id="run-hold")
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo_b), lease_id="run-want")
+        message = str(err.value)
+        assert "capacity" in message
+        assert rec_a.name in message           # names the busy worker
+        assert "max_workers" in message        # actionable remedy
+        assert workers._read_record(rec_a.name) is not None
+
+    def test_max_workers_rejects_junk_config(self, monkeypatch):
+        for junk in ("lots", float("inf"), float("nan"), 0, -3, None):
+            monkeypatch.setattr(
+                workers, "_plugin_config", lambda key, junk=junk: junk
+            )
+            assert workers._max_workers() == 10
+
+
+class TestCanonicalAliasAdoption:
+    """Migration from pre-canonical naming: a live worker recorded under
+    a SUBDIRECTORY-derived name must be adopted for the canonical
+    worktree — never duplicated, never killed. Multiple live candidates
+    for one canonical checkout fail closed."""
+
+    def _alias_record(self, repo, alias_name, pid, fake_procs):
+        directory = workers.state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{alias_name}.json").write_text(json.dumps({
+            "name": alias_name,
+            "repo_path": os.path.realpath(str(repo)),  # canonical target
+            "pid": pid,
+            "log_path": str(directory / f"{alias_name}.log"),
+            "started_at": 1000.0,
+            "verified": True,
+        }))
+        fake_procs.add(pid)
+
+    def test_live_subdir_named_worker_is_adopted_not_duplicated(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = _make_repo(tmp_path / "repo")
+        sub = repo / "src"
+        sub.mkdir()
+        # Old naming keyed the SUBDIR the user happened to dispatch from.
+        alias = _raw_name(str(sub))
+        assert alias != workers.worker_name_for(str(repo))
+        self._alias_record(repo, alias, 8611, fake_procs)
+
+        record = workers.ensure_worker(str(sub), lease_id="run-m")
+        assert record.pid == 8611          # the live alias was adopted
+        assert record.name == alias        # registered name preserved
+        assert len(fake_spawn) == 0        # never duplicated
+        assert "run-m" in record.leases    # lease installed atomically
+
+    def test_two_live_candidates_for_one_checkout_fail_closed(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = _make_repo(tmp_path / "repo")
+        sub_a, sub_b = repo / "a", repo / "b"
+        sub_a.mkdir(), sub_b.mkdir()
+        alias_a = _raw_name(str(sub_a))
+        alias_b = _raw_name(str(sub_b))
+        self._alias_record(repo, alias_a, 8612, fake_procs)
+        self._alias_record(repo, alias_b, 8613, fake_procs)
+
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        message = str(err.value).lower()
+        assert "conflict" in message or "multiple" in message
+        assert len(fake_spawn) == 0                    # no spawn
+        assert 8612 in fake_procs and 8613 in fake_procs  # nothing killed
+
+    def test_dead_alias_does_not_block_canonical_spawn(
+        self, tmp_path, fake_procs, fake_spawn
+    ):
+        repo = _make_repo(tmp_path / "repo")
+        sub = repo / "src"
+        sub.mkdir()
+        alias = _raw_name(str(sub))
+        self._alias_record(repo, alias, 8614, fake_procs)
+        fake_procs.discard(8614)  # the alias worker is dead
+
+        record = workers.ensure_worker(str(repo))
+        assert record.name == workers.worker_name_for(str(repo))
+        assert len(fake_spawn) == 1  # fresh canonical spawn
+
+
+def _mp_ensure_child(repo, xdg, alive_dir, spawn_log, cap, barrier, result_q):
+    """Child body for the REAL multi-process admission tests (fork start
+    method: the plugin module is inherited; seams are re-pointed at
+    filesystem-backed fakes shared by every process)."""
+    import time as _time
+
+    os.environ["XDG_STATE_HOME"] = xdg
+    workers._migrated_dirs.clear()
+    workers.READY_TIMEOUT_S = 10.0
+    workers._READY_POLL_S = 0.01
+    workers._systemd_available = lambda: False
+    workers._probe_management = lambda record: (
+        {"status": "ok", "connected": True, "claimed": False}
+        if record.state == workers.STATE_READY
+        else None
+    )
+    workers._pid_alive = (
+        lambda pid: (Path(alive_dir) / str(int(pid))).exists()
+    )
+    workers._kill_detached = lambda record: (
+        (Path(alive_dir) / str(int(record.pid))).unlink(missing_ok=True)
+    )
+    workers._pgid_empty = (
+        lambda pgid: not (Path(alive_dir) / str(int(pgid))).exists()
+    )
+    workers._max_workers = lambda: int(cap)
+
+    def spawn(name, repo_path, log_path, **kw):
+        _time.sleep(0.3)  # hold the locks long enough for a real race
+        with open(spawn_log, "a") as fh:
+            fh.write(f"{name}\n")
+        with open(spawn_log) as fh:
+            pid = 50000 + sum(1 for _ in fh)
+        (Path(alive_dir) / str(pid)).touch()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as fh:
+            fh.write(f"registering...\n{workers.READY_LINE}\n")
+        return pid
+
+    workers._spawn_worker = spawn
+    barrier.wait(timeout=10)  # both processes race the SAME instant
+    try:
+        record = workers.ensure_worker(str(repo), lease_id=f"run-{os.getpid()}")
+        result_q.put(("ok", record.pid, record.generation))
+    except workers.WorkerError as exc:
+        result_q.put(("err", str(exc), ""))
+
+
+class TestMultiProcessAdmission:
+    """Cross-PROCESS admission: flock + the machine-global admission lock
+    must hold between real interpreters, not just threads."""
+
+    def _run_children(self, tmp_path, repos, cap):
+        import multiprocessing
+
+        ctx = multiprocessing.get_context("fork")
+        alive_dir = tmp_path / "alive"
+        alive_dir.mkdir()
+        spawn_log = tmp_path / "spawns.log"
+        spawn_log.touch()
+        barrier = ctx.Barrier(len(repos))
+        result_q = ctx.Queue()
+        children = [
+            ctx.Process(
+                target=_mp_ensure_child,
+                args=(
+                    str(repo), os.environ["XDG_STATE_HOME"], str(alive_dir),
+                    str(spawn_log), cap, barrier, result_q,
+                ),
+            )
+            for repo in repos
+        ]
+        for child in children:
+            child.start()
+        for child in children:
+            child.join(timeout=30)
+            assert child.exitcode == 0
+        results = [result_q.get(timeout=5) for _ in repos]
+        spawns = spawn_log.read_text().splitlines()
+        return results, spawns
+
+    def test_two_processes_same_worktree_spawn_exactly_one_generation(
+        self, tmp_path
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        results, spawns = self._run_children(tmp_path, [repo, repo], cap=10)
+        assert len(spawns) == 1, "exactly one spawn may win the flock"
+        oks = [r for r in results if r[0] == "ok"]
+        assert len(oks) == 2, f"both processes must get the worker: {results}"
+        assert len({(pid, gen) for _, pid, gen in oks}) == 1, (
+            "both processes must see ONE generation"
+        )
+
+    def test_two_processes_distinct_worktrees_respect_the_global_cap(
+        self, tmp_path
+    ):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir(), repo_b.mkdir()
+        results, spawns = self._run_children(
+            tmp_path, [repo_a, repo_b], cap=1
+        )
+        assert len(spawns) == 1, "the admission lock must gate BOTH processes"
+        oks = [r for r in results if r[0] == "ok"]
+        errs = [r for r in results if r[0] == "err"]
+        assert len(oks) == 1 and len(errs) == 1, results
+        assert "capacity" in errs[0][1]
 
 
 class TestUnroutableHint:
