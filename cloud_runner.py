@@ -1029,12 +1029,14 @@ class _CloudWorker:
 
         # Settle: the result event + a final GET as the authority (the
         # simplified SSE status events lie about cancelled runs).
-        status = _lower_status(self._final_status(client)) or _lower_status(
+        authoritative_status = _lower_status(self._final_status(client))
+        status = authoritative_status or _lower_status(
             (result_data or {}).get("status")
         )
-        if status in ("finished", "cancelled", "expired", "error"):
-            # Remote-emitted terminal state (GET authority or the run's
-            # own result event) — the lease may be released.
+        if authoritative_status in ("finished", "cancelled", "expired", "error"):
+            # ONLY the GET authority proves the remote terminal state: a
+            # replayed SSE result can lie (FINISHED on a cancelled run),
+            # so the display fallback below never releases the lease.
             self._remote_terminal_observed = True
         self._settled = True
         if self.abort_reason == "timeout":

@@ -5527,6 +5527,40 @@ class TestWorkerLeasePlumbing:
         # agent id so same-agent stale leases are settled too.
         assert releases == [("test-worker", lease_id, "bc-fake-1")]
 
+    def test_sse_finished_with_get_unavailable_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """SSE result FINISHED is NOT authoritative (a cancelled run's
+        replay can say FINISHED). With the settle GET unavailable, the
+        user-facing result may keep origin/main's display fallback —
+        but no remote terminal was OBSERVED, so the bound lease must
+        survive the executor's exit."""
+        client = _FakeRestClient()
+
+        def get_down(agent_id, run_id):
+            raise gc_rest.RestNetworkError("api unreachable at settle")
+
+        client.get_run = get_down
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        # origin/main display semantics preserved: the SSE result still
+        # settles the user-facing run status.
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+        assert len(binds) == 1     # the run WAS protected
+        assert releases == []      # …and stays protected (safe leak)
+
+    def test_sse_finished_with_nonterminal_get_keeps_the_lease(
+        self, tmp_path, monkeypatch
+    ):
+        """The GET authority says RUNNING while the (lying) SSE replay
+        said FINISHED: nothing terminal was observed — retain."""
+        client = _FakeRestClient(statuses=("RUNNING",))
+        _, binds, releases = self._install_leased(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert events[-1][0] == "cloud.error"  # authority wins the display
+        assert len(binds) == 1
+        assert releases == []
+
     def test_unconfirmed_executor_exit_retains_the_lease(
         self, tmp_path, monkeypatch
     ):
