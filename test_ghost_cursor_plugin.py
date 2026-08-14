@@ -413,7 +413,9 @@ class TestFirstSendRun:
         assert len(events) == 1
         evt = events[0]
         assert evt["type"] == "async_delegation"
-        assert evt["delegation_id"] == job.session_name
+        # Per-run identity — the fake session carries no run_id, so the
+        # id falls back to this job's stable job_id.
+        assert evt["delegation_id"] == f"{job.session_name}#job-{job.job_id}"
         assert evt["session_key"] == "gw:test:1"  # routes back to the caller
         assert evt["status"] == "completed"
         assert evt["cursor_session_id"] == "s-done"
@@ -807,7 +809,9 @@ class TestCursorSendMessage:
         events = _drain_completion_queue()
         assert len(events) == 1
         assert events[0]["result"]["session_id"] == "s-send"
-        assert events[0]["delegation_id"] == name
+        assert events[0]["delegation_id"] == (
+            f"{name}#job-{second_job.job_id}"
+        )
 
     def test_send_after_run_settled_is_a_plain_followup(
         self, clean_state, monkeypatch, tmp_path
@@ -2111,7 +2115,7 @@ class TestProgressSubscriptions:
         completions = _completion_events(collected)
         assert len(completions) == 1
         assert completions[0]["status"] == "completed"
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#job-{job.job_id}"
         assert len(_digest_events(collected)) >= 2
 
     def test_interrupt_and_reprompt_carries_subscription_and_numbering(
@@ -2831,10 +2835,13 @@ class TestMultiSubscriberDelivery:
         by_key = {c["session_key"]: c for c in completions}
         assert set(by_key) == {"gw:alice", "gw:bob"}
         # Distinct delegation_ids (TUI dedup): the dispatcher keeps the
-        # plain session name, other subscribers get the hash suffix.
-        assert by_key["gw:alice"]["delegation_id"] == name
+        # per-run base id, other subscribers get the hash suffix AFTER it.
+        assert by_key["gw:alice"]["delegation_id"] == (
+            f"{name}#job-{job.job_id}"
+        )
         assert by_key["gw:bob"]["delegation_id"] == (
-            f"{name}@{gc_progress.subscriber_suffix('gw:bob')}"
+            f"{name}#job-{job.job_id}"
+            f"@{gc_progress.subscriber_suffix('gw:bob')}"
         )
         # Identical payloads apart from routing.
         assert by_key["gw:alice"]["status"] == "completed"
@@ -2905,7 +2912,7 @@ class TestMultiSubscriberDelivery:
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         assert completions[0]["session_key"] == ""
-        assert completions[0]["delegation_id"] == name
+        assert completions[0]["delegation_id"] == f"{name}#job-{job.job_id}"
 
     # -- legacy scalar migration ---------------------------------------------
 
@@ -6670,6 +6677,144 @@ def _wait_settled(name, status, timeout=10.0):
     )
 
 
+class TestCompletionIdentity:
+    """The gateway dedupes async_delegation events by (delegation_id,
+    type). With the plain session name as the id, the FIRST run's
+    terminal delivery consumed the id forever and every later follow-up
+    completion in the same named session was silently suppressed
+    (verified live at e0dc27d). Terminal identity is per-RUN:
+    ``<session>#run-<run_id>`` when the remote run is known — stable for
+    retries/replay of the SAME run, distinct across runs — with
+    deterministic attempt/job fallbacks. Display fields keep the plain
+    session name."""
+
+    def test_followup_completion_gets_a_distinct_per_run_id(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        def replay1(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {"agentId": "s-fu", "cwd": str(workdir),
+                                     "model": "m", "run_id": "run-1"})
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay1)
+        _start_run("t", repo=str(tmp_path))
+        job1 = _job_for("s-fu")
+        assert job1.done_event.wait(10)
+        name = job1.session_name
+        first = _completion_events(_drain_completion_queue())
+        assert len(first) == 1
+
+        def replay2(task, workdir, cancel_check=None, agent_id=None, **kw):
+            yield ("cloud.session", {"agentId": "s-fu", "cwd": str(workdir),
+                                     "model": "m", "resumed": True,
+                                     "run_id": "run-2"})
+            yield ("cloud.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay2)
+        cursor_send_message(name, "again")
+        job2 = gc_jobs.registry.get_by_name(name)
+        assert job2 is not job1
+        assert job2.done_event.wait(10)
+        second = _completion_events(_drain_completion_queue())
+        assert len(second) == 1  # the follow-up's terminal turn ARRIVES
+
+        # Distinct per-run ids; display session unchanged.
+        assert first[0]["delegation_id"] == f"{name}#run-run-1"
+        assert second[0]["delegation_id"] == f"{name}#run-run-2"
+        assert second[0]["result"]["session"] == name
+        assert f"cursor_send_message('{name}'" in second[0]["summary"]
+
+    def test_reattached_followup_completion_gets_a_distinct_per_run_id(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-fu", run="run-1")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-1"
+        )
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        first = _completion_events(_drain_completion_queue())
+        assert len(first) == 1
+        assert first[0]["delegation_id"] == f"{name}#run-run-1"
+
+        # A follow-up re-prompted the session; that gateway died too and
+        # the NEXT reconcile pass settles run-2 the same way.
+        gc_handles.record(name, status="running", latest_run_id="run-2")
+        gc_handles.record_supervision(
+            name, phase="streaming", current_attempt_id="att-2", attempt_n=2
+        )
+        client2 = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-2"
+        )
+        _install_supervisor_client(monkeypatch, client2)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        second = _completion_events(_drain_completion_queue())
+        assert len(second) == 1
+        assert second[0]["delegation_id"] == f"{name}#run-run-2"
+
+    def test_replaying_the_same_run_delivery_keeps_ids_stable(
+        self, clean_state, monkeypatch
+    ):
+        """Same run replayed => same ids (gateway dedupe still prevents
+        duplicates); a follow-up run changes them; the subscriber suffix
+        rides AFTER the run identity."""
+        name = _seed_reattachable(name="lost-replay", run="run-7")
+        gc_handles.set_subscriber(name, "gw:bob", 3600.0)
+        sup = gc_supervisor.SessionSupervisor(name)
+        sup._run_id = "run-7"
+        sup._deliver_completion("completed", "", [])
+        sup._deliver_completion("completed", "", [])
+        replayed = _completion_events(_drain_completion_queue())
+        ids = [e["delegation_id"] for e in replayed]
+        assert len(ids) == 4
+        assert sorted(ids[:2]) == sorted(ids[2:])   # replay-stable
+        assert f"{name}#run-run-7" in ids
+        suffix = gc_progress.subscriber_suffix("gw:bob")
+        assert f"{name}#run-run-7@{suffix}" in ids  # suffix AFTER run id
+
+        sup._run_id = "run-8"
+        sup._deliver_completion("completed", "", [])
+        followup = _completion_events(_drain_completion_queue())
+        new_ids = {e["delegation_id"] for e in followup}
+        assert new_ids == {
+            f"{name}#run-run-8", f"{name}#run-run-8@{suffix}",
+        }
+        assert new_ids.isdisjoint(set(ids))
+
+    def test_pre_agent_failure_falls_back_to_the_job_identity(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """No cloud.session ever arrived (preflight died after the run
+        was armed): no run identity exists — the id falls back to the
+        stable job id, never a timestamp/random-at-delivery. Exercised
+        at the jobs layer: the public send path reports in-window
+        pre-agent failures in-turn by design."""
+        release = threading.Event()
+
+        def failing_replay(task, workdir, cancel_check=None,
+                           agent_id=None, **kw):
+            assert release.wait(10)
+            raise gc_cloud.CloudRunnerError("worker preflight failed")
+            yield  # pragma: no cover — generator shape
+
+        monkeypatch.setattr(gc_cloud, "run_cloud", failing_replay)
+        job, _ = gc_jobs.registry.dispatch(
+            runner=gc._execute_cursor_run,
+            task="t", repo=str(tmp_path),
+            inactivity_timeout_s=30.0, max_wall_s=60.0,
+            session_name="Prefail", session_key="",
+        )
+        job.arm_delivery()  # armed BEFORE the failure lands
+        release.set()
+        assert job.done_event.wait(10)
+        assert job.latest_run_id == ""  # no run identity ever existed
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["delegation_id"] == f"Prefail#job-{job.job_id}"
+
+
 def _seed_leased_worker(name="host-w1", agent="bc-lost", run="run-9",
                         lease_id="run-9", bound=True):
     """A persisted worker record shaped like the live restart leak: the
@@ -6935,7 +7080,7 @@ class TestSupervisorReattach:
         evt = completions[0]
         assert evt["status"] == "completed"
         assert evt["session_key"] == ""
-        assert evt["delegation_id"] == name
+        assert evt["delegation_id"] == f"{name}#run-run-9"  # per-run id
         assert "all done" in evt["summary"]
 
     def test_replayed_finished_never_beats_the_gets_cancelled(
@@ -6988,8 +7133,10 @@ class TestSupervisorReattach:
         assert len(completions) == 2
         by_key = {e["session_key"]: e for e in completions}
         assert set(by_key) == {"", "alice"}
-        assert by_key[""]["delegation_id"] == name
-        assert by_key["alice"]["delegation_id"] != name  # suffixed copy
+        assert by_key[""]["delegation_id"] == f"{name}#run-run-9"
+        assert by_key["alice"]["delegation_id"].startswith(
+            f"{name}#run-run-9@"
+        )  # suffixed copy, suffix AFTER the run identity
 
         # A second reconcile pass finds nothing live: settled is settled.
         assert gc_supervisor.reconcile_once() == []

@@ -905,6 +905,13 @@ def _run_attempt(
                     job.model = str(obj.get("model") or "")
                     job.worker = str(obj.get("worker") or "")
                     job.agents_ui_url = str(obj.get("agents_ui_url") or "")
+                    # THIS job's run identity (completion delivery id) —
+                    # a retry attempt on the same job overwrites it; a
+                    # LATER run in the session never can (immutable per
+                    # job, unlike the handle's latest_run_id).
+                    job.latest_run_id = (
+                        str(obj.get("run_id") or "") or job.latest_run_id
+                    )
                 # Supervision phase: the agent exists and events flow
                 # (RFC §1 — the durable record a reconciler re-attaches to).
                 _supervisor.mark_streaming(job.session_name or sid)
