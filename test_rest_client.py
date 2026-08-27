@@ -201,6 +201,12 @@ class TestRestClientRequests:
                 model_id="claude-fable-5",
                 env={"type": "machine", "name": "w1"},
                 repos=[{"url": "https://github.com/o/r", "startingRef": "main"}],
+                mcp_servers=[{
+                    "name": "paper",
+                    "type": "stdio",
+                    "command": "/usr/bin/python",
+                    "args": ["/plugin/proxy.py", "http://127.0.0.1:29979/mcp"],
+                }],
                 work_on_current_branch=True,
                 name="my session",
             )
@@ -211,6 +217,12 @@ class TestRestClientRequests:
             "model": {"id": "claude-fable-5"},
             "env": {"type": "machine", "name": "w1"},
             "repos": [{"url": "https://github.com/o/r", "startingRef": "main"}],
+            "mcpServers": [{
+                "name": "paper",
+                "type": "stdio",
+                "command": "/usr/bin/python",
+                "args": ["/plugin/proxy.py", "http://127.0.0.1:29979/mcp"],
+            }],
             "workOnCurrentBranch": True,
             "name": "my session",
         }
@@ -224,7 +236,7 @@ class TestRestClientRequests:
             return httpx.Response(201, json={"agent": {}, "run": {}})
 
         with _client_with(handler) as client:
-            client.create_agent("task only")
+            client.create_agent("task only", mcp_servers=[])
         assert seen["body"] == {"prompt": {"text": "task only"}}
 
     def test_followup_posts_runs(self):

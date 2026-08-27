@@ -393,6 +393,7 @@ class CursorRestClient:
         model_params: Optional[List[Dict[str, str]]] = None,
         env: Optional[Dict[str, str]] = None,
         repos: Optional[List[Dict[str, str]]] = None,
+        mcp_servers: Optional[List[Dict[str, Any]]] = None,
         work_on_current_branch: Optional[bool] = None,
         name: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -416,6 +417,7 @@ class CursorRestClient:
             ),
             **({"env": env} if env else {}),
             **({"repos": repos} if repos is not None else {}),
+            **({"mcpServers": mcp_servers} if mcp_servers else {}),
             **(
                 {"workOnCurrentBranch": bool(work_on_current_branch)}
                 if work_on_current_branch is not None
