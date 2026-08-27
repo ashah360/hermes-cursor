@@ -146,9 +146,21 @@ plugins:
     max_wall_s: 0              # total run limit; 0 disables
     max_workers: 10            # local worker capacity
     worker_idle_ttl_s: 1800    # local worker idle lifetime in seconds
+    local_mcp_servers:          # optional, runtime="local" only
+      paper:
+        url: http://127.0.0.1:29979/mcp
 ```
 
 A tool argument overrides the configured default for that run.
+
+`local_mcp_servers` exposes host-local Streamable HTTP MCP endpoints to new
+local-worker sessions through a bundled stdio proxy. Each mapping key becomes
+the MCP server name. Servers are attached only when a fresh
+`runtime="local"` agent is created; hosted agents never receive them, and
+follow-ups retain the original agent configuration. This is an explicit
+host-local integration point, not Paper-specific behavior. This initial
+configuration supports only an unauthenticated `http` or `https` URL (no
+headers or secrets).
 
 Progress updates default to every 180 seconds. Ask Hermes for a different interval, pass `update_interval_s` with the task, or use `cursor_subscribe`. Setting the interval to `0` stops progress updates for that Hermes conversation but does not disable the final result.
 

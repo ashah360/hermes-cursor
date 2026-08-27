@@ -66,6 +66,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
+from . import local_mcp as _local_mcp
 from . import workers as _workers
 from .events import unified_diff_text
 from .rest_client import (
@@ -762,6 +763,11 @@ class _CloudWorker:
             model_params=model_params_of(self._model),
             env=env,
             repos=repos,
+            mcp_servers=(
+                _local_mcp.configured_servers()
+                if self._runtime == "local"
+                else None
+            ),
             # Local runtime works IN the local checkout: commits belong on
             # the branch that is actually checked out, not an auto branch.
             work_on_current_branch=True if self._runtime == "local" else None,

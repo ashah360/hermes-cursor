@@ -4828,11 +4828,12 @@ class _FakeRestClient:
 
     def create_agent(self, prompt_text, *, model_id=None, model_params=None,
                      env=None, repos=None, work_on_current_branch=None,
-                     name=None):
+                     name=None, mcp_servers=None):
         self.create_calls.append({
             "prompt": prompt_text, "model_id": model_id,
             "model_params": model_params, "env": env, "repos": repos,
             "work_on_current_branch": work_on_current_branch, "name": name,
+            "mcp_servers": mcp_servers,
         })
         if self.create_error is not None:
             err, self.create_error = self.create_error, None
@@ -4992,6 +4993,7 @@ class TestCloudRunner:
         assert call["repos"] == [{
             "url": "https://github.com/example/repo", "startingRef": "main",
         }]
+        assert call["mcp_servers"] == []
         # Settle authority: the final GET confirmed FINISHED.
         assert client.get_run_calls >= 1
 
@@ -5087,6 +5089,11 @@ class TestCloudRunner:
         client = _FakeRestClient()
         _install_fake_rest(monkeypatch, client)
         monkeypatch.setattr(
+            gc_cloud._local_mcp,
+            "configured_servers",
+            lambda: pytest.fail("cloud runtime must not read local MCP config"),
+        )
+        monkeypatch.setattr(
             gc_workers, "ensure_worker",
             lambda repo, **kw: pytest.fail(
                 "cloud runtime must not touch workers"
@@ -5097,6 +5104,26 @@ class TestCloudRunner:
         call = client.create_calls[0]
         assert call["env"] is None
         assert call["work_on_current_branch"] is None
+        assert call["mcp_servers"] is None
+
+    def test_local_runtime_includes_configured_mcp_servers(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        expected = [{
+            "name": "paper",
+            "type": "stdio",
+            "command": "/usr/bin/python",
+            "args": ["/plugin/mcp_http_proxy.py", "http://127.0.0.1:29979/mcp"],
+        }]
+        monkeypatch.setattr(
+            gc_cloud._local_mcp, "configured_servers", lambda: expected
+        )
+
+        _run_cloud_events(tmp_path, runtime="local")
+
+        assert client.create_calls[0]["mcp_servers"] == expected
 
     def test_cloud_runtime_accepts_a_github_url_directly(
         self, tmp_path, monkeypatch
