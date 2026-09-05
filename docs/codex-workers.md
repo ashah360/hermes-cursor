@@ -46,7 +46,7 @@ worker behavior. Full authoritative scope: the plan in
   pid + birth). Cursor cloud VMs have no local worktree and are never
   blocked.
 - **Approvals.** Threads start with `approvalPolicy: "never"` and
-  `sandbox: workspaceWrite` (explicit, persisted on the session). Any
+  `sandbox: "workspace-write"` (thread/start config mode; `sandboxPolicy.type: workspaceWrite` on turn/start — both verified against codex-cli 0.153.4), explicit and persisted on the session. Any
   server-initiated approval/input request that still arrives is declined
   and recorded as a lifecycle event; the turn fails clearly instead of
   hanging. Interactive approvals are a documented v1 limit.
@@ -76,3 +76,29 @@ worker behavior. Full authoritative scope: the plan in
 - Without user systemd the controller runs detached and status says so.
 - Live model acceptance requires an authenticated Codex install; see the
   test log in the PR for what was verified.
+
+## Live protocol evidence (codex-cli 0.153.4, scratch install, no credentials)
+
+Run on the worker host against `/tmp/codex-dev/node_modules/.bin/codex` with an
+empty `CODEX_HOME`, through `codex_protocol.AppServer`:
+
+- `initialize` -> `userAgent: hermes_cursor_codex/0.153.4 (...)`, `codexHome`
+  honored, `platformFamily: unix`.
+- `model/list` (includeHidden) -> 11 models; exact id `gpt-6-astra` present
+  (efforts low, medium, high, xhigh, max, ultra; default low).
+  `resolve_model(catalog, "gpt-6-astra", None)` resolves without substitution.
+- `account/read` -> `{"account": null, "requiresOpenaiAuth": true}`: not
+  authenticated. **Live model gate is BLOCKED on auth**, not on protocol.
+- `thread/start` with `sandbox: "workspaceWrite"` -> `-32600 unknown variant`;
+  with `sandbox: "workspace-write"` -> thread created (`historyMode: paginated`,
+  `model: gpt-6-astra`). Controller fixed accordingly.
+- `turn/start` accepted (turn id, `status: inProgress`); notifications
+  `thread/started`, `thread/status/changed`, `turn/started`, `item/started`
+  (userMessage), then `error` notifications with
+  `codexErrorInfo.responseStreamDisconnected.httpStatusCode = 401`
+  ("Missing bearer or basic authentication").
+- `thread/resume` of that thread from a NEW app-server process -> ok;
+  `turn/start` on the resumed thread -> ok.
+- `turn/steer` with a wrong `expectedTurnId` -> `-32600 expected active turn
+  id ... but found ...` (exact mismatch reporting).
+- `turn/interrupt` -> `{}` then `turn/completed` with `status: interrupted`.

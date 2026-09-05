@@ -58,7 +58,12 @@ _SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 TERMINAL = ("completed", "failed", "cancelled")
 
-DEFAULT_SANDBOX = "workspaceWrite"
+# thread/start takes the config-style sandbox mode (verified against codex-cli
+# 0.153.4: "read-only" | "workspace-write" | "danger-full-access"); turn/start's
+# sandboxPolicy.type uses the camelCase variant.
+DEFAULT_SANDBOX = "workspace-write"
+SANDBOX_POLICY_TYPE = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                       "danger-full-access": "dangerFullAccess"}
 DEFAULT_APPROVAL = "never"
 
 
@@ -321,7 +326,8 @@ class Controller:
                 params: Dict[str, Any] = {
                     "threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": state["cwd"],
                     "approvalPolicy": state["approval_policy"],
-                    "sandboxPolicy": {"type": state["sandbox"], "writableRoots": [state["cwd"]], "networkAccess": True},
+                    "sandboxPolicy": {"type": SANDBOX_POLICY_TYPE.get(state["sandbox"], "workspaceWrite"),
+                                      "writableRoots": [state["cwd"]], "networkAccess": True},
                     "model": state["model"],
                 }
                 if state.get("effort"):

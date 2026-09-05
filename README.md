@@ -184,7 +184,7 @@ Requirements and behavior:
   `codex_stop` uses `turn/interrupt` and only reports `cancelled` after the
   controller observes the turn end.
 - One writer per worktree across both backends; sibling worktrees run in parallel.
-- Approvals: threads run with `approvalPolicy: never` and a `workspaceWrite`
+- Approvals: threads run with `approvalPolicy: never` and a `workspace-write`
   sandbox. If Codex still asks for an interactive approval or input, the request
   is declined and recorded, and the turn fails clearly instead of hanging.
 
