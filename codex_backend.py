@@ -348,6 +348,11 @@ def codex_status(session: str, **_: Any) -> str:
                               f"({pend.get('error') or 'no reply observed'}) — {STOP} clears it; do not re-send blindly")
         note_parts.append(f"codex thread {live.get('thread_id')} · turn {active or turn.get('turn_id') or '—'} · "
                           f"app-server {'alive' if proj.get('app_server_alive') else 'idle/stopped'}")
+        if proj.get("containment") == "none":
+            note_parts.append("warning: the app-server runs UNCONTAINED (no user systemd — detached fallback): "
+                              "descendant cleanup cannot be proven, so unresolved dispatches keep their worktree claim")
+        if live.get("claim_retained"):
+            note_parts.append(f"worktree claim retained: {live['claim_retained']}")
     else:
         note_parts.append("codex controller not reachable — showing the persisted record.")
     if str(entry.get("worker_supervision") or "") == "detached":

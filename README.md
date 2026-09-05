@@ -176,7 +176,10 @@ Requirements and behavior:
 - A small independent controller process owns `codex app-server` and the run
   state under `$XDG_STATE_HOME/ghost_cursor/codex` (0700; Unix socket only, no
   network listener). It is started under user systemd when available, else
-  detached — status output says which. Gateway restarts do not interrupt a
+  detached — status output says which. With user systemd the app-server itself
+  runs in a controller-owned transient scope so all of its descendants can be
+  stopped and verified; without it, a lost dispatch cannot be proven idle and
+  keeps its worktree reservation until you intervene. Gateway restarts do not interrupt a
   Codex turn; results that finished while the gateway was down are delivered
   when it reconnects. The controller restarting mid-turn settles that turn as
   `unknown`/failed and never re-sends the prompt.

@@ -124,6 +124,7 @@ class Controller:
         self._inbox: "queue.Queue[Any]" = queue.Queue()
         self._stop = threading.Event()
         self._last_activity = time.monotonic()
+        self.containment = "unknown"
 
     # -- persistence -----------------------------------------------------------
 
@@ -279,8 +280,14 @@ class Controller:
             if self._server is not None and self._server.alive():
                 return self._server
             srv_ref: List[Any] = [None]
+            # Containment: a controller-owned, uniquely named user-systemd
+            # scope when user systemd answers; otherwise the child runs
+            # uncontained and every cleanup proof fails closed.
+            unit = proto.new_unit_name() if proto.systemd_user_available() else None
+            if unit:
+                self._record_unit(unit)
             srv = proto.AppServer(
-                self.codex_bin, env=self._spawn_env(),
+                self.codex_bin, env=self._spawn_env(), unit=unit,
                 on_notification=lambda m: self._inbox.put(("notify", m)),
                 on_request=lambda m: self._inbox.put(("request", m)),
                 on_exit=lambda code: self._inbox.put(("exit", (code, srv_ref[0]))),
@@ -294,40 +301,46 @@ class Controller:
             self._server = srv
             self._catalog = None
             self._thread_to_session.clear()
-            self._record_group(srv.pgid)
+            self.containment = "systemd-scope" if unit else "none"
             return srv
 
-    def _group_file(self) -> Path:
-        return self.state_dir / "appserver_groups.json"
+    def _units_file(self) -> Path:
+        return self.state_dir / "appserver_units.json"
 
-    def _record_group(self, pgid: int) -> None:
-        """Remember every app-server process group this state dir ever
-        started, until it is proven empty (boot reconciliation checks them)."""
-        groups = self._known_groups()
-        if pgid not in groups:
-            groups.append(pgid)
-        self._group_file().write_text(json.dumps(groups), "utf-8")
+    def _record_unit(self, unit: str) -> None:
+        """Remember every owned scope this state dir ever started, until its
+        cgroup is proven empty. Only unit NAMES are persisted — never pids or
+        pgids, which can be reused by unrelated processes after a restart."""
+        units = self._known_units()
+        if unit not in units:
+            units.append(unit)
+        self._units_file().write_text(json.dumps(units), "utf-8")
 
-    def _known_groups(self) -> List[int]:
+    def _known_units(self) -> List[Any]:
         try:
-            data = json.loads(self._group_file().read_text("utf-8"))
-            return [int(g) for g in data] if isinstance(data, list) else []
+            data = json.loads(self._units_file().read_text("utf-8"))
+            return list(data) if isinstance(data, list) else []
         except Exception:
             return []
 
-    def _forget_group(self, pgid: int) -> None:
-        groups = [g for g in self._known_groups() if g != pgid]
-        self._group_file().write_text(json.dumps(groups), "utf-8")
+    def _forget_unit(self, unit: str) -> None:
+        units = [u for u in self._known_units() if u != unit]
+        self._units_file().write_text(json.dumps(units), "utf-8")
 
-    def _stop_all_known_groups(self, grace_s: float = 5.0) -> List[int]:
-        """Terminate every recorded app-server group; return the pgids that
-        could NOT be proven empty (they stay recorded)."""
-        survivors: List[int] = []
-        for pgid in self._known_groups():
-            if proto.terminate_group(pgid, grace_s):
-                self._forget_group(pgid)
+    def _stop_all_known_units(self, grace_s: float = 5.0) -> List[Any]:
+        """Stop every recorded owned scope; return the entries that could NOT
+        be proven empty (they stay recorded). Entries that are not
+        controller-minted unit names (e.g. a legacy naked pgid) are never
+        signalled and always count as unproven."""
+        survivors: List[Any] = []
+        for unit in self._known_units():
+            if not isinstance(unit, str) or not unit.startswith(proto.UNIT_PREFIX):
+                survivors.append(unit)
+                continue
+            if proto.stop_unit(unit, grace_s):
+                self._forget_unit(unit)
             else:
-                survivors.append(pgid)
+                survivors.append(unit)
         return survivors
 
     def catalog(self) -> List[Dict[str, Any]]:
@@ -546,20 +559,24 @@ class Controller:
                     "reason": ("cannot prove the lost dispatch is not executing: the shared codex app-server "
                                f"still serves active turns for {len(others)} other session(s); the intent and the "
                                "worktree claim stay in place")}
-        # Proof is the PROCESS GROUP being empty — every app-server group this
-        # state dir ever started, including one whose leader exited cleanly
-        # and left tool descendants behind. The leader's exit (or
-        # AppServer.alive()) is never accepted as evidence on its own.
+        # Proof is every owned scope's CGROUP being empty — including one
+        # whose leader exited cleanly and left tool descendants (setsid or
+        # not) behind. The leader's exit (or AppServer.alive()) is never
+        # accepted as evidence. An uncontained child cannot be proven clean.
         with self._lock:
             app, self._server = self._server, None
+        uncontained = app is not None and not app.contained()
         if app is not None:
             app.close(grace_s=5.0)
-        survivors = self._stop_all_known_groups(grace_s=5.0)
-        if survivors:
+        survivors = self._stop_all_known_units(grace_s=5.0)
+        if uncontained or survivors:
+            reason = ("the app-server ran uncontained (no user systemd: detached fallback) — descendant cleanup "
+                      "cannot be proven" if uncontained else
+                      f"owned scope(s) {survivors} still have processes in their cgroup (or are not verifiable)")
             return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
-                    "reason": (f"owned app-server process group(s) {survivors} still have live members after "
-                               "SIGTERM/SIGKILL; intent and claim stay in place"), "surviving_groups": survivors}
-        proof = "every owned app-server process group is empty (verified via /proc)"
+                    "reason": reason + "; intent and claim stay in place", "surviving_units": survivors,
+                    "containment": "none" if uncontained else "systemd-scope"}
+        proof = "every owned app-server scope cgroup is empty (verified via systemd + cgroup.procs)"
         state["pending_intent"] = None
         state["status"] = "unknown"
         self.save(state)
@@ -574,7 +591,8 @@ class Controller:
         if state is None:
             return {"ok": False, "error": "unknown session"}
         srv_alive = self._server is not None and self._server.alive()
-        return {"ok": True, "state": state, "app_server_alive": srv_alive, "controller_pid": os.getpid()}
+        return {"ok": True, "state": state, "app_server_alive": srv_alive, "controller_pid": os.getpid(),
+                "containment": self.containment}
 
     def op_events(self, req: Dict[str, Any]) -> Dict[str, Any]:
         session = str(req.get("session") or "")
@@ -632,7 +650,7 @@ class Controller:
         op = str(req.get("op") or "")
         if op == "ping":
             return {"ok": True, "pid": os.getpid(), "app_server_alive": bool(self._server and self._server.alive()),
-                    "codex_bin": self.codex_bin}
+                    "codex_bin": self.codex_bin, "containment": self.containment}
         if op == "shutdown":
             logger.info("shutdown requested by a client")
             self._stop.set()
@@ -818,9 +836,9 @@ class Controller:
             # empty — otherwise the claims stay (a later stop/boot retries).
             group_ok = True
             if srv is not None:
-                group_ok = proto.terminate_group(srv.pgid, 5.0)
+                group_ok = bool(srv.unit) and proto.stop_unit(srv.unit, 5.0)
                 if group_ok:
-                    self._forget_group(srv.pgid)
+                    self._forget_unit(srv.unit)
             for session, state in self._active_sessions().items():
                 turn_id = state.get("active_turn_id")
                 env = proto.lifecycle("run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
@@ -835,8 +853,8 @@ class Controller:
                     turn_state["status"] = "unknown"
                 state["completions"][-1]["status"] = "unknown"
                 if not group_ok:
-                    state["claim_retained"] = ("app-server process group still has live members after "
-                                               "SIGTERM/SIGKILL; worktree claim kept")
+                    state["claim_retained"] = ("descendant cleanup not proven (uncontained child, or the owned "
+                                               "scope cgroup is not empty); worktree claim kept")
                 self.save(state)
             self._server = None
 
@@ -846,10 +864,11 @@ class Controller:
         outcome. Settle it honestly (never re-run the prompt) and drop its
         claim so the worktree is not held by a ghost."""
         with self._lock:
-            # The previous controller's app-server groups may have orphaned
-            # tool descendants: terminate every recorded group and release
-            # claims only when they are all proven empty.
-            survivors = self._stop_all_known_groups(grace_s=5.0)
+            # The previous controller's app-server scopes may have orphaned
+            # tool descendants: stop every recorded owned scope (by unique
+            # unit name — never a persisted pid) and release claims only when
+            # all of them are proven empty.
+            survivors = self._stop_all_known_units(grace_s=5.0)
             for session, state in self._active_sessions().items():
                 turn_id = state.get("active_turn_id")
                 env = proto.lifecycle(
@@ -861,7 +880,7 @@ class Controller:
                 turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
                 self._settle_turn(state, turn_state, env, release_claim=not survivors)
                 if survivors:
-                    state["claim_retained"] = (f"previous app-server group(s) {survivors} still have live members; "
+                    state["claim_retained"] = (f"previous app-server scope(s) {survivors} could not be proven empty; "
                                                "worktree claim kept")
                 state["status"] = "unknown"
                 if turn_state is not None:

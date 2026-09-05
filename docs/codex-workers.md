@@ -57,16 +57,21 @@ worker behavior. Full authoritative scope: the plan in
   turn id is ambiguous: the intent (`ambiguous: true`) and the claim are
   retained, a later `turn/started` for the thread adopts the turn, and
   further sends are refused. `codex_stop` clears the intent only after the
-  controller proves quiescence: every app-server PROCESS GROUP this state
-  dir ever started (recorded in `appserver_groups.json`) is SIGTERM/SIGKILLed
-  and observed empty via `/proc` — a leader that exits cleanly on stdin EOF
-  leaves tool descendants behind, so the leader's exit (or
-  `AppServer.alive()`) is never accepted as evidence. If other sessions are
-  active on the shared child, or a group still has members, stop reports
-  `unresolved` and keeps intent and claim. The same proof gates claim
-  release in `_on_exit` and boot reconciliation (`claim_retained` on the
-  session record when it fails). Descendants that leave the group
-  (`setsid`) are outside this proof. No automatic re-send. A steer that races a
+  controller proves quiescence. Containment: when user systemd answers, the
+  controller runs `codex app-server` inside a transient, uniquely named,
+  controller-owned scope (`systemd-run --user --scope
+  --unit=ghost-cursor-codex-app-<uuid>.scope`); every descendant — tool
+  shells, `setsid`'d children — lives in that cgroup. Proof = `systemctl
+  --user stop` of every owned scope this state dir ever started (recorded by
+  unit NAME in `appserver_units.json`, never a pid/pgid) and `cgroup.procs`
+  observed empty / unit `not-found`. A leader that exits cleanly on stdin
+  EOF is never evidence; neither is `AppServer.alive()`. Without user
+  systemd the child runs uncontained and every cleanup proof FAILS CLOSED:
+  stop reports `unresolved` ("containment: none"), intent and claim stay,
+  and `codex_status` warns. The same proof gates claim release in
+  `_on_exit` and boot reconciliation (`claim_retained` when it fails).
+  Recorded entries that are not controller-minted unit names are never
+  signalled and count as unproven. No automatic re-send. A steer that races a
   finishing turn returns without starting a new turn.
 - **Claim ownership** is per dispatch: the claim carries `owner` (the
   dispatch intent id for Codex; `cursor:<profile>:<session>:<dispatch>` for
@@ -106,7 +111,8 @@ worker behavior. Full authoritative scope: the plan in
 - Progress digests and status read files/pending tools/plan from the
   controller's durable per-turn record, so a gateway restart loses no
   projection; completion delivery is the guaranteed path.
-- Without user systemd the controller runs detached and status says so.
+- Without user systemd the controller runs detached and the app-server
+  uncontained; status says so and ambiguous cleanups fail closed.
 - Live model acceptance requires an authenticated Codex install; see the
   test log in the PR for what was verified.
 

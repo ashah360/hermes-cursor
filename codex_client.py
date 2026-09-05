@@ -412,7 +412,7 @@ class Follower:
         )
         files = sorted((dict(f) for f in (turn.get("files") or {}).values()), key=lambda f: str(f.get("path")))
         return {"files": files, "pending_tools": pending, "plan": list(turn.get("plan") or []), "state": state,
-                "turn": turn, "app_server_alive": st.get("app_server_alive")}
+                "turn": turn, "app_server_alive": st.get("app_server_alive"), "containment": st.get("containment")}
 
     def _maybe_digest(self, name: str, entry: Dict[str, Any]) -> None:
         subs = _handles.subscribers_of(entry)

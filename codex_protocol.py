@@ -61,51 +61,90 @@ class RpcError(ProtocolError):
         self.data = data
 
 
-def group_members(pgid: int) -> List[int]:
-    """Live (non-zombie) pids whose process group is ``pgid``, from /proc."""
-    out: List[int] = []
-    if pgid <= 0:
-        return out
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        try:
-            with open(f"/proc/{name}/stat", "r") as fh:
-                rest = fh.read().rsplit(")", 1)[1].split()
-        except Exception:
-            continue
-        # rest[0] = state, rest[1] = ppid, rest[2] = pgrp
-        if len(rest) > 2 and rest[2] == str(pgid) and rest[0] != "Z":
-            out.append(int(name))
+UNIT_PREFIX = "ghost-cursor-codex-app-"
+_SYSTEMCTL_TIMEOUT_S = 20.0
+
+
+def systemd_user_available() -> bool:
+    """User systemd answers: containment via a transient scope is possible."""
+    try:
+        proc = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    return proc.returncode == 0 or (proc.stdout or "").strip() in ("running", "degraded")
+
+
+def new_unit_name() -> str:
+    """Unique controller-owned scope name; never reused, so a recorded name
+    can only ever refer to the unit this controller created."""
+    import uuid
+
+    return f"{UNIT_PREFIX}{uuid.uuid4().hex[:12]}.scope"
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S)
+
+
+def unit_state(unit: str) -> Dict[str, str]:
+    """LoadState/ActiveState/ControlGroup of a unit ("not-found" when gone)."""
+    try:
+        proc = _systemctl("show", "-p", "LoadState", "-p", "ActiveState", "-p", "ControlGroup", unit)
+    except Exception:
+        return {"LoadState": "unknown", "ActiveState": "unknown", "ControlGroup": ""}
+    out: Dict[str, str] = {"LoadState": "unknown", "ActiveState": "unknown", "ControlGroup": ""}
+    for line in (proc.stdout or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
     return out
 
 
-def group_empty(pgid: int) -> bool:
-    return not group_members(pgid)
+def unit_procs(unit: str) -> Optional[List[int]]:
+    """Pids in the unit's cgroup (every descendant, setsid or not). ``[]`` when
+    the unit is gone; None when the cgroup cannot be read (unprovable)."""
+    st = unit_state(unit)
+    if st["LoadState"] == "not-found":
+        return []
+    cg = st.get("ControlGroup") or ""
+    if not cg:
+        return None if st["LoadState"] == "unknown" else []
+    try:
+        with open(f"/sys/fs/cgroup{cg}/cgroup.procs", "r") as fh:
+            return [int(x) for x in fh.read().split() if x.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return None
 
 
-def terminate_group(pgid: int, grace_s: float) -> bool:
-    """SIGTERM, then SIGKILL, the whole group; True only when it is observed
-    empty. A group whose leader is gone but still has members is ours (Linux
-    never reuses a pid that is still a live pgid), so signalling is safe."""
-    if pgid <= 0:
+def stop_unit(unit: str, grace_s: float) -> bool:
+    """Stop the scope (KillMode=control-group: SIGTERM, then SIGKILL after the
+    manager's timeout) and return True only when its cgroup is observed
+    empty/gone. Stopping a unit that no longer exists signals nothing."""
+    if not str(unit or "").startswith(UNIT_PREFIX):
+        return False  # never act on a name this controller did not mint
+    if unit_procs(unit) == []:
         return True
-    deadline = time.monotonic() + max(grace_s, 0.1)
-    for sig in (15, 9):
-        if group_empty(pgid):
+    try:
+        _systemctl("stop", unit)
+    except Exception:
+        return False
+    deadline = time.monotonic() + max(grace_s, 0.2)
+    while time.monotonic() < deadline:
+        if unit_procs(unit) == []:
             return True
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return group_empty(pgid)
-        except PermissionError:
-            return False
-        while time.monotonic() < deadline:
-            if group_empty(pgid):
-                return True
-            time.sleep(0.05)
-        deadline = time.monotonic() + max(grace_s, 0.1)
-    return group_empty(pgid)
+        time.sleep(0.05)
+    try:
+        _systemctl("kill", "--signal=SIGKILL", unit)
+    except Exception:
+        return False
+    deadline = time.monotonic() + max(grace_s, 0.2)
+    while time.monotonic() < deadline:
+        if unit_procs(unit) == []:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -130,7 +169,14 @@ class AppServer:
         on_notification: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_request: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_exit: Optional[Callable[[Optional[int]], None]] = None,
+        unit: Optional[str] = None,
     ) -> None:
+        """``unit`` (a :func:`new_unit_name`) runs the child inside a transient
+        user-systemd scope so EVERY descendant — including ones that call
+        ``setsid`` — lives in one owned cgroup that :meth:`close` can stop and
+        verify. Without a unit the child is uncontained: :meth:`close` can
+        never prove cleanup and always returns False."""
+        self.unit = unit
         self._on_notification = on_notification
         self._on_request = on_request
         self._on_exit = on_exit
@@ -142,6 +188,10 @@ class AppServer:
         spawn_env = dict(env) if env is not None else dict(os.environ)
         spawn_env.setdefault("RUST_LOG", "warn")
         cmd = [codex_bin, "app-server", *(extra_args or [])]
+        if unit:
+            # systemd-run --scope moves THIS invocation into the scope and then
+            # execs the command, so the stdio pipes are the command's.
+            cmd = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}", "--collect", "--", *cmd]
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -153,7 +203,6 @@ class AppServer:
             start_new_session=True,
         )
         self.pid = self._proc.pid
-        self.pgid = self._proc.pid  # start_new_session=True: leader of its own group
         threading.Thread(target=self._read_loop, name="codex-appserver-stdout", daemon=True).start()
         threading.Thread(target=self._stderr_loop, name="codex-appserver-stderr", daemon=True).start()
 
@@ -166,14 +215,14 @@ class AppServer:
         return self._proc.poll()
 
     def close(self, grace_s: float = 5.0) -> bool:
-        """Stop the app-server AND everything it spawned.
+        """Stop the app-server and everything it spawned.
 
-        The child was started as a session/process-group leader, so the
-        whole group is signalled — a parent that exits cleanly on stdin EOF
-        never signals its own descendants (tool shells), so the parent's
-        exit alone is not termination evidence. Returns True only when the
-        process group is OBSERVED empty afterwards (:func:`group_empty`);
-        False means owned execution may still be running.
+        Returns True ONLY when the owned scope's cgroup is observed empty —
+        the single proof that all descendants (tool shells, setsid'd
+        children) are gone. A parent exiting cleanly on stdin EOF is not
+        evidence; neither is ``alive()``. An uncontained child (no unit)
+        gets a best-effort process-group kill and returns False: cleanup
+        cannot be proven.
         """
         self._closed = True
         try:
@@ -185,9 +234,18 @@ class AppServer:
             self._proc.wait(timeout=grace_s)
         except Exception:
             pass
-        proven = terminate_group(self.pgid, grace_s)
+        if self.unit:
+            proven = stop_unit(self.unit, grace_s)
+        else:
+            for sig in (15, 9):
+                try:
+                    os.killpg(self._proc.pid, sig)
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            proven = False
         try:
-            self._proc.wait(timeout=0.1)  # reap the leader if it is ours
+            self._proc.wait(timeout=0.1)
         except Exception:
             pass
         with self._lock:
@@ -197,9 +255,8 @@ class AppServer:
             q.put({"_transport": True, "error": {"code": -1, "message": "app-server closed"}})
         return proven
 
-    def group_empty(self) -> bool:
-        """True when no process in the app-server's group remains."""
-        return group_empty(self.pgid)
+    def contained(self) -> bool:
+        return bool(self.unit)
 
     # -- wire ----------------------------------------------------------------
 
