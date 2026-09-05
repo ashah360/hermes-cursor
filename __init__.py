@@ -91,6 +91,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cloud_runner as _cloud
+from . import codex_backend as _codex_backend
+from . import codex_client as _codex_client
 from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
@@ -100,6 +102,7 @@ from . import render as _render
 from . import runner as _runner
 from . import supervisor as _supervisor
 from . import workers as _workers
+from . import writer_guard as _guard
 
 logger = logging.getLogger(__name__)
 
@@ -1296,6 +1299,19 @@ def _send_to_session(
             ),
         }
 
+    if runtime == "local" and os.path.isdir(repo):
+        # Cross-backend writer exclusion: a live Codex turn on this worktree
+        # rejects a Cursor writer the same way a Cursor run would.
+        claim = _guard.codex_writer(repo, _codex_client.claims_dir())
+        if claim is not None:
+            return {
+                "success": False,
+                "status": "rejected",
+                "reason": "a codex turn is already active on this worktree",
+                "session": str(claim.get("session") or ""),
+                "repo": repo,
+            }
+
     job = _live_job(name, entry)
     interrupted = False
     if job is not None and job.status == "running":
@@ -2029,3 +2045,10 @@ def register(ctx) -> None:
             check_fn=check_cursor_available,
             emoji=emoji,
         )
+    # Codex backend: same handle table/event log/delivery rail, separate
+    # execution (independent controller). Gated on a codex binary only —
+    # never on CURSOR_API_KEY — and never blocks Cursor registration.
+    try:
+        _codex_backend.register(ctx)
+    except Exception:
+        logger.exception("ghost_cursor codex tool registration failed")

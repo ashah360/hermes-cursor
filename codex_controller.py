@@ -129,14 +129,25 @@ class Controller:
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
 
-    def append_event(self, session: str, envelope: Dict[str, Any]) -> int:
-        state = self.load(session) or {"session": session, "next_seq": 0}
-        seq = int(state.get("next_seq") or 0)
-        record = {"seq": seq, "ts": _now(), **envelope}
-        with self._events_path(session).open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        state["next_seq"] = seq + 1
-        self.save(state)
+    def append_event(self, session: str, envelope: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> int:
+        """Append one event with the next per-session seq.
+
+        ``state`` (when the caller holds the session record) is mutated in
+        place and NOT saved here — the caller saves once; otherwise the
+        record is loaded and saved. Both paths run under ``self._lock`` so
+        seq assignment is single-writer.
+        """
+        own = state is None
+        with self._lock:
+            if own:
+                state = self.load(session) or {"session": session, "next_seq": 0}
+            seq = int(state.get("next_seq") or 0)
+            record = {"seq": seq, "ts": _now(), **envelope}
+            with self._events_path(session).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            state["next_seq"] = seq + 1
+            if own:
+                self.save(state)
         return seq
 
     def read_events(self, session: str, since: int, limit: int) -> List[Dict[str, Any]]:
@@ -218,12 +229,14 @@ class Controller:
         with self._lock:
             if self._server is not None and self._server.alive():
                 return self._server
+            srv_ref: List[Any] = [None]
             srv = proto.AppServer(
                 self.codex_bin, env=self._spawn_env(),
                 on_notification=lambda m: self._inbox.put(("notify", m)),
                 on_request=lambda m: self._inbox.put(("request", m)),
-                on_exit=lambda code: self._inbox.put(("exit", code)),
+                on_exit=lambda code: self._inbox.put(("exit", (code, srv_ref[0]))),
             )
+            srv_ref[0] = srv
             try:
                 self._server_info = srv.initialize()
             except Exception:
@@ -445,6 +458,7 @@ class Controller:
             return {"ok": True, "pid": os.getpid(), "app_server_alive": bool(self._server and self._server.alive()),
                     "codex_bin": self.codex_bin}
         if op == "shutdown":
+            logger.info("shutdown requested by a client")
             self._stop.set()
             return {"ok": True}
         fn = getattr(self, f"op_{op}", None)
@@ -521,7 +535,7 @@ class Controller:
             envelopes = norm.normalize(msg)
             turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == state.get("active_turn_id")), None)
             for env in envelopes:
-                self.append_event(session, env)
+                self.append_event(session, env, state)
                 kind = env.get("kind")
                 if turn_state is not None:
                     if kind == "file_diff":
@@ -601,15 +615,18 @@ class Controller:
                 note="codex asked for interactive approval/input; v1 declines instead of hanging",
             ))
 
-    def _on_exit(self, code: Optional[int]) -> None:
+    def _on_exit(self, payload: Any) -> None:
+        code, srv = payload if isinstance(payload, tuple) else (payload, None)
         with self._lock:
+            if srv is not None and self._server is not None and self._server is not srv:
+                return  # a stale exit from an app-server already replaced
             for session, state in self._active_sessions().items():
                 turn_id = state.get("active_turn_id")
                 env = proto.lifecycle("run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
                                       error=f"codex app-server exited (code {code}) while the turn was active; "
                                             "outcome unknown — inspect the worktree before re-sending",
                                       app_server_exit=True)
-                self.append_event(session, env)
+                self.append_event(session, env, state)
                 turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
                 self._settle_turn(state, turn_state, env)
                 state["status"] = "unknown"
@@ -618,6 +635,28 @@ class Controller:
                 state["completions"][-1]["status"] = "unknown"
                 self.save(state)
             self._server = None
+
+    def reconcile_on_boot(self) -> None:
+        """A previous controller died: its app-server child died with it, so
+        any session still recorded with an active turn has an UNKNOWN
+        outcome. Settle it honestly (never re-run the prompt) and drop its
+        claim so the worktree is not held by a ghost."""
+        with self._lock:
+            for session, state in self._active_sessions().items():
+                turn_id = state.get("active_turn_id")
+                env = proto.lifecycle(
+                    "run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
+                    error="codex controller restarted while the turn was active; outcome unknown — inspect the "
+                          "worktree before re-sending", controller_restart=True,
+                )
+                self.append_event(session, env, state)
+                turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
+                self._settle_turn(state, turn_state, env)
+                state["status"] = "unknown"
+                if turn_state is not None:
+                    turn_state["status"] = "unknown"
+                state["completions"][-1]["status"] = "unknown"
+                self.save(state)
 
     def _idle_check(self) -> None:
         if self.idle_exit_s <= 0 or self._server is None:
@@ -645,6 +684,7 @@ class Controller:
         info.write_text(json.dumps({"pid": os.getpid(), "birth": _pid_birth(os.getpid()), "started_at": _now(),
                                     "codex_bin": self.codex_bin, "socket": str(sock_path)}), "utf-8")
         os.chmod(info, 0o600)
+        self.reconcile_on_boot()
         threading.Thread(target=self._fold_loop, name="codex-fold", daemon=True).start()
         try:
             while not self._stop.is_set():
@@ -710,8 +750,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 3
     ctl = Controller(state_dir, args.codex_bin, args.codex_home,
                      [e for e in args.env_allow.split(",") if e], args.idle_exit_s)
-    signal.signal(signal.SIGTERM, lambda *_: ctl._stop.set())
-    signal.signal(signal.SIGINT, lambda *_: ctl._stop.set())
+    def _on_signal(signum, _frame):
+        logger.info("signal %s received; shutting down", signum)
+        ctl._stop.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     ctl.serve()
     return 0
 

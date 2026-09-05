@@ -152,6 +152,42 @@ A tool argument overrides the configured default for that run.
 
 Progress updates default to every 180 seconds. Ask Hermes for a different interval, pass `update_interval_s` with the task, or use `cursor_subscribe`. Setting the interval to `0` stops progress updates for that Hermes conversation but does not disable the final result.
 
+## Codex backend (local app-server)
+
+Hermes Cursor can also delegate to OpenAI Codex running locally through
+`codex app-server`. Codex sessions use their own tools (`codex_create_session`,
+`codex_send_message`, `codex_status`, `codex_events`, `codex_stop`,
+`codex_list`, `codex_subscribe`) and share the session table, event log,
+progress digests and final-result delivery with the Cursor tools. A session is
+bound to one backend for life; Cursor tools never see Codex sessions and vice
+versa. Installs without Codex keep working exactly as before — the `codex_*`
+tools simply stay hidden.
+
+Requirements and behavior:
+
+- A `codex` binary on PATH, or `GHOST_CURSOR_CODEX_BIN` / `plugins.ghost_cursor.codex_bin`
+  pointing at one, already authenticated the way you normally use Codex
+  (the plugin never logs in or copies credentials). `CODEX_HOME` or
+  `plugins.ghost_cursor.codex_home` selects the Codex profile.
+- Sessions run in a LOCAL worktree; no GitHub origin or pushed branch is needed.
+- `model` is required (or `plugins.ghost_cursor.codex_model`); `effort` is
+  optional. Both are checked against the installed Codex catalog on the first
+  send. Nothing is substituted when they do not match.
+- A small independent controller process owns `codex app-server` and the run
+  state under `$XDG_STATE_HOME/ghost_cursor/codex` (0700; Unix socket only, no
+  network listener). It is started under user systemd when available, else
+  detached — status output says which. Gateway restarts do not interrupt a
+  Codex turn; results that finished while the gateway was down are delivered
+  when it reconnects. The controller restarting mid-turn settles that turn as
+  `unknown`/failed and never re-sends the prompt.
+- Sending while a turn is active appends to that turn natively (`turn/steer`);
+  `codex_stop` uses `turn/interrupt` and only reports `cancelled` after the
+  controller observes the turn end.
+- One writer per worktree across both backends; sibling worktrees run in parallel.
+- Approvals: threads run with `approvalPolicy: never` and a `workspaceWrite`
+  sandbox. If Codex still asks for an interactive approval or input, the request
+  is declined and recorded, and the turn fails clearly instead of hanging.
+
 ## What survives a restart
 
 Cursor runs independently of Hermes. If the gateway restarts, Hermes Cursor reconnects to active runs and resumes terminal delivery. In local mode, systemd-supervised workers also survive the restart and are adopted by the new gateway process.

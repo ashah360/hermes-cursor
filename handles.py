@@ -484,6 +484,18 @@ def runtime_of(entry: Optional[Dict[str, Any]]) -> str:
         return "legacy"
 
 
+def backend_of(entry: Optional[Dict[str, Any]]) -> str:
+    """The entry's backend: "cursor" | "codex". Never raises.
+
+    Records written before the Codex backend existed carry no ``backend``
+    field and are Cursor records. A session binds to its backend at create.
+    """
+    try:
+        return str((entry or {}).get("backend") or "cursor")
+    except Exception:
+        return "cursor"
+
+
 def last_prompt_seq(entry: Optional[Dict[str, Any]]) -> int:
     """The event-log position recorded when the session was last prompted.
 

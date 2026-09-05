@@ -1,6 +1,6 @@
 name: ghost_cursor
-version: 0.6.0
-description: "Delegate coding tasks from Hermes to Cursor Cloud on hosted VMs or isolated workers on your own machine, with named sessions, progress updates, follow-ups, cancellation, restart reattachment, and final-result delivery."
+version: 0.7.0
+description: "Delegate coding tasks from Hermes to Cursor Cloud (hosted VMs or isolated workers on your own machine) or to a local OpenAI Codex app-server, with named sessions, progress updates, follow-ups, cancellation, restart reattachment, and final-result delivery."
 author: Arman Hezarkhani
 kind: backend
 provides_tools:
@@ -11,3 +11,10 @@ provides_tools:
   - cursor_events
   - cursor_list
   - cursor_subscribe
+  - codex_create_session
+  - codex_send_message
+  - codex_status
+  - codex_stop
+  - codex_events
+  - codex_list
+  - codex_subscribe
