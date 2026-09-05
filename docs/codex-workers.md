@@ -66,9 +66,14 @@ worker behavior. Full authoritative scope: the plan in
   unit NAME in `appserver_units.json`, never a pid/pgid) and `cgroup.procs`
   observed empty / unit `not-found`. A leader that exits cleanly on stdin
   EOF is never evidence; neither is `AppServer.alive()`. Without user
-  systemd the child runs uncontained and every cleanup proof FAILS CLOSED:
-  stop reports `unresolved` ("containment: none"), intent and claim stay,
-  and `codex_status` warns. The same proof gates claim release in
+  systemd the child runs uncontained and an `uncontained-app-server-<id>`
+  marker is persisted in `appserver_units.json`; it is never signalled and
+  never proven, so every ambiguous cleanup FAILS CLOSED — in this controller
+  and in any successor after a restart — until an operator removes the
+  marker deliberately. Stop reports `unresolved`, intent and claim stay,
+  and `codex_status` warns. Retrying a retained claim, like reconciling a
+  pending intent, stops nothing while another session has an active turn on
+  the shared app-server. The same proof gates claim release in
   `_on_exit` and boot reconciliation (`claim_retained` when it fails).
   Recorded entries that are not controller-minted unit names are never
   signalled and count as unproven. No automatic re-send. A steer that races a

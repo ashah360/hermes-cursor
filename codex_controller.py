@@ -43,6 +43,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -61,6 +62,11 @@ TERMINAL = ("completed", "failed", "cancelled")
 # thread/start takes the config-style sandbox mode (verified against codex-cli
 # 0.153.4: "read-only" | "workspace-write" | "danger-full-access"); turn/start's
 # sandboxPolicy.type uses the camelCase variant.
+# Persisted in appserver_units.json when an app-server ran without an owned
+# scope. Never signalled, never proven: cleanup stays unresolved until an
+# operator removes it deliberately.
+UNCONTAINED_MARK = "uncontained-app-server-"
+
 DEFAULT_SANDBOX = "workspace-write"
 SANDBOX_POLICY_TYPE = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
                        "danger-full-access": "dangerFullAccess"}
@@ -73,6 +79,14 @@ def _pid_birth(pid: int) -> Optional[int]:
             return int(fh.read().rsplit(")", 1)[1].split()[19])
     except Exception:
         return None
+
+
+def _survivor_reason(survivors: List[Any]) -> str:
+    marks = [s for s in survivors if isinstance(s, str) and s.startswith(UNCONTAINED_MARK)]
+    if marks:
+        return ("an app-server ran uncontained (no user systemd: detached fallback) — descendant cleanup cannot be "
+                f"proven ({len(marks)} recorded)")
+    return f"owned scope(s) {survivors} still have processes in their cgroup (or are not verifiable)"
 
 
 def claim_key(cwd: str) -> str:
@@ -276,8 +290,10 @@ class Controller:
             # scope when user systemd answers; otherwise the child runs
             # uncontained and every cleanup proof fails closed.
             unit = proto.new_unit_name() if proto.systemd_user_available() else None
-            if unit:
-                self._record_unit(unit)
+            # Record what will need proving later: the owned scope name, or —
+            # uncontained — a marker that can never be proven and therefore
+            # keeps every ambiguous cleanup failing closed, across restarts.
+            self._record_unit(unit or f"{UNCONTAINED_MARK}{uuid.uuid4().hex[:12]}")
             srv = proto.AppServer(
                 self.codex_bin, env=self._spawn_env(), unit=unit,
                 on_notification=lambda m: self._inbox.put(("notify", m)),
@@ -535,15 +551,23 @@ class Controller:
             self.append_event(session, proto.lifecycle("interrupt_requested", turn_id=active))
             return {"ok": True, "turn_id": active, "status": "running"}
 
+    def _others_active(self, session: str) -> List[str]:
+        return [s for s in self._active_sessions() if s != session]
+
     def _retry_retained_claim(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """A settled-unknown turn whose worktree claim was kept because cleanup
-        could not be proven: try again, release only on proof."""
+        could not be proven: try again, release only on proof. Sessions share
+        the app-server, so nothing is stopped while another session has an
+        active turn."""
+        others = self._others_active(state["session"])
+        if others:
+            return {"ok": True, "turn_id": "", "status": "unresolved", "surviving_units": [],
+                    "reason": (f"cannot stop owned scopes while {len(others)} other session(s) have active turns on "
+                               "the shared app-server; the worktree claim stays in place")}
         survivors = self._stop_all_known_units(grace_s=5.0)
-        if survivors or (self._server is not None and not self._server.contained()):
+        if survivors:
             return {"ok": True, "turn_id": "", "status": "unresolved", "surviving_units": survivors,
-                    "reason": (f"owned scope(s) {survivors} still cannot be proven empty" if survivors else
-                               "the app-server runs uncontained; descendant cleanup cannot be proven")
-                    + "; the worktree claim stays in place"}
+                    "reason": _survivor_reason(survivors) + "; the worktree claim stays in place"}
         last = (state.get("turns") or [{}])[-1]
         self.clear_claim(state["cwd"], state["session"], owner=str(last.get("intent_id") or ""))
         note = state.pop("claim_retained", None)
@@ -566,8 +590,8 @@ class Controller:
         unresolved — reported honestly.
         """
         session = state["session"]
-        others = [s for s in self._active_sessions() if s != session]
-        if others and self._server is not None:
+        others = self._others_active(session)
+        if others:
             return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
                     "reason": ("cannot prove the lost dispatch is not executing: the shared codex app-server "
                                f"still serves active turns for {len(others)} other session(s); the intent and the "
@@ -578,17 +602,17 @@ class Controller:
         # accepted as evidence. An uncontained child cannot be proven clean.
         with self._lock:
             app, self._server = self._server, None
-        uncontained = app is not None and not app.contained()
         if app is not None:
             app.close(grace_s=5.0)
+        # The persisted unit record — not the in-memory server — decides:
+        # an uncontained marker recorded by this or an earlier controller
+        # can never be proven and keeps this unresolved after restarts too.
         survivors = self._stop_all_known_units(grace_s=5.0)
-        if uncontained or survivors:
-            reason = ("the app-server ran uncontained (no user systemd: detached fallback) — descendant cleanup "
-                      "cannot be proven" if uncontained else
-                      f"owned scope(s) {survivors} still have processes in their cgroup (or are not verifiable)")
+        if survivors:
+            uncontained = any(isinstance(s, str) and s.startswith(UNCONTAINED_MARK) for s in survivors)
             return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
-                    "reason": reason + "; intent and claim stay in place", "surviving_units": survivors,
-                    "containment": "none" if uncontained else "systemd-scope"}
+                    "reason": _survivor_reason(survivors) + "; intent and claim stay in place",
+                    "surviving_units": survivors, "containment": "none" if uncontained else "systemd-scope"}
         proof = "every owned app-server scope cgroup is empty (verified via systemd + cgroup.procs)"
         state["pending_intent"] = None
         state["status"] = "unknown"

@@ -958,12 +958,14 @@ def test_unproven_cleanup_retains_intent_and_claim(codex_env, monkeypatch, tmp_p
     assert resp["status"] == "unresolved" and resp["surviving_units"] == [unit]
     assert ctl.load(ref)["pending_intent"]["intent_id"] == "intent-x"
     assert ctl._read_claim(str(repo))["owner"] == "intent-x"
-    # Uncontained child (detached fallback): unresolved even if nothing is recorded.
-    ctl._units_file().write_text("[]")
-    ctl._server = Stuck(None)
+    # Uncontained child (detached fallback): the PERSISTED marker, not the in-memory
+    # server, keeps this unresolved — also with no server object at all (restart).
+    ctl._units_file().write_text(json.dumps([ctl_mod.UNCONTAINED_MARK + "abc123"]))
+    ctl._server = None
     resp = ctl._reconcile_pending(ctl.load(ref), ctl.load(ref)["pending_intent"])
     assert resp["status"] == "unresolved" and resp["containment"] == "none" and "cannot be proven" in resp["reason"]
     assert ctl._read_claim(str(repo))["owner"] == "intent-x"
+    ctl._units_file().write_text("[]")
     # _on_exit with an unproven scope: the turn settles unknown but the claim is kept.
     ctl._record_unit(unit)
     ctl.save({**ctl.load(ref), "pending_intent": None, "active_turn_id": "turn_z",
@@ -1075,3 +1077,93 @@ def test_controller_death_keeps_worktree_reserved_until_proven_cleanup(codex_env
         _deliveries()
     finally:
         proto.stop_unit(unit, 3.0)
+
+
+# ---------------------------------------------------------------------------
+# Review finding: retrying a retained claim must not stop siblings' work, and
+# uncontained uncertainty must survive a controller restart.
+# ---------------------------------------------------------------------------
+
+@_needs_user_systemd
+def test_retained_claim_retry_leaves_sibling_session_running(codex_env, tmp_path):
+    import plugins.ghost_cursor.codex_protocol as proto
+
+    repo = codex_env
+    repo_b = _git_repo(tmp_path / "repo_b")
+    cb.codex_create_session(title="Session A", repo=str(repo), model="test-model")
+    cb.codex_create_session(title="Session B", repo=str(repo_b), model="test-model")
+    assert "turn turn_1" in cb.codex_send_message("Session A", "hang here")
+    unit_a = json.loads((cc.state_dir() / "appserver_units.json").read_text())[0]
+    owner_a = guard.current(str(repo), cc.claims_dir())["owner"]
+    try:
+        ctl_pid = int(cc.controller_info()["pid"])
+        os.kill(ctl_pid, signal.SIGKILL)
+        assert _wait(lambda: _dead(ctl_pid), timeout=5)
+        (cc.state_dir() / "control.sock").unlink(missing_ok=True)
+        # Poison the record so boot cleanup cannot be proven -> A settles unknown, claim kept.
+        (cc.state_dir() / "appserver_units.json").write_text(json.dumps([unit_a, 4242]))
+        assert "turn turn_" in cb.codex_send_message("Session B", "hang here")  # restarts controller; B active
+        st_a = _controller_state("Session A")
+        assert st_a["active_turn_id"] is None and "worktree claim kept" in st_a["claim_retained"]
+        unit_b = [u for u in json.loads((cc.state_dir() / "appserver_units.json").read_text()) if isinstance(u, str) and u != unit_a][0]
+        assert proto.unit_procs(unit_b), "B's owned scope executes"
+        # Stop A: nothing may be stopped while B is active; A stays reserved.
+        stop = cb.codex_stop("Session A")
+        assert "could NOT be proven idle" in stop and "other session" in stop, stop
+        assert proto.unit_procs(unit_b), "B still executing after stop A"
+        assert _controller_state("Session B")["active_turn_id"]
+        assert guard.current(str(repo), cc.claims_dir())["owner"] == owner_a
+        assert json.loads((cc.state_dir() / "appserver_units.json").read_text()) == [unit_b, 4242] or \
+            set(json.loads((cc.state_dir() / "appserver_units.json").read_text())) == {unit_b, 4242}
+        # B finishes; the poisoned entry is resolved; now A's retry proves and releases.
+        assert "status: cancelled" in cb.codex_stop("Session B")
+        (cc.state_dir() / "appserver_units.json").write_text(json.dumps([unit_b]))
+        stop = cb.codex_stop("Session A")
+        assert "is now released" in stop, stop
+        assert guard.current(str(repo), cc.claims_dir()) is None
+        _deliveries()
+    finally:
+        proto.stop_unit(unit_a, 3.0)
+
+
+def test_uncontained_uncertainty_persists_across_controller_restart(codex_env, monkeypatch, tmp_path):
+    """An app-server that ran without an owned scope leaves a persisted marker;
+    a NEW controller (no in-memory server, no live units) must still refuse to
+    release claims — an empty unit list is not proof."""
+    from plugins.ghost_cursor import codex_controller as ctl_mod
+
+    repo = codex_env
+    state_dir = tmp_path / "ctl_state"
+    monkeypatch.setattr(ctl_mod.proto, "systemd_user_available", lambda: False)
+    first = ctl_mod.Controller(state_dir, str(FAKE), None, [], idle_exit_s=0)
+    srv = first.server()  # real fake app-server, uncontained
+    try:
+        assert first.containment == "none"
+        marks = [u for u in first._known_units() if str(u).startswith(ctl_mod.UNCONTAINED_MARK)]
+        assert len(marks) == 1
+        ref = cc.session_ref("Uncontained run")
+        first.save({"session": ref, "cwd": os.path.realpath(str(repo)), "next_seq": 0, "completions": [],
+                    "active_turn_id": "turn_u", "status": "running",
+                    "turns": [{"turn_id": "turn_u", "intent_id": "intent-u", "status": "running", "started_at": time.time()}]})
+        with first._claim_locked(str(repo)):
+            first.write_claim(str(repo), ref, "turn_u", owner="intent-u")
+    finally:
+        srv.close(grace_s=1.0)  # returns False: uncontained; the marker stays recorded
+    # "Controller death": a fresh Controller on the same state dir with no server object.
+    second = ctl_mod.Controller(state_dir, str(FAKE), None, [], idle_exit_s=0)
+    assert second._server is None
+    second.reconcile_on_boot()
+    st = second.load(ref)
+    assert st["active_turn_id"] is None and st["completions"][-1]["status"] == "unknown"
+    assert "worktree claim kept" in st["claim_retained"]
+    assert second._read_claim(str(repo))["owner"] == "intent-u"
+    assert guard.claim_live(second._read_claim(str(repo))) is True  # durable: blocks admission
+    resp = second._retry_retained_claim(second.load(ref))
+    assert resp["status"] == "unresolved" and "uncontained" in resp["reason"]
+    assert second._read_claim(str(repo))["owner"] == "intent-u"
+    assert second._known_units() == marks  # never dropped by the controller itself
+    # Only a deliberate operator resolution of the marker lets the proof succeed.
+    second._units_file().write_text("[]")
+    resp = second._retry_retained_claim(second.load(ref))
+    assert resp.get("claim_released") is True
+    assert second._read_claim(str(repo)) is None
