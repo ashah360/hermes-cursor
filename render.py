@@ -54,7 +54,7 @@ PENDING_MAX_ROWS = 4
 _STATUS_WORDS = {"A": "added", "M": "modified", "D": "deleted"}
 
 
-def _plan_line(plan: Any) -> str:
+def _plan_line(plan: Any, where: str = "cursor_events") -> str:
     """'plan: 2/5 done — current: <item>' from cursor's todo snapshot, or
     '' when no plan was streamed / the shape is unusable."""
     if not isinstance(plan, list) or not plan:
@@ -73,7 +73,7 @@ def _plan_line(plan: Any) -> str:
     )
     line = f"plan: {done}/{len(items)} done"
     if current:
-        line += f" — current: {clip(current, 120)}"
+        line += f" — current: {clip(current, 120, where)}"
     return line
 
 
@@ -408,6 +408,7 @@ def digest_text(
     events: Optional[List[Dict[str, Any]]] = None,
     new_count: int = 0,
     next_update_s: Any = None,
+    backend: str = "cursor",
 ) -> str:
     """One periodic progress digest: the cursor_status-style header plus
     the events since the previous tick (cursor_events-style lines, capped
@@ -422,15 +423,18 @@ def digest_text(
     scalar ``pending_tool``/``pending_tool_s`` pair, which stays accepted
     for callers without the richer snapshot. ``plan`` is cursor's own
     todo list ({content, status} dicts) when one was streamed.
+
+    ``backend`` names the agent and its events tool; Cursor is the default.
     """
+    events_tool = f"{backend}_events"
     last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
     next_update = dur_compact(next_update_s)
     lines = [
-        f"cursor session '{name}' — progress update {n}",
+        f"{backend} session '{name}' — progress update {n}",
         f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}"
         + (f" · next update in {next_update}" if next_update else ""),
     ]
-    plan_line = _plan_line(plan)
+    plan_line = _plan_line(plan, events_tool)
     if plan_line:
         lines.append(plan_line)
     if files:
@@ -443,14 +447,14 @@ def digest_text(
         for p in pending[:PENDING_MAX_ROWS]:
             since = p.get("pending_s")
             suffix = f" ({secs(since)})" if since is not None else ""
-            lines.append(f"  {clip(_one_line(p.get('title') or 'tool'), 160)}{suffix}")
+            lines.append(f"  {clip(_one_line(p.get('title') or 'tool'), 160, events_tool)}{suffix}")
         if len(pending) > PENDING_MAX_ROWS:
             lines.append(f"  … {len(pending) - PENDING_MAX_ROWS} more in-flight calls")
     lines.append("")
     if not events:
         if pending:
             lines.append(
-                "no new stream events — cursor is busy inside the calls above"
+                f"no new stream events — {backend} is busy inside the calls above"
             )
         else:
             lines.append("no new events since last update")
@@ -462,8 +466,8 @@ def digest_text(
     for record in events[-DIGEST_MAX_EVENTS:]:
         row = clip(
             f"{record.get('seq')}  {_eventlog.display_kind(record):<11}  "
-            f"{_event_summary(record)}",
-            200,
+            f"{_event_summary(record, events_tool)}",
+            200, events_tool,
         )
         if used + len(row) + 1 > DIGEST_BODY_CAP:
             break
@@ -471,7 +475,7 @@ def digest_text(
         used += len(row) + 1
         rows += 1
     if new_count > rows:
-        lines.append(f"… {new_count - rows} more — cursor_events('{name}')")
+        lines.append(f"… {new_count - rows} more — {events_tool}('{name}')")
     return "\n".join(lines)
 
 
@@ -614,7 +618,7 @@ def stop_text(
 # cursor_events
 # ---------------------------------------------------------------------------
 
-def _event_summary(record: Dict[str, Any]) -> str:
+def _event_summary(record: Dict[str, Any], where: str = "cursor_events") -> str:
     kind = _eventlog.display_kind(record)
     if kind == "tool_use":
         tool = str(record.get("tool") or "tool")
@@ -632,20 +636,20 @@ def _event_summary(record: Dict[str, Any]) -> str:
         suffix = f" ({dur / 1000:.1f}s)" if isinstance(dur, (int, float)) else ""
         head = _one_line(record.get("output") or "")
         head = f" {head}" if head else ""
-        return clip(f"→ {status}{head}{suffix}", 160)
+        return clip(f"→ {status}{head}{suffix}", 160, where)
     if kind == "file_diff":
         return (
             f"{record.get('path', '?')} +{record.get('added', 0)} "
             f"−{record.get('removed', 0)}"
         )
     if kind == "reasoning":
-        return clip(f'"{_one_line(record.get("text"))}"', 160)
+        return clip(f'"{_one_line(record.get("text"))}"', 160, where)
     if kind == "content":
-        return clip(f'"{_one_line(record.get("delta"))}"', 160)
+        return clip(f'"{_one_line(record.get("delta"))}"', 160, where)
     if kind == "lifecycle":
         event = str(record.get("event") or "lifecycle")
         err = _one_line(record.get("error") or "")
-        return clip(f"{event}: {err}" if err else event, 160)
+        return clip(f"{event}: {err}" if err else event, 160, where)
     return kind
 
 

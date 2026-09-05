@@ -941,7 +941,8 @@ def ensure_supervisor(session_name: str) -> Optional[SessionSupervisor]:
     name = str(session_name or "").strip()
     if not name:
         return None
-    if not _handles.supervision_is_live(_handles.get(name)):
+    entry = _handles.get(name)
+    if _handles.backend_of(entry) != "cursor" or not _handles.supervision_is_live(entry):
         return None
     if _job_is_live(name):
         return None
@@ -1093,6 +1094,8 @@ def reconcile_once() -> List[str]:
             name = str(entry.get("session") or "")
             if not name:
                 continue
+            if _handles.backend_of(entry) != "cursor":
+                continue  # Codex sessions are the codex controller's to supervise
             if not _handles.supervision_is_live(entry):
                 if not (
                     _adopt_legacy_handle(name, entry)

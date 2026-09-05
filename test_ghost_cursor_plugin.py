@@ -3340,11 +3340,22 @@ class TestRegistration:
         register(ctx)
 
         by_name = {c["name"]: c for c in calls}
-        assert set(by_name) == {
+        cursor_tools = {
             CREATE_TOOL_NAME, SEND_TOOL_NAME, STATUS_TOOL_NAME,
             STOP_TOOL_NAME, EVENTS_TOOL_NAME, LIST_TOOL_NAME,
             SUBSCRIBE_TOOL_NAME,
         }
+        # The codex_* backend registers beside the seven cursor tools with
+        # its own gate; the cursor seven are unchanged.
+        assert cursor_tools <= set(by_name)
+        assert {n for n in by_name if n.startswith("codex_")} == {
+            "codex_create_session", "codex_send_message", "codex_status",
+            "codex_stop", "codex_events", "codex_list", "codex_subscribe",
+        }
+        assert all(
+            by_name[n]["check_fn"] is not check_cursor_available
+            for n in by_name if n.startswith("codex_")
+        )
         for name, schema, required in (
             (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, []),
             (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, ["session", "message"]),
