@@ -10,9 +10,11 @@ until the run is observed terminal.
 
 Claim liveness (a stale claim is ignored and overwritten):
 
-* ``backend: codex`` — the controller pid is alive (same process birth).
-  The controller clears its claim on ``turn/completed`` and on boot
-  reconciliation.
+* ``backend: codex`` — see ``codex_protocol.codex_claim_live``: a
+  provisional gateway claim lives with the gateway pid; a claim the
+  controller made durable stays live until the controller releases it with
+  the matching owner (after the turn settles, or after cleanup is proven).
+  Controller death never frees it — its app-server scope may still run.
 * ``backend: cursor`` — the dispatching gateway pid is alive, OR the local
   handle for that session is still recorded ``running`` (the supervisor
   keeps that truthful across gateway restarts), OR the worktree's Cursor
@@ -33,6 +35,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+from . import codex_protocol as _proto
 from . import handles as _handles
 from . import workers as _workers
 
@@ -95,6 +98,9 @@ def _profile_id() -> str:
 def claim_live(claim: Dict[str, Any]) -> bool:
     if not isinstance(claim, dict):
         return False
+    codex = _proto.codex_claim_live(claim)
+    if codex is not None:
+        return codex  # durable controller claims survive controller death
     if _holder_alive(claim):
         return True
     if str(claim.get("backend") or "") == "cursor":

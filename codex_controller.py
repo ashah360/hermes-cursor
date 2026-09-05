@@ -202,12 +202,15 @@ class Controller:
         return _flocked(self.claims_dir / f"{claim_key(cwd)}.lock")
 
     def write_claim(self, cwd: str, session: str, turn_id: str, owner: str = "") -> None:
-        """Assert (or refresh) the claim for ``owner`` (the dispatch intent id).
-        Caller holds the flock. Only the same owner is ever overwritten."""
+        """Assert (or refresh) the claim for ``owner`` (the dispatch intent id)
+        as DURABLE: from here it is live until this controller (or its
+        successor) clears it with the matching owner — never merely because
+        the controller pid died. Caller holds the flock."""
         pid = os.getpid()
         prior = self._read_claim(cwd) or {}
         data = {"cwd": os.path.realpath(cwd), "session": session, "turn_id": turn_id, "backend": "codex",
-                "owner": owner or prior.get("owner") or "", "holder_pid": pid, "holder_birth": _pid_birth(pid),
+                "owner": owner or prior.get("owner") or "", "durable": True, "profile": prior.get("profile"),
+                "holder_pid": pid, "holder_birth": _pid_birth(pid),
                 "claimed_at": prior.get("claimed_at") if prior.get("owner") == (owner or prior.get("owner")) else _now()}
         path = self._claim_path(cwd)
         tmp = path.with_suffix(".tmp")
@@ -236,22 +239,11 @@ class Controller:
 
     @staticmethod
     def _claim_live(data: Dict[str, Any]) -> bool:
-        pid = int(data.get("holder_pid") or 0)
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        try:
-            with open(f"/proc/{pid}/stat", "r") as fh:
-                if fh.read().rsplit(")", 1)[1].split()[0] == "Z":
-                    return False
-        except Exception:
-            pass
-        return data.get("holder_birth") in (None, _pid_birth(pid))
+        codex = proto.codex_claim_live(data)
+        if codex is not None:
+            return codex
+        # A Cursor claim: the controller can only judge the holder pid.
+        return proto.pid_alive(data.get("holder_pid"), data.get("holder_birth"))
 
     def other_claim(self, cwd: str, owner: str) -> Optional[Dict[str, Any]]:
         """A LIVE claim by a different owner (any backend, any session — a
@@ -533,6 +525,8 @@ class Controller:
                 pending = state.get("pending_intent")
                 if pending:
                     return self._reconcile_pending(state, pending)
+                if state.get("claim_retained"):
+                    return self._retry_retained_claim(state)
                 return {"ok": True, "turn_id": "", "status": state.get("status") or "idle"}
             try:
                 self.server().request("turn/interrupt", {"threadId": state["thread_id"], "turnId": active}, timeout=30)
@@ -540,6 +534,25 @@ class Controller:
                 return {"ok": False, "error": str(exc), "turn_id": active}
             self.append_event(session, proto.lifecycle("interrupt_requested", turn_id=active))
             return {"ok": True, "turn_id": active, "status": "running"}
+
+    def _retry_retained_claim(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """A settled-unknown turn whose worktree claim was kept because cleanup
+        could not be proven: try again, release only on proof."""
+        survivors = self._stop_all_known_units(grace_s=5.0)
+        if survivors or (self._server is not None and not self._server.contained()):
+            return {"ok": True, "turn_id": "", "status": "unresolved", "surviving_units": survivors,
+                    "reason": (f"owned scope(s) {survivors} still cannot be proven empty" if survivors else
+                               "the app-server runs uncontained; descendant cleanup cannot be proven")
+                    + "; the worktree claim stays in place"}
+        last = (state.get("turns") or [{}])[-1]
+        self.clear_claim(state["cwd"], state["session"], owner=str(last.get("intent_id") or ""))
+        note = state.pop("claim_retained", None)
+        self.save(state)
+        self.append_event(state["session"], proto.lifecycle(
+            "claim.released", turn_id=last.get("turn_id"), was_retained=note,
+            proof="every owned app-server scope cgroup is empty (verified via systemd + cgroup.procs)"))
+        return {"ok": True, "turn_id": "", "status": state.get("status") or "unknown", "claim_released": True,
+                "proof": "every owned app-server scope cgroup is empty (verified via systemd + cgroup.procs)"}
 
     def _reconcile_pending(self, state: Dict[str, Any], pending: Dict[str, Any]) -> Dict[str, Any]:
         """Explicit stop on an unresolved dispatch intent.

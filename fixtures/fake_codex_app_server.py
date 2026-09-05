@@ -25,6 +25,7 @@ every inbound request appended, for assertions.
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -101,7 +102,11 @@ def run_turn(thread_id, turn_id, prompt, ctl):
         finish("failed", {"message": "command approval declined", "codexErrorInfo": "Other"})
         return
     if "hang" in prompt:
+        # A real "tool shell" descendant that leaves the session (setsid) and
+        # outlives this process: only an owned cgroup can prove it gone.
+        tool = subprocess.Popen([sys.executable, "-c", "import os, time; os.setsid(); time.sleep(120)"])
         ctl["interrupt"].wait(timeout=60)
+        tool.kill()
         notify("item/completed", {"threadId": thread_id, "turnId": turn_id, "item": {**cmd_item, "status": "failed", "exitCode": 130}})
         finish("interrupted")
         return

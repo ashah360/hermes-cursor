@@ -73,6 +73,15 @@ worker behavior. Full authoritative scope: the plan in
   Recorded entries that are not controller-minted unit names are never
   signalled and count as unproven. No automatic re-send. A steer that races a
   finishing turn returns without starting a new turn.
+- **Claim liveness (Codex)** has two phases in one file
+  (`codex_protocol.codex_claim_live`, used by both the gateway guard and the
+  controller): the gateway's provisional claim lives with the gateway pid;
+  once the controller asserts it before `turn/start` it is `durable` and
+  stays live until the controller (or its successor) releases it with the
+  matching owner after the turn settles or cleanup is proven. Controller
+  death never frees it — the owned scope may still run. A claim kept after
+  an unproven cleanup (`claim_retained`) keeps blocking both backends;
+  `codex_stop` retries the proof and releases only on success.
 - **Claim ownership** is per dispatch: the claim carries `owner` (the
   dispatch intent id for Codex; `cursor:<profile>:<session>:<dispatch>` for
   Cursor) and `profile`. `reserve` refuses any live claim with another owner

@@ -385,6 +385,10 @@ def codex_stop(session: str, **_: Any) -> str:
         return (f"no turn was ever observed for the pending dispatch in '{name}', and it could NOT be proven idle: "
                 f"{resp.get('reason')}. The intent and the worktree reservation stay in place; retry {STOP} once the "
                 "other sessions finish, or inspect the worktree.")
+    if resp.get("claim_released"):
+        _codex.follower.ingest(name, _handles.get(name) or {})
+        return (f"no active turn in '{name}'; the worktree reservation kept after the earlier unproven cleanup is now "
+                f"released ({resp.get('proof')}).")
     if resp.get("intent_cleared"):
         _codex.follower.ingest(name, _handles.get(name) or {})
         _handles.record(name, status="failed", pending_intent_id=None,

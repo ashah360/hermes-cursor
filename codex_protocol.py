@@ -62,6 +62,51 @@ class RpcError(ProtocolError):
 
 
 UNIT_PREFIX = "ghost-cursor-codex-app-"
+
+
+def pid_alive(pid: Any, birth: Any) -> bool:
+    """Process alive (not a zombie) with the same /proc start time."""
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            rest = fh.read().rsplit(")", 1)[1].split()
+        if rest[0] == "Z":
+            return False
+        return birth is None or int(rest[19]) == int(birth)
+    except Exception:
+        return True
+
+
+def codex_claim_live(claim: Dict[str, Any]) -> Optional[bool]:
+    """Liveness of a CODEX worktree claim; None when the claim is not Codex's.
+
+    Two phases share one file:
+
+    * provisional — written by the gateway before it contacts the controller
+      (``durable`` absent): live while the gateway pid is alive. If that
+      gateway dies before the controller takes over, nothing runs.
+    * durable — asserted by the controller before ``turn/start``
+      (``durable: true``): live until the controller releases it with the
+      matching owner after the turn settles or cleanup is PROVEN. Controller
+      death is not release: the owned app-server scope and its descendants
+      keep running independently, so a dead holder pid means nothing here.
+    """
+    if not isinstance(claim, dict) or str(claim.get("backend") or "") != "codex":
+        return None
+    if claim.get("durable"):
+        return True
+    return pid_alive(claim.get("holder_pid"), claim.get("holder_birth"))
 _SYSTEMCTL_TIMEOUT_S = 20.0
 
 

@@ -1001,3 +1001,77 @@ def test_stale_recorded_ids_never_signal_unrelated_processes(codex_env, tmp_path
     finally:
         bystander.kill()
         bystander.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Review finding: controller death must not free the worktree while its owned
+# app-server scope still executes; failed cleanup on restart keeps blocking.
+# ---------------------------------------------------------------------------
+
+@_needs_user_systemd
+def test_controller_death_keeps_worktree_reserved_until_proven_cleanup(codex_env, monkeypatch, tmp_path):
+    import plugins.ghost_cursor.codex_protocol as proto
+
+    repo = codex_env
+    name = "Survives controller death"
+    cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    assert "turn turn_1" in cb.codex_send_message(name, "hang here")
+    units = json.loads((cc.state_dir() / "appserver_units.json").read_text())
+    assert len(units) == 1 and units[0].startswith(proto.UNIT_PREFIX)
+    unit = units[0]
+    assert proto.unit_procs(unit), "owned app-server scope should be running"
+    claim = guard.current(str(repo), cc.claims_dir())
+    assert claim["durable"] is True and claim["session"] == cc.session_ref(name)
+    owner = claim["owner"]
+    try:
+        # Kill the controller hard. Its scope (fake app-server + hanging turn) keeps running.
+        ctl_pid = int(cc.controller_info()["pid"])
+        os.kill(ctl_pid, signal.SIGKILL)
+        assert _wait(lambda: _dead(ctl_pid), timeout=5)
+        (cc.state_dir() / "control.sock").unlink(missing_ok=True)
+        assert proto.unit_procs(unit), "live owned execution remains after controller death"
+        # Admission BEFORE restart: the durable claim still blocks both backends.
+        assert guard.current(str(repo), cc.claims_dir())["owner"] == owner
+        _handles.record("Cursor after crash", repo=str(repo), status="created", runtime="local")
+        res = plugin._send_to_session("Cursor after crash", _handles.get("Cursor after crash"), "x", None, None)
+        assert res["status"] == "rejected" and "codex" in res["session"], res
+        cb.codex_create_session(title="Codex after crash", repo=str(repo), model="test-model")
+        # (codex send restarts the controller; poison the unit record first so boot cleanup cannot be proven)
+        (cc.state_dir() / "appserver_units.json").write_text(json.dumps([unit, 4242]))
+        out = cb.codex_send_message("Codex after crash", "x")
+        assert "already running" in out and name in out, out
+        # Boot reconciliation ran: the real owned scope was stopped and proven, the
+        # non-minted entry could not be, so the turn settled unknown WITH the claim kept.
+        assert proto.unit_procs(unit) == []
+        st = _controller_state(name)
+        assert st["active_turn_id"] is None and st["completions"][-1]["status"] == "unknown"
+        assert "worktree claim kept" in st["claim_retained"]
+        assert json.loads((cc.state_dir() / "appserver_units.json").read_text()) == [4242]
+        assert guard.current(str(repo), cc.claims_dir())["owner"] == owner
+        res = plugin._send_to_session("Cursor after crash", _handles.get("Cursor after crash"), "x", None, None)
+        assert res["status"] == "rejected"
+        # An explicit stop cannot prove cleanup either: still unresolved, still reserved.
+        stop = cb.codex_stop(name)
+        assert "could NOT be proven idle" in stop or "cannot be proven" in stop, stop
+        assert guard.current(str(repo), cc.claims_dir())["owner"] == owner
+        # Operator resolves the unprovable record; the same stop path now proves cleanup and releases.
+        (cc.state_dir() / "appserver_units.json").write_text("[]")
+        stop = cb.codex_stop(name)
+        assert "is now released" in stop and "cgroup is empty" in stop, stop
+        assert guard.current(str(repo), cc.claims_dir()) is None
+        events = _deliveries()
+        assert any(e["delegation_id"] == f"{name}#codex-turn-turn_1" and e["status"] == "failed" for e in events)
+        # Admission after proven cleanup.
+        res = plugin._send_to_session("Cursor after crash", _handles.get("Cursor after crash"), "x", None, None)
+        assert res["status"] != "rejected"  # admitted (the cursor run itself fails fast here: no API key)
+        job = _jobs.registry.get_by_name("Cursor after crash")
+        if job is not None:
+            job.done_event.wait(10)  # its finalize releases the cursor claim
+        left = guard.current(str(repo), cc.claims_dir())
+        if left is not None:
+            plugin._release_worktree(str(repo), "Cursor after crash", left["owner"])
+        assert "turn turn_" in cb.codex_send_message("Codex after crash", "quick")
+        assert _wait(_settled("Codex after crash"))
+        _deliveries()
+    finally:
+        proto.stop_unit(unit, 3.0)
