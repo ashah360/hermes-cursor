@@ -61,6 +61,53 @@ class RpcError(ProtocolError):
         self.data = data
 
 
+def group_members(pgid: int) -> List[int]:
+    """Live (non-zombie) pids whose process group is ``pgid``, from /proc."""
+    out: List[int] = []
+    if pgid <= 0:
+        return out
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "r") as fh:
+                rest = fh.read().rsplit(")", 1)[1].split()
+        except Exception:
+            continue
+        # rest[0] = state, rest[1] = ppid, rest[2] = pgrp
+        if len(rest) > 2 and rest[2] == str(pgid) and rest[0] != "Z":
+            out.append(int(name))
+    return out
+
+
+def group_empty(pgid: int) -> bool:
+    return not group_members(pgid)
+
+
+def terminate_group(pgid: int, grace_s: float) -> bool:
+    """SIGTERM, then SIGKILL, the whole group; True only when it is observed
+    empty. A group whose leader is gone but still has members is ours (Linux
+    never reuses a pid that is still a live pgid), so signalling is safe."""
+    if pgid <= 0:
+        return True
+    deadline = time.monotonic() + max(grace_s, 0.1)
+    for sig in (15, 9):
+        if group_empty(pgid):
+            return True
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return group_empty(pgid)
+        except PermissionError:
+            return False
+        while time.monotonic() < deadline:
+            if group_empty(pgid):
+                return True
+            time.sleep(0.05)
+        deadline = time.monotonic() + max(grace_s, 0.1)
+    return group_empty(pgid)
+
+
 def _clip(text: Any, limit: int) -> str:
     s = str(text or "")
     return s if len(s) <= limit else s[:limit] + f"\n… [truncated {len(s) - limit} chars]"
@@ -106,6 +153,7 @@ class AppServer:
             start_new_session=True,
         )
         self.pid = self._proc.pid
+        self.pgid = self._proc.pid  # start_new_session=True: leader of its own group
         threading.Thread(target=self._read_loop, name="codex-appserver-stdout", daemon=True).start()
         threading.Thread(target=self._stderr_loop, name="codex-appserver-stderr", daemon=True).start()
 
@@ -117,7 +165,16 @@ class AppServer:
     def returncode(self) -> Optional[int]:
         return self._proc.poll()
 
-    def close(self, grace_s: float = 5.0) -> None:
+    def close(self, grace_s: float = 5.0) -> bool:
+        """Stop the app-server AND everything it spawned.
+
+        The child was started as a session/process-group leader, so the
+        whole group is signalled — a parent that exits cleanly on stdin EOF
+        never signals its own descendants (tool shells), so the parent's
+        exit alone is not termination evidence. Returns True only when the
+        process group is OBSERVED empty afterwards (:func:`group_empty`);
+        False means owned execution may still be running.
+        """
         self._closed = True
         try:
             if self._proc.stdin:
@@ -127,19 +184,22 @@ class AppServer:
         try:
             self._proc.wait(timeout=grace_s)
         except Exception:
-            try:
-                os.killpg(self._proc.pid, 15)
-                self._proc.wait(timeout=grace_s)
-            except Exception:
-                try:
-                    os.killpg(self._proc.pid, 9)
-                except Exception:
-                    pass
+            pass
+        proven = terminate_group(self.pgid, grace_s)
+        try:
+            self._proc.wait(timeout=0.1)  # reap the leader if it is ours
+        except Exception:
+            pass
         with self._lock:
             waiters = list(self._pending.values())
             self._pending.clear()
         for q in waiters:
             q.put({"_transport": True, "error": {"code": -1, "message": "app-server closed"}})
+        return proven
+
+    def group_empty(self) -> bool:
+        """True when no process in the app-server's group remains."""
+        return group_empty(self.pgid)
 
     # -- wire ----------------------------------------------------------------
 

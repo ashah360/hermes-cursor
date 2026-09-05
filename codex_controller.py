@@ -294,7 +294,41 @@ class Controller:
             self._server = srv
             self._catalog = None
             self._thread_to_session.clear()
+            self._record_group(srv.pgid)
             return srv
+
+    def _group_file(self) -> Path:
+        return self.state_dir / "appserver_groups.json"
+
+    def _record_group(self, pgid: int) -> None:
+        """Remember every app-server process group this state dir ever
+        started, until it is proven empty (boot reconciliation checks them)."""
+        groups = self._known_groups()
+        if pgid not in groups:
+            groups.append(pgid)
+        self._group_file().write_text(json.dumps(groups), "utf-8")
+
+    def _known_groups(self) -> List[int]:
+        try:
+            data = json.loads(self._group_file().read_text("utf-8"))
+            return [int(g) for g in data] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _forget_group(self, pgid: int) -> None:
+        groups = [g for g in self._known_groups() if g != pgid]
+        self._group_file().write_text(json.dumps(groups), "utf-8")
+
+    def _stop_all_known_groups(self, grace_s: float = 5.0) -> List[int]:
+        """Terminate every recorded app-server group; return the pgids that
+        could NOT be proven empty (they stay recorded)."""
+        survivors: List[int] = []
+        for pgid in self._known_groups():
+            if proto.terminate_group(pgid, grace_s):
+                self._forget_group(pgid)
+            else:
+                survivors.append(pgid)
+        return survivors
 
     def catalog(self) -> List[Dict[str, Any]]:
         srv = self.server()
@@ -506,25 +540,26 @@ class Controller:
         unresolved — reported honestly.
         """
         session = state["session"]
-        srv = self._server
-        proof = ""
-        if srv is None or not srv.alive():
-            proof = "app-server child is not running"
-        else:
-            others = [s for s in self._active_sessions() if s != session]
-            if others:
-                return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
-                        "reason": ("cannot prove the lost dispatch is not executing: the shared codex app-server "
-                                   f"still serves active turns for {len(others)} other session(s); the intent and the "
-                                   "worktree claim stay in place")}
-            with self._lock:
-                app, self._server = self._server, None
+        others = [s for s in self._active_sessions() if s != session]
+        if others and self._server is not None:
+            return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
+                    "reason": ("cannot prove the lost dispatch is not executing: the shared codex app-server "
+                               f"still serves active turns for {len(others)} other session(s); the intent and the "
+                               "worktree claim stay in place")}
+        # Proof is the PROCESS GROUP being empty — every app-server group this
+        # state dir ever started, including one whose leader exited cleanly
+        # and left tool descendants behind. The leader's exit (or
+        # AppServer.alive()) is never accepted as evidence on its own.
+        with self._lock:
+            app, self._server = self._server, None
+        if app is not None:
             app.close(grace_s=5.0)
-            if app.alive():
-                self._server = app
-                return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
-                        "reason": "codex app-server did not exit within the bound; intent and claim stay in place"}
-            proof = f"app-server child (pid {app.pid}) terminated by the controller"
+        survivors = self._stop_all_known_groups(grace_s=5.0)
+        if survivors:
+            return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
+                    "reason": (f"owned app-server process group(s) {survivors} still have live members after "
+                               "SIGTERM/SIGKILL; intent and claim stay in place"), "surviving_groups": survivors}
+        proof = "every owned app-server process group is empty (verified via /proc)"
         state["pending_intent"] = None
         state["status"] = "unknown"
         self.save(state)
@@ -729,7 +764,8 @@ class Controller:
             state["last_activity_at"] = _now()
             self.save(state)
 
-    def _settle_turn(self, state: Dict[str, Any], turn_state: Optional[Dict[str, Any]], env: Dict[str, Any]) -> None:
+    def _settle_turn(self, state: Dict[str, Any], turn_state: Optional[Dict[str, Any]], env: Dict[str, Any],
+                     release_claim: bool = True) -> None:
         turn_id = str(env.get("turn_id") or state.get("active_turn_id") or "")
         if env.get("event") == "run.completed":
             status = "completed"
@@ -752,7 +788,8 @@ class Controller:
             "files": files, "started_at": (turn_state or {}).get("started_at"), "finished_at": _now(),
             "delivered": False, "model": state.get("model"),
         })
-        self.clear_claim(state["cwd"], state["session"], owner=str((turn_state or {}).get("intent_id") or ""))
+        if release_claim:
+            self.clear_claim(state["cwd"], state["session"], owner=str((turn_state or {}).get("intent_id") or ""))
 
     def _on_request(self, msg: Dict[str, Any]) -> None:
         method = str(msg.get("method") or "")
@@ -776,19 +813,30 @@ class Controller:
         with self._lock:
             if srv is not None and self._server is not None and self._server is not srv:
                 return  # a stale exit from an app-server already replaced
+            # The leader exited; its tool descendants may not have. Stop the
+            # whole group and only release worktree claims when it is proven
+            # empty — otherwise the claims stay (a later stop/boot retries).
+            group_ok = True
+            if srv is not None:
+                group_ok = proto.terminate_group(srv.pgid, 5.0)
+                if group_ok:
+                    self._forget_group(srv.pgid)
             for session, state in self._active_sessions().items():
                 turn_id = state.get("active_turn_id")
                 env = proto.lifecycle("run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
                                       error=f"codex app-server exited (code {code}) while the turn was active; "
                                             "outcome unknown — inspect the worktree before re-sending",
-                                      app_server_exit=True)
+                                      app_server_exit=True, descendants_stopped=group_ok)
                 self.append_event(session, env, state)
                 turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
-                self._settle_turn(state, turn_state, env)
+                self._settle_turn(state, turn_state, env, release_claim=group_ok)
                 state["status"] = "unknown"
                 if turn_state is not None:
                     turn_state["status"] = "unknown"
                 state["completions"][-1]["status"] = "unknown"
+                if not group_ok:
+                    state["claim_retained"] = ("app-server process group still has live members after "
+                                               "SIGTERM/SIGKILL; worktree claim kept")
                 self.save(state)
             self._server = None
 
@@ -798,16 +846,23 @@ class Controller:
         outcome. Settle it honestly (never re-run the prompt) and drop its
         claim so the worktree is not held by a ghost."""
         with self._lock:
+            # The previous controller's app-server groups may have orphaned
+            # tool descendants: terminate every recorded group and release
+            # claims only when they are all proven empty.
+            survivors = self._stop_all_known_groups(grace_s=5.0)
             for session, state in self._active_sessions().items():
                 turn_id = state.get("active_turn_id")
                 env = proto.lifecycle(
                     "run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
                     error="codex controller restarted while the turn was active; outcome unknown — inspect the "
-                          "worktree before re-sending", controller_restart=True,
+                          "worktree before re-sending", controller_restart=True, descendants_stopped=not survivors,
                 )
                 self.append_event(session, env, state)
                 turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
-                self._settle_turn(state, turn_state, env)
+                self._settle_turn(state, turn_state, env, release_claim=not survivors)
+                if survivors:
+                    state["claim_retained"] = (f"previous app-server group(s) {survivors} still have live members; "
+                                               "worktree claim kept")
                 state["status"] = "unknown"
                 if turn_state is not None:
                     turn_state["status"] = "unknown"

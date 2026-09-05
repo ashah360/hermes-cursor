@@ -57,10 +57,16 @@ worker behavior. Full authoritative scope: the plan in
   turn id is ambiguous: the intent (`ambiguous: true`) and the claim are
   retained, a later `turn/started` for the thread adopts the turn, and
   further sends are refused. `codex_stop` clears the intent only after the
-  controller proves quiescence — its app-server child is dead, or it is the
-  only session on that child and the child is torn down (bounded). If other
-  sessions are active on the shared child, stop reports `unresolved` and
-  keeps intent and claim. No automatic re-send. A steer that races a
+  controller proves quiescence: every app-server PROCESS GROUP this state
+  dir ever started (recorded in `appserver_groups.json`) is SIGTERM/SIGKILLed
+  and observed empty via `/proc` — a leader that exits cleanly on stdin EOF
+  leaves tool descendants behind, so the leader's exit (or
+  `AppServer.alive()`) is never accepted as evidence. If other sessions are
+  active on the shared child, or a group still has members, stop reports
+  `unresolved` and keeps intent and claim. The same proof gates claim
+  release in `_on_exit` and boot reconciliation (`claim_retained` on the
+  session record when it fails). Descendants that leave the group
+  (`setsid`) are outside this proof. No automatic re-send. A steer that races a
   finishing turn returns without starting a new turn.
 - **Claim ownership** is per dispatch: the claim carries `owner` (the
   dispatch intent id for Codex; `cursor:<profile>:<session>:<dispatch>` for

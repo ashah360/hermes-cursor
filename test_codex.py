@@ -564,11 +564,12 @@ def test_lost_reply_with_no_turn_releases_only_after_proven_quiescence(codex_env
     # Free the neighbour; now the controller can tear down its own child and prove quiescence.
     assert "status: cancelled" in cb.codex_stop("Busy neighbour")
     stop = cb.codex_stop(name)
-    assert "cleared the unresolved dispatch intent" in stop and "terminated by the controller" in stop
+    assert "cleared the unresolved dispatch intent" in stop and "process group is empty (verified via /proc)" in stop
     assert guard.current(str(repo), cc.claims_dir()) is None
     log = _eventlog.read_events(name, offset=0, limit=100)["events"]
     cleared = [e for e in log if e.get("event") == "intent.cleared"]
-    assert cleared and "terminated" in cleared[0]["proof"]
+    assert cleared and "group is empty" in cleared[0]["proof"]
+    assert not (cc.state_dir() / "appserver_groups.json").exists() or json.loads((cc.state_dir() / "appserver_groups.json").read_text()) == []
     assert "turn turn_" in cb.codex_send_message(name, "after clearing")  # fresh child, fresh turn
     assert _wait(_settled(name))
     _deliveries()
@@ -588,7 +589,7 @@ def test_app_server_death_before_turn_start_reply_is_ambiguous(codex_env, monkey
     assert any(e.get("event") == "dispatch.ambiguous" for e in log)
     assert not any(e.get("event") == "dispatch.failed" for e in log)
     stop = cb.codex_stop(name)
-    assert "cleared the unresolved dispatch intent" in stop and "not running" in stop
+    assert "cleared the unresolved dispatch intent" in stop and "process group is empty (verified via /proc)" in stop
     assert guard.current(str(repo), cc.claims_dir()) is None
 
 
@@ -815,3 +816,114 @@ def test_restart_projection_comes_from_controller_record(codex_env, monkeypatch)
     proj = cc.follower.turn_projection(name)
     assert [f["path"] for f in proj["files"]] == ["calc.py"]
     _deliveries()
+
+
+# ---------------------------------------------------------------------------
+# Review finding: a cleanly exiting app-server leaves tool descendants behind
+# ---------------------------------------------------------------------------
+
+_ORPHANING_PARENT = r"""
+import os, subprocess, sys, time
+# Behaves like an app-server whose tool shell outlives it: fork a sleeping
+# descendant in the SAME process group, then exit 0 on stdin EOF.
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+sys.stdout.write('{"pid": %d}\n' % child.pid)
+sys.stdout.flush()
+sys.stdin.read()
+sys.exit(0)
+"""
+
+
+def _proc_state(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0]
+    except FileNotFoundError:
+        return None
+
+
+def test_app_server_close_stops_orphaned_descendants(tmp_path):
+    import plugins.ghost_cursor.codex_protocol as proto
+
+    script = tmp_path / "orphaning_parent.py"
+    script.write_text(_ORPHANING_PARENT)
+    wrapper = tmp_path / "fake_codex"
+    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script}\n")
+    wrapper.chmod(0o755)
+    seen = []
+    srv = proto.AppServer(str(wrapper), on_notification=seen.append)
+    deadline = time.monotonic() + 5
+    child_pid = None
+    while time.monotonic() < deadline and child_pid is None:
+        members = proto.group_members(srv.pgid)
+        others = [m for m in members if m != srv.pid]
+        child_pid = others[0] if others else None
+        time.sleep(0.05)
+    assert child_pid is not None, "descendant never appeared in the group"
+    assert _proc_state(child_pid) == "S"
+    proven = srv.close(grace_s=0.5)
+    # The parent exited 0 on EOF; alive() is NOT the evidence — the group is.
+    assert srv.returncode() == 0
+    assert proven is True
+    assert proto.group_empty(srv.pgid)
+    assert _proc_state(child_pid) in (None, "Z")
+    # Group scan on a leader-less group: a surviving member is still found.
+    survivor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        assert proto.group_members(survivor.pid) == [survivor.pid]
+        assert proto.terminate_group(survivor.pid, 1.0) is True
+        assert proto.group_empty(survivor.pid)
+    finally:
+        try:
+            survivor.kill()
+        except Exception:
+            pass
+        survivor.wait(timeout=5)
+
+
+def test_unproven_group_cleanup_retains_intent_and_claim(codex_env, monkeypatch, tmp_path):
+    """The real controller code path, in-process, with group termination
+    reporting failure: the worktree claim and the intent must survive; once
+    termination is proven the same path releases them."""
+    import plugins.ghost_cursor.codex_protocol as proto
+    from plugins.ghost_cursor import codex_controller as ctl_mod
+
+    repo = codex_env
+    state_dir = tmp_path / "ctl_state"
+    ctl = ctl_mod.Controller(state_dir, str(FAKE), None, [], idle_exit_s=0)
+    ref = cc.session_ref("Unproven")
+    ctl.save({"session": ref, "cwd": os.path.realpath(str(repo)), "next_seq": 0, "turns": [], "completions": [],
+              "pending_intent": {"intent_id": "intent-x", "ambiguous": True, "at": time.time()}})
+    with ctl._claim_locked(str(repo)):
+        ctl.write_claim(str(repo), ref, "pending", owner="intent-x")
+    ctl._record_group(999999)  # a recorded app-server group we cannot prove empty
+
+    class Unkillable:
+        pid = pgid = 999999
+
+        def close(self, grace_s=5.0):
+            return False
+
+    ctl._server = Unkillable()
+    monkeypatch.setattr(ctl_mod.proto, "terminate_group", lambda pgid, grace: False)
+    resp = ctl._reconcile_pending(ctl.load(ref), ctl.load(ref)["pending_intent"])
+    assert resp["status"] == "unresolved" and resp["surviving_groups"] == [999999]
+    assert ctl.load(ref)["pending_intent"]["intent_id"] == "intent-x"
+    assert ctl._read_claim(str(repo))["owner"] == "intent-x"
+    assert ctl._known_groups() == [999999]
+    # _on_exit with an unproven group: turn settles as unknown but the claim is kept.
+    ctl.save({**ctl.load(ref), "pending_intent": None, "active_turn_id": "turn_z",
+              "turns": [{"turn_id": "turn_z", "intent_id": "intent-x", "status": "running", "started_at": time.time()}]})
+    dead = Unkillable()
+    ctl._server = dead
+    ctl._on_exit((1, dead))
+    st = ctl.load(ref)
+    assert st["active_turn_id"] is None and st["completions"][-1]["status"] == "unknown"
+    assert "worktree claim kept" in st["claim_retained"]
+    assert ctl._read_claim(str(repo))["owner"] == "intent-x"
+    # Now termination is provable: the same reconciliation releases everything.
+    monkeypatch.setattr(ctl_mod.proto, "terminate_group", lambda pgid, grace: True)
+    ctl.save({**ctl.load(ref), "pending_intent": {"intent_id": "intent-x", "ambiguous": True}})
+    resp = ctl._reconcile_pending(ctl.load(ref), ctl.load(ref)["pending_intent"])
+    assert resp.get("intent_cleared") == "intent-x" and "empty" in resp["proof"]
+    assert ctl._read_claim(str(repo)) is None and ctl._known_groups() == []
