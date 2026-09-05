@@ -1,26 +1,37 @@
-"""Cross-backend writer exclusion for one canonical LOCAL worktree.
+"""One writer per canonical LOCAL worktree, across Cursor and Codex.
 
-Two agents writing one working tree corrupt it, whichever backend drives
-them. Both dispatch paths ask here before starting a turn:
+The reservation is a claim file ``<codex state>/claims/<key>.json`` written
+under a per-worktree ``flock`` (``<key>.lock``). Both dispatch paths call
+:func:`reserve` inside that lock, so two writers can never both pass the
+check: the check and the write are one critical section, across threads,
+gateway processes and profiles (the claims dir is machine-global). The
+claim is held from BEFORE the dispatch is sent (ambiguous outcomes keep it)
+until the run is observed terminal.
 
-* Cursor writer evidence: an in-process running local job on the repo, or
-  a persisted local Cursor handle still recorded ``running`` (the
-  supervisor keeps that record truthful across gateway restarts).
-* Codex writer evidence: the controller's active-turn claim file
-  (``<codex state>/claims/<sha1(realpath)[:16]>.json``) whose holder pid
-  is alive with the same process birth. A dead holder's claim is stale
-  and ignored.
+Claim liveness (a stale claim is ignored and overwritten):
 
-Cursor cloud sessions have no local worktree and are never blocked.
+* ``backend: codex`` — the controller pid is alive (same process birth).
+  The controller clears its claim on ``turn/completed`` and on boot
+  reconciliation.
+* ``backend: cursor`` — the dispatching gateway pid is alive, OR the local
+  handle for that session is still recorded ``running`` (the supervisor
+  keeps that truthful across gateway restarts), OR the worktree's Cursor
+  worker still holds a run lease (machine-global evidence from
+  ``workers.py``).
+
+Cursor cloud sessions have no local worktree and never reserve.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+import time
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from . import handles as _handles
 from . import workers as _workers
@@ -40,11 +51,7 @@ def _pid_birth(pid: int) -> Optional[int]:
         return None
 
 
-def _holder_alive(claim: Dict[str, Any]) -> bool:
-    try:
-        pid = int(claim.get("holder_pid") or 0)
-    except (TypeError, ValueError):
-        return False
+def _pid_alive(pid: int, birth: Any) -> bool:
     if pid <= 0:
         return False
     try:
@@ -59,29 +66,88 @@ def _holder_alive(claim: Dict[str, Any]) -> bool:
                 return False
     except Exception:
         pass
-    birth = claim.get("holder_birth")
     return birth is None or _pid_birth(pid) == birth
 
 
-def codex_writer(repo: str, claims_dir: str) -> Optional[Dict[str, Any]]:
-    """The live Codex claim on ``repo``'s canonical worktree, or None."""
+def _holder_alive(claim: Dict[str, Any]) -> bool:
     try:
-        canonical = _workers.canonical_repo_path(repo)
-        path = os.path.join(claims_dir, f"{claim_key(canonical)}.json")
+        pid = int(claim.get("holder_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    return _pid_alive(pid, claim.get("holder_birth"))
+
+
+def _worker_lease_held(canonical: str) -> bool:
+    """Machine-global Cursor evidence: the worktree's worker holds a run lease."""
+    try:
+        record = _workers._read_record(_workers.worker_name_for(canonical))
+    except Exception:
+        return False
+    return bool(record is not None and record.leases)
+
+
+def claim_live(claim: Dict[str, Any]) -> bool:
+    if not isinstance(claim, dict):
+        return False
+    if _holder_alive(claim):
+        return True
+    if str(claim.get("backend") or "") == "cursor":
+        entry = _handles.get(str(claim.get("session") or ""))
+        if entry is not None and str(entry.get("status") or "") == "running":
+            return True
+        return _worker_lease_held(str(claim.get("cwd") or ""))
+    return False
+
+
+def _paths(canonical: str, claims_dir: str) -> Tuple[str, str]:
+    key = claim_key(canonical)
+    return os.path.join(claims_dir, f"{key}.json"), os.path.join(claims_dir, f"{key}.lock")
+
+
+@contextmanager
+def _locked(lock_path: str) -> Iterator[None]:
+    os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+    fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+def _read(path: str) -> Optional[Dict[str, Any]]:
+    try:
         with open(path, "r", encoding="utf-8") as fh:
-            claim = json.load(fh)
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
     except FileNotFoundError:
         return None
     except Exception:
-        logger.debug("codex claim read failed", exc_info=True)
+        logger.debug("claim read failed", exc_info=True)
         return None
-    if not isinstance(claim, dict) or not _holder_alive(claim):
-        return None
-    return claim
+
+
+def _write(path: str, claim: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(claim, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def current(repo: str, claims_dir: str) -> Optional[Dict[str, Any]]:
+    """The LIVE claim on ``repo``'s worktree, or None (read-only)."""
+    canonical = _workers.canonical_repo_path(repo)
+    path, _ = _paths(canonical, claims_dir)
+    claim = _read(path)
+    return claim if claim is not None and claim_live(claim) else None
 
 
 def cursor_writer(repo: str) -> Optional[str]:
-    """The Cursor session name actively writing ``repo``'s worktree, or None."""
+    """The Cursor session (or worker) actively writing ``repo``'s worktree, or None."""
     try:
         from . import jobs as _jobs
 
@@ -97,6 +163,66 @@ def cursor_writer(repo: str) -> Optional[str]:
             recorded = str(entry.get("repo") or "")
             if recorded and os.path.isdir(recorded) and _workers.canonical_repo_path(recorded) == canonical:
                 return str(entry.get("session") or "")
+        if _worker_lease_held(canonical):
+            return f"cursor worker {_workers.worker_name_for(canonical)} (run lease held)"
     except Exception:
         logger.debug("cursor writer probe failed", exc_info=True)
     return None
+
+
+def reserve(
+    repo: str, backend: str, session: str, claims_dir: str, **extra: Any
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Atomically reserve ``repo``'s canonical worktree for ``session``.
+
+    Returns ``(claim, None)`` when reserved (or re-asserted by the same
+    session), ``(None, holder)`` when another live writer holds it —
+    ``holder`` names the backend and session. Check and write happen under
+    the worktree flock.
+    """
+    canonical = _workers.canonical_repo_path(repo)
+    path, lock_path = _paths(canonical, claims_dir)
+    with _locked(lock_path):
+        existing = _read(path)
+        if existing is not None and str(existing.get("session")) != str(session) and claim_live(existing):
+            return None, existing
+        if backend == "codex":
+            other = cursor_writer(canonical)
+            if other and other != session:
+                return None, {"backend": "cursor", "session": other, "cwd": canonical}
+        pid = os.getpid()
+        claim = {
+            "cwd": canonical, "backend": backend, "session": str(session), "holder_pid": pid,
+            "holder_birth": _pid_birth(pid), "claimed_at": round(time.time(), 3), **extra,
+        }
+        _write(path, claim)
+        return claim, None
+
+
+def release(repo: str, session: str, claims_dir: str) -> bool:
+    """Drop ``session``'s claim on the worktree. True when a claim was removed."""
+    canonical = _workers.canonical_repo_path(repo)
+    path, lock_path = _paths(canonical, claims_dir)
+    with _locked(lock_path):
+        existing = _read(path)
+        if existing is None or str(existing.get("session")) != str(session):
+            return False
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return True
+
+
+def describe(holder: Optional[Dict[str, Any]]) -> str:
+    """Human name for a busy holder. A Cursor holder is its plain handle (so
+    the rejection text stays a usable cursor_* argument); a Codex holder is
+    '<title> (codex backend)' with the profile prefix stripped."""
+    holder = holder or {}
+    session = str(holder.get("session") or "?")
+    backend = str(holder.get("backend") or "unknown")
+    if backend == "cursor":
+        return session
+    if ":" in session and backend == "codex":
+        session = session.split(":", 1)[1]
+    return f"{session} ({backend} backend)"

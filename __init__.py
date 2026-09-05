@@ -572,6 +572,10 @@ def _resolve_session(identifier: str) -> Optional[str]:
         return None
     name = _handles.resolve(ident)
     if name:
+        # Backend fence: a Codex-bound handle is never a Cursor session —
+        # not dispatchable, stoppable or listable through cursor_* tools.
+        if _handles.backend_of(_handles.get(name)) != "cursor":
+            return None
         return name
     # A live job whose handle record hasn't landed yet (dispatch races).
     job = _jobs.registry.get_by_session(ident)
@@ -1124,6 +1128,14 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
 # Dispatch plumbing behind cursor_send_message
 # ---------------------------------------------------------------------------
 
+def _release_worktree(repo: str, session_name: str) -> None:
+    """Drop this session's worktree reservation. Never raises."""
+    try:
+        _guard.release(repo, session_name, _codex_client.claims_dir())
+    except Exception:
+        logger.debug("worktree release failed for %s", session_name, exc_info=True)
+
+
 def _dispatch_run(
     task: str,
     workdir: str,
@@ -1152,11 +1164,19 @@ def _dispatch_run(
         requested_session_id=(str(session_id).strip() or None) if session_id else None,
         requested_model=model,
         runtime=runtime,
+        # The worktree reservation taken in _send_to_session is released by
+        # jobs._finalize once the run is observed terminal (local only).
+        writer_release=(
+            (lambda: _release_worktree(str(workdir), session_name))
+            if runtime != "cloud" and session_name else None
+        ),
     )
     if job is None:
         # Same-repo concurrency guard: two cursor agents on one working tree
         # corrupt it. Surface the existing run's handle so the caller can
         # steer/inspect it instead. (Different repos run in parallel.)
+        if runtime != "cloud" and session_name and existing.session_name != session_name:
+            _release_worktree(str(workdir), session_name)
         existing.session_event.wait(timeout=10)  # give a usable handle
         return {
             "success": False,
@@ -1299,19 +1319,6 @@ def _send_to_session(
             ),
         }
 
-    if runtime == "local" and os.path.isdir(repo):
-        # Cross-backend writer exclusion: a live Codex turn on this worktree
-        # rejects a Cursor writer the same way a Cursor run would.
-        claim = _guard.codex_writer(repo, _codex_client.claims_dir())
-        if claim is not None:
-            return {
-                "success": False,
-                "status": "rejected",
-                "reason": "a codex turn is already active on this worktree",
-                "session": str(claim.get("session") or ""),
-                "repo": repo,
-            }
-
     job = _live_job(name, entry)
     interrupted = False
     if job is not None and job.status == "running":
@@ -1377,6 +1384,24 @@ def _send_to_session(
     caller_key = _resolve_session_key()
     interval = _progress.resolve_interval(entry, update_interval_s, caller_key)
     _handles.set_subscriber(name, caller_key, interval)
+    # Cross-backend writer exclusion (local worktrees only): reserve the
+    # canonical worktree atomically BEFORE dispatch; the job releases it
+    # when the run is observed terminal. A live Codex claim (or another
+    # Cursor writer's claim) rejects this send the same way the in-process
+    # same-repo guard does.
+    if runtime == "local" and os.path.isdir(repo):
+        claim, holder = _guard.reserve(repo, "cursor", name, _codex_client.claims_dir())
+        if claim is None:
+            return {
+                "success": False,
+                "status": "rejected",
+                "reason": (
+                    f"a {(holder or {}).get('backend') or 'other'} writer is already "
+                    "active on this worktree"
+                ),
+                "session": _guard.describe(holder),
+                "repo": repo,
+            }
     result = _dispatch_run(
         task=str(message),
         workdir=repo,
@@ -1442,6 +1467,8 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
     now = time.time()
     rows: List[Dict[str, str]] = []
     for entry in _handles.entries(scope=scope, session_key=_resolve_session_key()):
+        if _handles.backend_of(entry) != "cursor":
+            continue  # codex sessions list through codex_list
         name = str(entry.get("session") or "")
         job = _live_job(name, entry)
         runtime = _handles.runtime_of(entry)
@@ -1481,8 +1508,14 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
     return rows
 
 
-def _unknown_session_text(identifier: str) -> str:
-    return _render.unknown_session(identifier, _list_rows("session"))
+def _unknown_session_text(identifier: str, scope: str = "session") -> str:
+    other = _handles.resolve(identifier)
+    if other and _handles.backend_of(_handles.get(other)) != "cursor":
+        return (
+            f"session '{other}' is a {_handles.backend_of(_handles.get(other))} "
+            "session, not a Cursor session — use the codex_* tools for it."
+        )
+    return _render.unknown_session(identifier, _list_rows(scope))
 
 
 # ---------------------------------------------------------------------------
@@ -1723,7 +1756,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
 
     name = _resolve_session(ident)
     if name is None:
-        return _render.unknown_session(ident, _list_rows(scope))
+        return _unknown_session_text(ident, scope)
 
     entry = _handles.get(name)
     log_key = _log_key(name, entry)
@@ -1794,7 +1827,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             agents_ui_url=str(entry.get("agents_ui_url") or ""),
         )
 
-    return _render.unknown_session(ident, _list_rows(scope))
+    return _unknown_session_text(ident, scope)
 
 
 def cursor_stop(session: str, **_kwargs: Any) -> str:

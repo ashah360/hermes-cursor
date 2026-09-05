@@ -20,6 +20,7 @@ end-to-end exactly-once.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 BACKEND = "codex"
 CODEX_BIN_ENV = "GHOST_CURSOR_CODEX_BIN"
+TURN_START_TIMEOUT_ENV = "GHOST_CURSOR_CODEX_TURN_START_TIMEOUT_S"
 CONTROLLER_START_WAIT_S = 12.0
 _UNIT_NAME = "ghost-cursor-codex"
 _SOCKET_TIMEOUT_S = 90.0
@@ -68,6 +70,32 @@ def state_dir() -> Path:
 
 def claims_dir() -> str:
     return str(state_dir() / "claims")
+
+
+def profile_id() -> str:
+    """Short stable id of this Hermes profile (HERMES_HOME). The controller is
+    machine-global while handles are profile-local, so controller session ids
+    are namespaced by profile: the same title in two profiles never collides
+    and one profile's follower never touches another's sessions."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    return hashlib.sha1(os.path.realpath(home).encode("utf-8")).hexdigest()[:10]
+
+
+def session_ref(name: str) -> str:
+    """The controller-side session id for a local handle name."""
+    return f"{profile_id()}:{name}"
+
+
+def local_name(ref: str) -> Optional[str]:
+    """The local handle name for a controller session id, or None when the
+    session belongs to another profile."""
+    prefix = profile_id() + ":"
+    return ref[len(prefix):] if str(ref).startswith(prefix) else None
 
 
 def _plugin_config(key: str) -> Any:
@@ -165,6 +193,9 @@ def _controller_argv(bin_path: str) -> List[str]:
     allow = _plugin_config("codex_env_allow")
     if isinstance(allow, list) and allow:
         argv += ["--env-allow", ",".join(str(a) for a in allow)]
+    turn_timeout = os.environ.get(TURN_START_TIMEOUT_ENV)
+    if turn_timeout:
+        argv += ["--turn-start-timeout-s", str(float(turn_timeout))]
     return argv
 
 
@@ -263,6 +294,13 @@ def completion_delegation_id(session: str, turn_id: str) -> str:
 
 
 class Follower:
+    """Pulls controller events into the shared log and delivers completions.
+
+    Projection state (files, pending tools, plan) is read from the
+    controller's persisted per-turn record, never from this process, so a
+    gateway restart changes nothing about digests or status.
+    """
+
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -270,9 +308,6 @@ class Follower:
         self._ingest_lock = threading.RLock()
         self._digest_due: Dict[str, Dict[str, float]] = {}
         self._digest_n: Dict[str, Dict[str, int]] = {}
-        self._pending_tools: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        self._files: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        self._plan: Dict[str, List[Dict[str, str]]] = {}
 
     def start(self) -> None:
         with self._lock:
@@ -303,7 +338,9 @@ class Follower:
         except (ControllerUnavailable, ValueError):
             return
         for row in live:
-            name = str(row.get("session") or "")
+            name = local_name(str(row.get("session") or ""))
+            if name is None:
+                continue  # another profile's session
             entry = _handles.get(name)
             if entry is None or _handles.backend_of(entry) != BACKEND:
                 continue
@@ -333,9 +370,10 @@ class Follower:
     def _ingest_locked(self, name: str, entry: Dict[str, Any]) -> int:
         since = int(entry.get("codex_last_seq") or 0)
         appended = 0
+        ref = session_ref(name)
         while True:
             try:
-                page = request("events", timeout=30.0, session=name, since=since, limit=500)
+                page = request("events", timeout=30.0, session=ref, since=since, limit=500)
             except (ControllerUnavailable, ValueError):
                 break
             events = page.get("events") or []
@@ -346,7 +384,6 @@ class Follower:
                 env["codex_seq"] = rec.get("seq")
                 env["backend"] = BACKEND
                 _eventlog.append(name, env)
-                self._fold(name, env)
                 appended += 1
             since = int(page.get("next") or (events[-1]["seq"] + 1))
             _handles.record(name, codex_last_seq=since)
@@ -354,27 +391,28 @@ class Follower:
                 break
         return appended
 
-    def _fold(self, name: str, env: Dict[str, Any]) -> None:
-        kind = env.get("kind")
-        if kind == "tool_use":
-            pend = self._pending_tools.setdefault(name, {})
-            cid = str(env.get("id") or "tool")
-            prior = pend.get(cid)
-            title = str(env.get("title") or env.get("command") or "").strip()
-            pend[cid] = {"tool": env.get("tool"), "title": f"{env.get('tool')} — {title}" if title else str(env.get("tool")),
-                         "since": (prior or {}).get("since") or time.time()}
-            if env.get("tool") == "plan" and env.get("plan_items"):
-                self._plan[name] = list(env.get("plan_items") or [])
-        elif kind == "tool_result":
-            self._pending_tools.setdefault(name, {}).pop(str(env.get("id") or "tool"), None)
-        elif kind == "file_diff":
-            files = self._files.setdefault(name, {})
-            f = files.setdefault(env.get("path"), {"path": env.get("path"), "added": 0, "removed": 0})
-            f["added"] += int(env.get("added") or 0)
-            f["removed"] += int(env.get("removed") or 0)
-            f["status"] = env.get("status")
-        elif kind == "lifecycle" and env.get("event") in ("run.completed", "run.failed"):
-            self._pending_tools.pop(name, None)
+    @staticmethod
+    def turn_projection(name: str) -> Dict[str, Any]:
+        """Files, pending tools and plan of the current (or last) turn, from
+        the controller's durable record. Empty when unreachable."""
+        try:
+            st = request("status", timeout=10.0, session=session_ref(name))
+        except (ControllerUnavailable, ValueError):
+            return {"files": [], "pending_tools": [], "plan": [], "state": None}
+        state = st.get("state") or {}
+        turns = state.get("turns") or []
+        active = state.get("active_turn_id")
+        turn = next((t for t in reversed(turns) if t.get("turn_id") == active), None) if active else (turns[-1] if turns else None)
+        turn = turn or {}
+        now = time.time()
+        pending = sorted(
+            ({"call_id": cid, "tool": p.get("tool"), "title": p.get("title"),
+              "pending_s": round(now - float(p.get("since") or now), 1)} for cid, p in (turn.get("pending_tools") or {}).items()),
+            key=lambda p: -(p["pending_s"] or 0),
+        )
+        files = sorted((dict(f) for f in (turn.get("files") or {}).values()), key=lambda f: str(f.get("path")))
+        return {"files": files, "pending_tools": pending, "plan": list(turn.get("plan") or []), "state": state,
+                "turn": turn, "app_server_alive": st.get("app_server_alive")}
 
     def _maybe_digest(self, name: str, entry: Dict[str, Any]) -> None:
         subs = _handles.subscribers_of(entry)
@@ -401,18 +439,11 @@ class Follower:
             page = _eventlog.read_events(name, offset=-1, limit=_DIGEST_MAX_EVENTS)
             events = [e for e in ((page or {}).get("events") or []) if int(e.get("seq") or 0) >= cursor]
         n = self._digest_n.setdefault(name, {}).get(key, 0) + 1
-        now = time.time()
-        pending = sorted(
-            ({"call_id": cid, "tool": p.get("tool"), "title": p.get("title"),
-              "pending_s": round(now - p["since"], 1) if p.get("since") else None}
-             for cid, p in self._pending_tools.get(name, {}).items()),
-            key=lambda p: -(p["pending_s"] or 0),
-        )
+        proj = self.turn_projection(name)
         text = _render.digest_text(
             name=name, n=n, status="running", elapsed_s=None, last_activity_s=None,
-            files=sorted(self._files.get(name, {}).values(), key=lambda f: str(f.get("path"))),
-            pending_tools=pending, plan=list(self._plan.get(name, [])), events=events, new_count=new_count,
-            next_update_s=interval,
+            files=proj["files"], pending_tools=proj["pending_tools"], plan=proj["plan"], events=events,
+            new_count=new_count, next_update_s=interval,
         )
         evt = {
             "type": "async_delegation",
@@ -428,14 +459,23 @@ class Follower:
             _handles.advance_delivery_cursor(name, key, total)
 
     def deliver(self, comp: Dict[str, Any]) -> bool:
-        """Fan out one completion intent, then ack it. True when acked."""
-        name = str(comp.get("session") or "")
+        """Fan out one completion intent, then ack it. True when acked.
+
+        Completions of OTHER profiles' sessions are left alone (no ack): the
+        owning profile's follower delivers them.
+        """
+        ref = str(comp.get("session") or "")
+        name = local_name(ref)
+        if name is None:
+            return False
         turn_id = str(comp.get("turn_id") or "")
         entry = _handles.get(name)
         if entry is None or _handles.backend_of(entry) != BACKEND:
-            # Not ours (or unknown here): ack so the controller does not spin on it.
+            # Ours by namespace, but the handle is gone (pruned): nothing to
+            # deliver to. Ack so the controller stops offering it.
+            logger.warning("codex completion for %s has no local handle; acking without delivery", name)
             try:
-                request("ack", session=name, turn_id=turn_id)
+                request("ack", session=ref, turn_id=turn_id)
             except (ControllerUnavailable, ValueError):
                 pass
             return False
@@ -496,12 +536,10 @@ class Follower:
         if not all_ok:
             return False  # leave the intent pending; the next pass retries
         try:
-            request("ack", session=name, turn_id=turn_id)
+            request("ack", session=ref, turn_id=turn_id)
         except (ControllerUnavailable, ValueError):
             return False
         self._digest_due.pop(name, None)
-        self._files.pop(name, None)
-        self._plan.pop(name, None)
         return True
 
 

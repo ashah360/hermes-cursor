@@ -183,7 +183,11 @@ Requirements and behavior:
 - Sending while a turn is active appends to that turn natively (`turn/steer`);
   `codex_stop` uses `turn/interrupt` and only reports `cancelled` after the
   controller observes the turn end.
-- One writer per worktree across both backends; sibling worktrees run in parallel.
+- One writer per worktree across both backends (one atomic reservation, held from
+  before dispatch until the run is observed finished); sibling worktrees run in
+  parallel. A lost `turn/start` reply leaves the session in a visible
+  "dispatch pending (outcome unknown)" state that `codex_stop` clears; the plugin
+  never re-sends a prompt on its own.
 - Approvals: threads run with `approvalPolicy: never` and a `workspace-write`
   sandbox. If Codex still asks for an interactive approval or input, the request
   is declined and recorded, and the turn fails clearly instead of hanging.

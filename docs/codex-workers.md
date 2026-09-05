@@ -39,12 +39,27 @@ worker behavior. Full authoritative scope: the plan in
   prompt. The dispatch intent (`pending_intent`) is persisted before
   `turn/start`, so a retried `codex_send_message` after a controller crash
   is refused when the intent is unresolved rather than silently doubled.
-- **Writer exclusion** is by canonical LOCAL worktree
-  (`workers.canonical_repo_path`) across both backends: `writer_guard.py`
-  checks the in-process Cursor job table, Cursor worker run leases, and the
-  controller's persisted active-turn claims (`claims/<hash>.json`, holder
-  pid + birth). Cursor cloud VMs have no local worktree and are never
-  blocked.
+- **Writer exclusion** is one atomic reservation per canonical LOCAL
+  worktree (`workers.canonical_repo_path`): `writer_guard.reserve` checks
+  and writes the claim file (`claims/<hash>.json`) inside a per-worktree
+  `flock` (`claims/<hash>.lock`); the controller uses the same file and lock.
+  Cursor local dispatch reserves before `jobs.dispatch` and the job releases
+  on observed terminal; Codex reserves in the gateway, the controller
+  re-asserts the claim BEFORE `turn/start` and clears it on
+  `turn/completed`/boot reconciliation. Liveness: codex claim = controller
+  pid alive; cursor claim = gateway pid alive, or the handle still
+  `running`, or the worktree's Cursor worker holds a run lease. Cursor cloud
+  VMs have no local worktree and are never blocked.
+- **Ambiguous dispatch.** A JSON-RPC error on `turn/start` is a definitive
+  rejection (intent and claim dropped). A transport failure after the request
+  went out (timeout, closed pipe) is ambiguous: the intent (`ambiguous: true`)
+  and the claim are retained, a later `turn/started` for the thread adopts
+  the turn, and further sends are refused until `codex_stop` clears the
+  intent explicitly. No automatic re-send.
+- **Profiles.** The controller is machine-global; handles are per Hermes
+  profile. Controller session ids are `<profile-id>:<title>`
+  (`codex_client.session_ref`), so equal titles in two profiles never
+  collide and a follower only ingests/acks its own profile's sessions.
 - **Approvals.** Threads start with `approvalPolicy: "never"` and
   `sandbox: "workspace-write"` (thread/start config mode; `sandboxPolicy.type: workspaceWrite` on turn/start — both verified against codex-cli 0.153.4), explicit and persisted on the session. Any
   server-initiated approval/input request that still arrives is declined
@@ -71,8 +86,9 @@ worker behavior. Full authoritative scope: the plan in
 ## Limits (v1)
 
 - Interactive approvals are declined, not brokered.
-- Progress digests for Codex sessions reuse the subscriber cadence through
-  the follower; completion delivery is the guaranteed path.
+- Progress digests and status read files/pending tools/plan from the
+  controller's durable per-turn record, so a gateway restart loses no
+  projection; completion delivery is the guaranteed path.
 - Without user systemd the controller runs detached and status says so.
 - Live model acceptance requires an authenticated Codex install; see the
   test log in the PR for what was verified.

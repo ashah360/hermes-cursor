@@ -11,6 +11,9 @@ keyed by words in the prompt:
 * ``hang`` — starts a command and waits for turn/interrupt.
 * ``approve`` — asks for a command approval; a decline fails the turn.
 * ``crash`` — exits the process mid-turn (controller death test).
+* ``lostresponse`` — the turn runs and streams normally but the turn/start
+  REPLY is delayed 2s (client-side timeout => ambiguous outcome).
+  With ``silent`` too: no reply and no turn at all.
 
 Invoked as ``fake_codex_app_server.py app-server`` (the controller appends
 the ``app-server`` subcommand). ``FAKE_CODEX_EVENT_LOG`` (optional) gets
@@ -179,7 +182,15 @@ def handle(msg):
             ctl = {"turn_id": turn_id, "interrupt": threading.Event(), "steers": []}
             _active[tid] = ctl
         prompt = " ".join(i.get("text", "") for i in params.get("input", []) if i.get("type") == "text")
-        send({"id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": [], "error": None}}})
+        reply = {"id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": [], "error": None}}}
+        if "lostresponse" in prompt:
+            if "silent" in prompt:
+                with _lock:
+                    _active.pop(tid, None)
+                return  # provider never answers and never starts a turn
+            threading.Thread(target=lambda: (time.sleep(2.0), send(reply)), daemon=True).start()
+        else:
+            send(reply)
         threading.Thread(target=run_turn, args=(tid, turn_id, prompt, ctl), daemon=True).start()
     elif method == "turn/steer":
         ctl = _active.get(params.get("threadId"))

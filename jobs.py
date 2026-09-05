@@ -219,6 +219,9 @@ class CursorJob:
     completed: bool = False
     cancelled: bool = False
     result: Optional[Dict[str, Any]] = None
+    # Releases this run's worktree reservation (writer_guard) once the run is
+    # observed terminal; None for cloud runs / direct registry use.
+    writer_release: Optional[Callable[[], None]] = field(default=None, repr=False)
     # --- control ---
     _pending_spill: List[Dict[str, Any]] = field(default_factory=list, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -455,6 +458,7 @@ class CursorJobRegistry:
         requested_session_id: Optional[str] = None,
         requested_model: Optional[str] = None,
         runtime: str = "local",
+        writer_release: Optional[Callable[[], None]] = None,
     ) -> Tuple[Optional[CursorJob], Optional[CursorJob]]:
         """Start a cursor run on a worker thread.
 
@@ -475,6 +479,7 @@ class CursorJobRegistry:
             requested_session_id=requested_session_id,
             requested_model=requested_model,
             runtime=runtime or "local",
+            writer_release=writer_release,
         )
         with self._lock:
             # Same-repo concurrency guard applies to LOCAL runs only: two
@@ -595,6 +600,12 @@ class CursorJobRegistry:
                         (job.finished_at or time.time()) - job.created_at, 1
                     ),
                 )
+        # Worktree reservation: released only now, on the observed terminal.
+        if job.writer_release is not None:
+            try:
+                job.writer_release()
+            except Exception:
+                logger.debug("worktree release failed for %s", job.job_id, exc_info=True)
         # Enqueue BEFORE signalling done: anyone who observes the job as
         # finished (waiters, tests, drains) must also find the completion
         # event already on the queue — no observe-then-miss window.

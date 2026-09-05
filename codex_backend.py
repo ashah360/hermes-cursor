@@ -219,15 +219,21 @@ def codex_send_message(session: str, message: str, update_interval_s: Optional[f
     _handles.set_subscriber(name, caller, _progress.resolve_interval(entry, interval, caller))
     _codex.follower.start()
 
+    ref = _codex.session_ref(name)
     # Active turn -> native steer with the exact expected turn id.
     try:
-        st = _codex.request("status", session=name)
+        st = _codex.request("status", session=ref)
     except _codex.ControllerUnavailable as exc:
         return f"cannot dispatch to Codex: {exc}"
     state = st.get("state") or {}
     active = str(state.get("active_turn_id") or "") if st.get("ok") else ""
+    if state.get("pending_intent") and not active:
+        pend = state["pending_intent"]
+        return (f"cannot dispatch: session '{name}' has an unresolved dispatch intent "
+                f"({pend.get('intent_id')}: {pend.get('error') or 'outcome unknown'}). The provider may have "
+                f"accepted that turn. Check {STATUS}; if no turn appears, {STOP} clears the intent, then send again.")
     if active:
-        resp = _codex.request("steer", session=name, text=str(message), expected_turn_id=active)
+        resp = _codex.request("steer", session=ref, text=str(message), expected_turn_id=active)
         if resp.get("ok"):
             _eventlog.append(name, {"source": "ghost", "kind": "lifecycle", "event": "steer.sent", "turn_id": active, "backend": "codex"})
             return (f"steered the ACTIVE turn {active} in {name} (turn/steer, expectedTurnId={active}) — no new turn "
@@ -240,22 +246,34 @@ def codex_send_message(session: str, message: str, update_interval_s: Optional[f
         else:
             return f"steer failed: {resp.get('error')}"
 
-    other = _guard.cursor_writer(repo)
-    if other:
-        return _render.repo_busy(other, repo).replace("two cursor runs", "two agents (Cursor + Codex)")
+    # Atomic worktree reservation (shared with Cursor local dispatch): the
+    # check and the claim write are one flock'd section. The controller
+    # re-asserts the same claim (same session ref) before turn/start and
+    # holds it through an ambiguous outcome until the turn settles.
+    claim, holder = _guard.reserve(repo, "codex", ref, _codex.claims_dir())
+    if claim is None:
+        return _render.repo_busy(_guard.describe(holder), repo).replace("two cursor runs", "two agents")
     prompt_seq = (_eventlog.stats(name) or {}).get("total_events", 0)
     intent_id = f"intent-{uuid.uuid4().hex[:12]}"
     _handles.record(name, pending_intent_id=intent_id, task=str(message)[:200])
-    resp = _codex.request("start", session=name, cwd=repo, model=str(entry.get("model") or ""),
+    resp = _codex.request("start", session=ref, cwd=repo, model=str(entry.get("model") or ""),
                           effort=entry.get("effort"), prompt=str(message), intent_id=intent_id)
     if not resp.get("ok"):
         err = str(resp.get("error") or "unknown error")
+        if err == "ambiguous_dispatch":
+            # Intent and claim stay in place on the controller. Never re-send.
+            _handles.record(name, status="running", codex_thread_id=resp.get("thread_id"))
+            return (f"dispatch to {name} is AMBIGUOUS: the turn/start reply was lost ({resp.get('detail')}). "
+                    "The provider may be running the turn; the worktree stays reserved and the intent "
+                    f"{intent_id} stays recorded. If the turn starts, it is adopted and its result auto-delivers. "
+                    f"Check {STATUS}; if nothing appears, {STOP} clears the intent.")
+        _guard.release(repo, ref, _codex.claims_dir())
+        _handles.record(name, pending_intent_id=None)
         if err == "worktree_busy":
-            claim = resp.get("claim") or {}
-            return _render.repo_busy(str(claim.get("session") or "?"), repo)
+            return _render.repo_busy(_guard.describe(resp.get("claim")), repo)
         if err == "turn_active":
             return f"a turn ({resp.get('turn_id')}) became active in {name} meanwhile — send again to steer it."
-        if err == "pending_intent":
+        if err in ("pending_intent", "duplicate_intent"):
             return (f"cannot dispatch: {resp.get('detail')}. pending intent: "
                     f"{(resp.get('pending_intent') or {}).get('intent_id')}")
         return f"codex dispatch failed for {name}: {err}"
@@ -286,14 +304,13 @@ def codex_status(session: str, **_: Any) -> str:
     if name is None:
         return _unknown(ident)
     entry = _handles.get(name) or {}
-    live = None
     try:
         _codex.follower.ingest(name, entry)
         entry = _handles.get(name) or entry
-        st = _codex.request("status", session=name, timeout=10.0)
-        live = st.get("state") if st.get("ok") else None
-    except (_codex.ControllerUnavailable, ValueError):
-        live = None
+    except Exception:
+        pass
+    proj = _codex.follower.turn_projection(name)
+    live = proj.get("state")
     stats = _eventlog.stats(name)
     tail = _eventlog.read_events(name, offset=-1, limit=20)
     bullets = _render.recent_bullets((tail or {}).get("events") or [])
@@ -305,26 +322,28 @@ def codex_status(session: str, **_: Any) -> str:
     last_activity = None
     if live is not None:
         active = live.get("active_turn_id")
-        turn = next((t for t in reversed(live.get("turns") or []) if t.get("turn_id") == (active or (live.get("turns") or [{}])[-1].get("turn_id"))), None)
+        turn = proj.get("turn") or {}
         if active:
             status = "running"
             if turn:
                 elapsed = time.time() - float(turn.get("started_at") or time.time())
+        elif live.get("pending_intent"):
+            status = "dispatch pending (outcome unknown)"
         elif live.get("status"):
             status = str(live.get("status"))
-        if turn:
-            files = sorted((turn.get("files") or {}).values(), key=lambda f: f["path"])
-            now = time.time()
-            pending = [{"call_id": cid, "tool": p.get("tool"), "title": p.get("title"),
-                        "pending_s": round(now - float(p.get("since") or now), 1)} for cid, p in (turn.get("pending_tools") or {}).items()]
+        files = proj["files"]
+        pending = proj["pending_tools"]
         if live.get("last_activity_at"):
             last_activity = time.time() - float(live["last_activity_at"])
         ts = live.get("thread_status") or {}
         if ts.get("flags"):
             note_parts.append(f"codex thread flags: {', '.join(ts['flags'])}")
         if live.get("pending_intent"):
-            note_parts.append("a dispatch intent is persisted with unknown turn/start outcome — inspect before re-sending")
-        note_parts.append(f"codex thread {live.get('thread_id')} · turn {active or (turn or {}).get('turn_id') or '—'} · app-server {'alive' if st.get('app_server_alive') else 'idle/stopped'}")
+            pend = live["pending_intent"]
+            note_parts.append(f"dispatch intent {pend.get('intent_id')} persisted with unknown turn/start outcome "
+                              f"({pend.get('error') or 'no reply observed'}) — {STOP} clears it; do not re-send blindly")
+        note_parts.append(f"codex thread {live.get('thread_id')} · turn {active or turn.get('turn_id') or '—'} · "
+                          f"app-server {'alive' if proj.get('app_server_alive') else 'idle/stopped'}")
     else:
         note_parts.append("codex controller not reachable — showing the persisted record.")
     if str(entry.get("worker_supervision") or "") == "detached":
@@ -333,8 +352,8 @@ def codex_status(session: str, **_: Any) -> str:
         name=name, status=status, elapsed_s=elapsed, last_activity_s=last_activity,
         total_events=(stats or {}).get("total_events", 0), log_path=(stats or {}).get("path"),
         task=str(entry.get("task") or ""), files=files, bullets=bullets, error=str(entry.get("status_note") or ""),
-        pending_tools=pending, last_prompt_seq=_handles.last_prompt_seq(entry), runtime="codex:local",
-        note="\n".join(note_parts),
+        pending_tools=pending, plan=proj.get("plan") or [], last_prompt_seq=_handles.last_prompt_seq(entry),
+        runtime="codex:local", note="\n".join(note_parts),
     )
 
 
@@ -345,20 +364,26 @@ def codex_stop(session: str, **_: Any) -> str:
     name = _resolve(ident)
     if name is None:
         return _unknown(ident)
+    ref = _codex.session_ref(name)
     try:
-        resp = _codex.request("interrupt", session=name)
+        resp = _codex.request("interrupt", session=ref)
     except _codex.ControllerUnavailable as exc:
         return f"cannot stop {name}: {exc}"
     if not resp.get("ok"):
         return f"codex interrupt failed for {name}: {resp.get('error')}"
     turn_id = str(resp.get("turn_id") or "")
+    if resp.get("intent_cleared"):
+        _handles.record(name, status="failed", pending_intent_id=None,
+                        status_note="unresolved dispatch intent cleared by codex_stop; no turn was observed")
+        return (f"no active turn in '{name}'; cleared the unresolved dispatch intent {resp['intent_cleared']} and "
+                "released the worktree. Inspect the worktree before sending again — the provider never reported a turn.")
     if not turn_id:
         entry = _handles.get(name) or {}
         return _render.stop_text(name=name, status=str(entry.get("status") or "idle"), elapsed_s=entry.get("duration_s"),
                                  files=[], already_finished=True)
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
-        st = _codex.request("status", session=name, timeout=10.0)
+        st = _codex.request("status", session=ref, timeout=10.0)
         state = st.get("state") or {}
         if st.get("ok") and not state.get("active_turn_id"):
             _codex.follower.sync_once()
