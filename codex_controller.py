@@ -1,0 +1,720 @@
+"""Independent Codex controller process.
+
+Owns the ``codex app-server`` child (stdio), the durable per-session state,
+the per-session event log, active-turn worktree claims, and pending
+completion intents. Started by ``codex_client`` under user systemd when
+available; runs standalone::
+
+    python codex_controller.py --state-dir DIR --codex-bin /path/to/codex
+
+The gateway talks to it over ``DIR/control.sock`` (Unix socket, mode 0600,
+DIR is 0700). One request per connection, newline-delimited JSON::
+
+    {"op": "start", "session": ..., "cwd": ..., "model": ..., "effort": ...,
+     "prompt": ..., "intent_id": ...}      -> {"ok": true, "thread_id", "turn_id"}
+    {"op": "steer", "session", "text", "expected_turn_id"} -> {"ok": true, "turn_id"}
+    {"op": "interrupt", "session"}          -> {"ok": true, "turn_id"}
+    {"op": "status", "session"}             -> {"ok": true, "state": {...}}
+    {"op": "events", "session", "since", "limit"} -> {"ok": true, "events": [...], "next": N}
+    {"op": "completions"}                   -> {"ok": true, "completions": [...]}
+    {"op": "ack", "session", "turn_id"}     -> {"ok": true}
+    {"op": "catalog"} / {"op": "ping"} / {"op": "sessions"} / {"op": "shutdown"}
+
+Lifecycle authority is the observed ``turn/started`` / ``turn/completed``
+state, never a client connection. Every turn's intent is persisted BEFORE
+``turn/start`` is sent, so a crash between the two leaves a visible
+``pending_intent`` instead of an ambiguous re-send.
+
+Stdlib only: nothing here imports the plugin package.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import logging
+import os
+import queue
+import re
+import signal
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import codex_protocol as proto  # noqa: E402
+
+logger = logging.getLogger("codex_controller")
+
+SOCKET_NAME = "control.sock"
+LOCK_NAME = "controller.lock"
+INFO_NAME = "controller.json"
+_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+TERMINAL = ("completed", "failed", "cancelled")
+
+DEFAULT_SANDBOX = "workspaceWrite"
+DEFAULT_APPROVAL = "never"
+
+
+def _pid_birth(pid: int) -> Optional[int]:
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[19])
+    except Exception:
+        return None
+
+
+def claim_key(cwd: str) -> str:
+    return hashlib.sha1(os.path.realpath(cwd).encode("utf-8")).hexdigest()[:16]
+
+
+def _now() -> float:
+    return round(time.time(), 3)
+
+
+class Controller:
+    def __init__(self, state_dir: Path, codex_bin: str, codex_home: Optional[str], env_allow: List[str],
+                 idle_exit_s: float) -> None:
+        self.state_dir = state_dir
+        self.codex_bin = codex_bin
+        self.codex_home = codex_home
+        self.env_allow = env_allow
+        self.idle_exit_s = idle_exit_s
+        self.sessions_dir = state_dir / "sessions"
+        self.events_dir = state_dir / "events"
+        self.claims_dir = state_dir / "claims"
+        for d in (state_dir, self.sessions_dir, self.events_dir, self.claims_dir):
+            d.mkdir(parents=True, exist_ok=True)
+            os.chmod(d, 0o700)
+        self._lock = threading.RLock()
+        self._server: Optional[proto.AppServer] = None
+        self._server_info: Dict[str, Any] = {}
+        self._catalog: Optional[List[Dict[str, Any]]] = None
+        self._normalizers: Dict[str, proto.Normalizer] = {}
+        self._thread_to_session: Dict[str, str] = {}
+        self._inbox: "queue.Queue[Any]" = queue.Queue()
+        self._stop = threading.Event()
+        self._last_activity = time.monotonic()
+
+    # -- persistence -----------------------------------------------------------
+
+    def _safe(self, session: str) -> str:
+        return _SAFE.sub("_", str(session))[:120]
+
+    def _session_path(self, session: str) -> Path:
+        return self.sessions_dir / f"{self._safe(session)}.json"
+
+    def _events_path(self, session: str) -> Path:
+        return self.events_dir / f"{self._safe(session)}.jsonl"
+
+    def load(self, session: str) -> Optional[Dict[str, Any]]:
+        path = self._session_path(session)
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text("utf-8"))
+        except Exception:
+            return None
+
+    def save(self, state: Dict[str, Any]) -> None:
+        path = self._session_path(state["session"])
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), "utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+
+    def append_event(self, session: str, envelope: Dict[str, Any]) -> int:
+        state = self.load(session) or {"session": session, "next_seq": 0}
+        seq = int(state.get("next_seq") or 0)
+        record = {"seq": seq, "ts": _now(), **envelope}
+        with self._events_path(session).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        state["next_seq"] = seq + 1
+        self.save(state)
+        return seq
+
+    def read_events(self, session: str, since: int, limit: int) -> List[Dict[str, Any]]:
+        path = self._events_path(session)
+        if not path.is_file():
+            return []
+        out: List[Dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and int(rec.get("seq", -1)) >= since:
+                    out.append(rec)
+                    if len(out) >= limit:
+                        break
+        return out
+
+    # -- claims (cross-backend writer exclusion, by canonical worktree) --------
+
+    def _claim_path(self, cwd: str) -> Path:
+        return self.claims_dir / f"{claim_key(cwd)}.json"
+
+    def write_claim(self, cwd: str, session: str, turn_id: str) -> None:
+        pid = os.getpid()
+        data = {"cwd": os.path.realpath(cwd), "session": session, "turn_id": turn_id, "backend": "codex",
+                "holder_pid": pid, "holder_birth": _pid_birth(pid), "claimed_at": _now()}
+        path = self._claim_path(cwd)
+        path.write_text(json.dumps(data), "utf-8")
+        os.chmod(path, 0o600)
+
+    def clear_claim(self, cwd: str, session: str) -> None:
+        path = self._claim_path(cwd)
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            if data.get("session") == session:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            path.unlink(missing_ok=True)
+
+    def other_claim(self, cwd: str, session: str) -> Optional[Dict[str, Any]]:
+        path = self._claim_path(cwd)
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except Exception:
+            return None
+        if data.get("session") == session:
+            return None
+        pid = int(data.get("holder_pid") or 0)
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = data.get("holder_birth") in (None, _pid_birth(pid))
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True
+        if not alive:
+            path.unlink(missing_ok=True)
+            return None
+        return data
+
+    # -- app-server ------------------------------------------------------------
+
+    def _spawn_env(self) -> Dict[str, str]:
+        env = {k: v for k, v in os.environ.items()
+               if k in ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_RUNTIME_DIR",
+                        "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
+               or k in self.env_allow}
+        if self.codex_home:
+            env["CODEX_HOME"] = self.codex_home
+        return env
+
+    def server(self) -> proto.AppServer:
+        with self._lock:
+            if self._server is not None and self._server.alive():
+                return self._server
+            srv = proto.AppServer(
+                self.codex_bin, env=self._spawn_env(),
+                on_notification=lambda m: self._inbox.put(("notify", m)),
+                on_request=lambda m: self._inbox.put(("request", m)),
+                on_exit=lambda code: self._inbox.put(("exit", code)),
+            )
+            try:
+                self._server_info = srv.initialize()
+            except Exception:
+                srv.close(grace_s=1.0)
+                raise
+            self._server = srv
+            self._catalog = None
+            self._thread_to_session.clear()
+            return srv
+
+    def catalog(self) -> List[Dict[str, Any]]:
+        srv = self.server()
+        with self._lock:
+            if self._catalog is None:
+                self._catalog = proto.list_models(srv)
+            return list(self._catalog)
+
+    # -- ops ---------------------------------------------------------------------
+
+    def op_start(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        session = str(req.get("session") or "").strip()
+        cwd = str(req.get("cwd") or "").strip()
+        prompt = str(req.get("prompt") or "")
+        intent_id = str(req.get("intent_id") or "")
+        if not session or not cwd or not prompt or not intent_id:
+            return {"ok": False, "error": "session, cwd, prompt and intent_id are required"}
+        if not os.path.isdir(cwd):
+            return {"ok": False, "error": f"cwd does not exist: {cwd}"}
+        with self._lock:
+            state = self.load(session) or {
+                "session": session, "cwd": os.path.realpath(cwd), "next_seq": 0, "turns": [], "completions": [],
+                "created_at": _now(),
+            }
+            if state.get("active_turn_id"):
+                return {"ok": False, "error": "turn_active", "turn_id": state["active_turn_id"]}
+            pending = state.get("pending_intent")
+            if pending and pending.get("intent_id") != intent_id:
+                return {"ok": False, "error": "pending_intent",
+                        "detail": "an earlier dispatch on this session was persisted but its turn/start outcome is unknown; "
+                                  "inspect codex_status before sending again", "pending_intent": pending}
+            if pending and pending.get("intent_id") == intent_id:
+                return {"ok": False, "error": "duplicate_intent", "pending_intent": pending}
+            claim = self.other_claim(cwd, session)
+            if claim is not None:
+                return {"ok": False, "error": "worktree_busy", "claim": claim}
+            model = str(req.get("model") or state.get("model") or "").strip()
+            effort = req.get("effort") if req.get("effort") is not None else state.get("effort")
+            if not model:
+                return {"ok": False, "error": "model is required (no default model substitution)"}
+            try:
+                resolved = proto.resolve_model(self.catalog(), model, effort)
+            except proto.ProtocolError as exc:
+                return {"ok": False, "error": str(exc)}
+            state.update({
+                "cwd": os.path.realpath(cwd), "model": resolved["model"], "effort": resolved["effort"],
+                "sandbox": str(req.get("sandbox") or state.get("sandbox") or DEFAULT_SANDBOX),
+                "approval_policy": str(req.get("approval_policy") or state.get("approval_policy") or DEFAULT_APPROVAL),
+            })
+            # Persist dispatch intent BEFORE any wire call.
+            state["pending_intent"] = {"intent_id": intent_id, "prompt_sha1": hashlib.sha1(prompt.encode()).hexdigest(),
+                                       "prompt_head": prompt[:200], "at": _now()}
+            self.save(state)
+            try:
+                srv = self.server()
+                thread_id = str(state.get("thread_id") or "")
+                if thread_id:
+                    try:
+                        srv.request("thread/resume", {"threadId": thread_id}, timeout=60)
+                    except proto.RpcError as exc:
+                        return self._fail_intent(state, f"thread/resume failed for {thread_id}: {exc.message}")
+                else:
+                    res = srv.request("thread/start", {
+                        "model": state["model"], "cwd": state["cwd"], "approvalPolicy": state["approval_policy"],
+                        "sandbox": state["sandbox"], "serviceName": proto.CLIENT_INFO["name"],
+                    }, timeout=60)
+                    thread_id = str(((res.get("thread") or {}).get("id")) or "")
+                    if not thread_id:
+                        return self._fail_intent(state, "thread/start returned no thread id")
+                    state["thread_id"] = thread_id
+                    self.save(state)
+                self._thread_to_session[thread_id] = session
+                params: Dict[str, Any] = {
+                    "threadId": thread_id, "input": [{"type": "text", "text": prompt}], "cwd": state["cwd"],
+                    "approvalPolicy": state["approval_policy"],
+                    "sandboxPolicy": {"type": state["sandbox"], "writableRoots": [state["cwd"]], "networkAccess": True},
+                    "model": state["model"],
+                }
+                if state.get("effort"):
+                    params["effort"] = state["effort"]
+                res = srv.request("turn/start", params, timeout=60)
+            except proto.ProtocolError as exc:
+                return self._fail_intent(state, str(exc))
+            turn = res.get("turn") or {}
+            turn_id = str(turn.get("id") or "")
+            if not turn_id:
+                return self._fail_intent(state, "turn/start returned no turn id")
+            state["active_turn_id"] = turn_id
+            state["status"] = "running"
+            state["pending_intent"] = None
+            state.setdefault("turns", []).append({"turn_id": turn_id, "intent_id": intent_id, "status": "running",
+                                                  "started_at": _now(), "prompt_head": prompt[:200]})
+            state["last_activity_at"] = _now()
+            self.save(state)
+            self.write_claim(state["cwd"], session, turn_id)
+            self._normalizers[thread_id] = proto.Normalizer()
+            self._last_activity = time.monotonic()
+            self.append_event(session, proto.lifecycle("dispatch.accepted", turn_id=turn_id, thread_id=thread_id,
+                                                       model=state["model"], effort=state.get("effort"), intent_id=intent_id))
+            return {"ok": True, "thread_id": thread_id, "turn_id": turn_id, "model": state["model"],
+                    "effort": state.get("effort"), "resumed": len(state["turns"]) > 1}
+
+    def _fail_intent(self, state: Dict[str, Any], error: str) -> Dict[str, Any]:
+        state["pending_intent"] = None
+        state["last_error"] = error
+        self.save(state)
+        self.append_event(state["session"], proto.lifecycle("dispatch.failed", error=error))
+        return {"ok": False, "error": error}
+
+    def op_steer(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        session = str(req.get("session") or "")
+        text = str(req.get("text") or "")
+        expected = str(req.get("expected_turn_id") or "")
+        with self._lock:
+            state = self.load(session)
+            if state is None:
+                return {"ok": False, "error": "unknown session"}
+            active = str(state.get("active_turn_id") or "")
+            if not active:
+                return {"ok": False, "error": "no_active_turn"}
+            if expected and expected != active:
+                return {"ok": False, "error": "stale_turn", "turn_id": active}
+            try:
+                res = self.server().request("turn/steer", {
+                    "threadId": state["thread_id"], "input": [{"type": "text", "text": text}], "expectedTurnId": active,
+                }, timeout=30)
+            except proto.ProtocolError as exc:
+                return {"ok": False, "error": str(exc), "turn_id": active}
+            self.append_event(session, proto.lifecycle("steer.accepted", turn_id=active, text_head=text[:200]))
+            return {"ok": True, "turn_id": str(res.get("turnId") or active)}
+
+    def op_interrupt(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        session = str(req.get("session") or "")
+        with self._lock:
+            state = self.load(session)
+            if state is None:
+                return {"ok": False, "error": "unknown session"}
+            active = str(state.get("active_turn_id") or "")
+            if not active:
+                return {"ok": True, "turn_id": "", "status": state.get("status") or "idle"}
+            try:
+                self.server().request("turn/interrupt", {"threadId": state["thread_id"], "turnId": active}, timeout=30)
+            except proto.ProtocolError as exc:
+                return {"ok": False, "error": str(exc), "turn_id": active}
+            self.append_event(session, proto.lifecycle("interrupt_requested", turn_id=active))
+            return {"ok": True, "turn_id": active, "status": "running"}
+
+    def op_status(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.load(str(req.get("session") or ""))
+        if state is None:
+            return {"ok": False, "error": "unknown session"}
+        srv_alive = self._server is not None and self._server.alive()
+        return {"ok": True, "state": state, "app_server_alive": srv_alive, "controller_pid": os.getpid()}
+
+    def op_events(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        session = str(req.get("session") or "")
+        since = max(int(req.get("since") or 0), 0)
+        limit = min(max(int(req.get("limit") or 200), 1), 2000)
+        events = self.read_events(session, since, limit)
+        return {"ok": True, "events": events, "next": (events[-1]["seq"] + 1) if events else since}
+
+    def op_completions(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        out = []
+        for path in sorted(self.sessions_dir.glob("*.json")):
+            try:
+                state = json.loads(path.read_text("utf-8"))
+            except Exception:
+                continue
+            for c in state.get("completions") or []:
+                if not c.get("delivered"):
+                    out.append({"session": state["session"], **c})
+        return {"ok": True, "completions": out}
+
+    def op_ack(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        session = str(req.get("session") or "")
+        turn_id = str(req.get("turn_id") or "")
+        with self._lock:
+            state = self.load(session)
+            if state is None:
+                return {"ok": False, "error": "unknown session"}
+            for c in state.get("completions") or []:
+                if c.get("turn_id") == turn_id:
+                    c["delivered"] = True
+                    c["delivered_at"] = _now()
+            self.save(state)
+        return {"ok": True}
+
+    def op_sessions(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        out = []
+        for path in sorted(self.sessions_dir.glob("*.json")):
+            try:
+                st = json.loads(path.read_text("utf-8"))
+            except Exception:
+                continue
+            out.append({k: st.get(k) for k in ("session", "cwd", "model", "effort", "thread_id", "active_turn_id",
+                                                "status", "pending_intent", "last_activity_at")})
+        return {"ok": True, "sessions": out}
+
+    def op_catalog(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return {"ok": True, "models": self.catalog(), "server": self._server_info}
+        except proto.ProtocolError as exc:
+            return {"ok": False, "error": str(exc), "stderr": (self._server.stderr_tail if self._server else [])}
+        except OSError as exc:
+            return {"ok": False, "error": f"cannot start codex app-server ({self.codex_bin}): {exc}"}
+
+    def handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        op = str(req.get("op") or "")
+        if op == "ping":
+            return {"ok": True, "pid": os.getpid(), "app_server_alive": bool(self._server and self._server.alive()),
+                    "codex_bin": self.codex_bin}
+        if op == "shutdown":
+            self._stop.set()
+            return {"ok": True}
+        fn = getattr(self, f"op_{op}", None)
+        if fn is None:
+            return {"ok": False, "error": f"unknown op {op!r}"}
+        try:
+            return fn(req)
+        except OSError as exc:
+            return {"ok": False, "error": f"cannot start codex app-server ({self.codex_bin}): {exc}"}
+        except Exception as exc:  # never crash the controller on one request
+            logger.exception("op %s failed", op)
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    # -- inbox: notifications / server requests / exit ------------------------------
+
+    def _fold_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                kind, msg = self._inbox.get(timeout=0.2)
+            except queue.Empty:
+                self._idle_check()
+                continue
+            try:
+                if kind == "notify":
+                    self._on_notify(msg)
+                elif kind == "request":
+                    self._on_request(msg)
+                elif kind == "exit":
+                    self._on_exit(msg)
+            except Exception:
+                logger.exception("fold failed for %s", kind)
+
+    def _session_for(self, params: Dict[str, Any]) -> Optional[str]:
+        thread_id = str(params.get("threadId") or ((params.get("turn") or {}).get("threadId")) or "")
+        if thread_id and thread_id in self._thread_to_session:
+            return self._thread_to_session[thread_id]
+        if not thread_id:
+            # Some turn notifications omit threadId; fall back to the single active session.
+            active = [s for s, st in self._active_sessions().items() if st.get("active_turn_id")]
+            return active[0] if len(active) == 1 else None
+        for path in self.sessions_dir.glob("*.json"):
+            try:
+                st = json.loads(path.read_text("utf-8"))
+            except Exception:
+                continue
+            if st.get("thread_id") == thread_id:
+                self._thread_to_session[thread_id] = st["session"]
+                return st["session"]
+        return None
+
+    def _active_sessions(self) -> Dict[str, Dict[str, Any]]:
+        out = {}
+        for path in self.sessions_dir.glob("*.json"):
+            try:
+                st = json.loads(path.read_text("utf-8"))
+            except Exception:
+                continue
+            if st.get("active_turn_id"):
+                out[st["session"]] = st
+        return out
+
+    def _on_notify(self, msg: Dict[str, Any]) -> None:
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = self._session_for(params)
+        if session is None:
+            return
+        self._last_activity = time.monotonic()
+        with self._lock:
+            state = self.load(session)
+            if state is None:
+                return
+            thread_id = str(state.get("thread_id") or "")
+            norm = self._normalizers.setdefault(thread_id, proto.Normalizer())
+            envelopes = norm.normalize(msg)
+            turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == state.get("active_turn_id")), None)
+            for env in envelopes:
+                self.append_event(session, env)
+                kind = env.get("kind")
+                if turn_state is not None:
+                    if kind == "file_diff":
+                        files = turn_state.setdefault("files", {})
+                        f = files.setdefault(env["path"], {"path": env["path"], "added": 0, "removed": 0})
+                        f["added"] += int(env.get("added") or 0)
+                        f["removed"] += int(env.get("removed") or 0)
+                        f["status"] = env.get("status")
+                        f["diff"] = str(env.get("diff") or "")[:20_000]
+                        turn_state["segment_open"] = False
+                    elif kind == "content":
+                        delta = str(env.get("delta") or "")
+                        segs = turn_state.setdefault("segments", [])
+                        if delta:
+                            if turn_state.get("segment_open") and segs:
+                                segs[-1] += delta
+                            else:
+                                segs.append(delta)
+                                turn_state["segment_open"] = True
+                        if env.get("done"):
+                            turn_state["segment_open"] = False
+                            turn_state["ended_on_content"] = True
+                    elif kind in ("tool_use", "tool_result"):
+                        turn_state["segment_open"] = False
+                        turn_state["ended_on_content"] = False
+                        pend = turn_state.setdefault("pending_tools", {})
+                        if kind == "tool_use":
+                            pend[str(env.get("id"))] = {"tool": env.get("tool"), "title": env.get("title"), "since": _now()}
+                        else:
+                            pend.pop(str(env.get("id")), None)
+                    elif kind == "lifecycle" and env.get("event") == "thread.status":
+                        state["thread_status"] = {"type": env.get("status"), "flags": env.get("flags")}
+                if kind == "lifecycle" and env.get("event") in ("run.completed", "run.failed"):
+                    self._settle_turn(state, turn_state, env)
+            state["last_activity_at"] = _now()
+            self.save(state)
+
+    def _settle_turn(self, state: Dict[str, Any], turn_state: Optional[Dict[str, Any]], env: Dict[str, Any]) -> None:
+        turn_id = str(env.get("turn_id") or state.get("active_turn_id") or "")
+        if env.get("event") == "run.completed":
+            status = "completed"
+        elif env.get("cancelled"):
+            status = "cancelled"
+        else:
+            status = "failed"
+        segs = (turn_state or {}).get("segments") or []
+        blocks = [b.strip() for b in segs if b.strip()]
+        summary = (blocks[-1] if (turn_state or {}).get("ended_on_content") and blocks else "\n\n".join(blocks))
+        files = sorted(((turn_state or {}).get("files") or {}).values(), key=lambda f: f["path"])
+        if turn_state is not None:
+            turn_state["status"] = status
+            turn_state["finished_at"] = _now()
+            turn_state["pending_tools"] = {}
+        state["active_turn_id"] = None
+        state["status"] = status
+        state.setdefault("completions", []).append({
+            "turn_id": turn_id, "status": status, "error": env.get("error"), "summary": summary[:20_000],
+            "files": files, "started_at": (turn_state or {}).get("started_at"), "finished_at": _now(),
+            "delivered": False, "model": state.get("model"),
+        })
+        self.clear_claim(state["cwd"], state["session"])
+
+    def _on_request(self, msg: Dict[str, Any]) -> None:
+        method = str(msg.get("method") or "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        session = self._session_for(params)
+        srv = self._server
+        if srv is not None:
+            try:
+                srv.respond(msg.get("id"), proto.decline_result(method))
+            except Exception:
+                logger.debug("respond failed", exc_info=True)
+        if session:
+            self.append_event(session, proto.lifecycle(
+                "approval.declined", method=method, item_id=params.get("itemId"), turn_id=params.get("turnId"),
+                reason=params.get("reason"),
+                note="codex asked for interactive approval/input; v1 declines instead of hanging",
+            ))
+
+    def _on_exit(self, code: Optional[int]) -> None:
+        with self._lock:
+            for session, state in self._active_sessions().items():
+                turn_id = state.get("active_turn_id")
+                env = proto.lifecycle("run.failed", turn_id=turn_id, thread_id=state.get("thread_id"),
+                                      error=f"codex app-server exited (code {code}) while the turn was active; "
+                                            "outcome unknown — inspect the worktree before re-sending",
+                                      app_server_exit=True)
+                self.append_event(session, env)
+                turn_state = next((t for t in reversed(state.get("turns") or []) if t.get("turn_id") == turn_id), None)
+                self._settle_turn(state, turn_state, env)
+                state["status"] = "unknown"
+                if turn_state is not None:
+                    turn_state["status"] = "unknown"
+                state["completions"][-1]["status"] = "unknown"
+                self.save(state)
+            self._server = None
+
+    def _idle_check(self) -> None:
+        if self.idle_exit_s <= 0 or self._server is None:
+            return
+        if self._active_sessions():
+            return
+        if time.monotonic() - self._last_activity > self.idle_exit_s:
+            with self._lock:
+                srv, self._server = self._server, None
+            if srv is not None:
+                srv.close()
+
+    # -- socket server ------------------------------------------------------------
+
+    def serve(self) -> None:
+        sock_path = self.state_dir / SOCKET_NAME
+        if sock_path.exists():
+            sock_path.unlink()
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        os.chmod(sock_path, 0o600)
+        srv.listen(16)
+        srv.settimeout(0.5)
+        info = self.state_dir / INFO_NAME
+        info.write_text(json.dumps({"pid": os.getpid(), "birth": _pid_birth(os.getpid()), "started_at": _now(),
+                                    "codex_bin": self.codex_bin, "socket": str(sock_path)}), "utf-8")
+        os.chmod(info, 0o600)
+        threading.Thread(target=self._fold_loop, name="codex-fold", daemon=True).start()
+        try:
+            while not self._stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                threading.Thread(target=self._serve_conn, args=(conn,), daemon=True).start()
+        finally:
+            srv.close()
+            sock_path.unlink(missing_ok=True)
+            info.unlink(missing_ok=True)
+            with self._lock:
+                app, self._server = self._server, None
+            if app is not None:
+                app.close()
+
+    def _serve_conn(self, conn: socket.socket) -> None:
+        try:
+            conn.settimeout(120)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            if not line:
+                return
+            try:
+                req = json.loads(line.decode("utf-8"))
+            except Exception:
+                resp = {"ok": False, "error": "malformed request (expected one JSON object per line)"}
+            else:
+                resp = self.handle(req) if isinstance(req, dict) else {"ok": False, "error": "request must be an object"}
+            conn.sendall((json.dumps(resp, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
+        except Exception:
+            logger.debug("connection failed", exc_info=True)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--state-dir", required=True)
+    ap.add_argument("--codex-bin", required=True)
+    ap.add_argument("--codex-home", default=None)
+    ap.add_argument("--env-allow", default="", help="comma-separated env var names passed to app-server")
+    ap.add_argument("--idle-exit-s", type=float, default=1800.0)
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    lock_fh = open(state_dir / LOCK_NAME, "a+")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another controller owns this state dir", file=sys.stderr)
+        return 3
+    ctl = Controller(state_dir, args.codex_bin, args.codex_home,
+                     [e for e in args.env_allow.split(",") if e], args.idle_exit_s)
+    signal.signal(signal.SIGTERM, lambda *_: ctl._stop.set())
+    signal.signal(signal.SIGINT, lambda *_: ctl._stop.set())
+    ctl.serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
