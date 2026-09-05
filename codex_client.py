@@ -306,6 +306,7 @@ class Follower:
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._ingest_lock = threading.RLock()
+        self._digest_id = uuid.uuid4().hex
         self._digest_due: Dict[str, Dict[str, float]] = {}
         self._digest_n: Dict[str, Dict[str, int]] = {}
 
@@ -443,11 +444,15 @@ class Follower:
         text = _render.digest_text(
             name=name, n=n, status="running", elapsed_s=None, last_activity_s=None,
             files=proj["files"], pending_tools=proj["pending_tools"], plan=proj["plan"], events=events,
-            new_count=new_count, next_update_s=interval,
+            new_count=new_count, next_update_s=interval, backend=BACKEND,
         )
         evt = {
             "type": "async_delegation",
-            "delegation_id": f"{name}#codex-progress-{n}@{_progress.subscriber_suffix(key)}@{entry.get('codex_turn_id') or ''}",
+            # A new follower restarts n, including on quiet ticks in the same turn.
+            "delegation_id": (
+                f"{name}#codex-progress-{n}@{_progress.subscriber_suffix(key)}"
+                f"@{entry.get('codex_turn_id') or ''}@{self._digest_id}"
+            ),
             "session_key": key,
             "goal": f"codex progress update {n} for session '{name}' (turn still active — NOT the final result)",
             "context": None, "toolsets": None, "role": "codex", "model": str(entry.get("model") or "codex"),

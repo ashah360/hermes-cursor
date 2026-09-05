@@ -23,6 +23,7 @@ from plugins.ghost_cursor import codex_client as cc
 from plugins.ghost_cursor import eventlog as _eventlog
 from plugins.ghost_cursor import handles as _handles
 from plugins.ghost_cursor import jobs as _jobs
+from plugins.ghost_cursor import render as _render
 from plugins.ghost_cursor import writer_guard as guard
 
 HERE = Path(__file__).resolve().parent
@@ -800,6 +801,77 @@ def test_cursor_entry_points_and_reconciler_fence_codex_handles(codex_env, monke
 # Gateway restart: digests/status project from the controller's durable record
 # ---------------------------------------------------------------------------
 
+def test_digest_ids_survive_follower_restart(codex_env):
+    name = "Digest restart"
+    cb.codex_create_session(title=name, repo=str(codex_env), model="test-model")
+    assert "turn turn_1" in cb.codex_send_message(name, "hang here")
+    assert _wait(lambda: any(t.get("pending_tools") for t in _controller_state(name).get("turns") or []))
+    old = cc.follower
+    cc._reset_for_tests()
+    old._thread.join(timeout=5)
+    assert not old._thread.is_alive()
+    cc.follower.ingest(name, _handles.get(name))
+    total = _eventlog.stats(name)["total_events"]
+    assert total > 0
+    keys = ("", "gw:watch")
+    _handles.record(name, subscribers={key: 60.0 for key in keys})
+    _drain()
+
+    for key in keys:
+        cc.follower._deliver_digest(name, _handles.get(name), key, 60.0)
+    first = _drain()
+    assert len(first) == 2
+    assert _handles.supervision_of(_handles.get(name))["last_seq_delivered"] == dict.fromkeys(keys, total)
+
+    cc._reset_for_tests()
+    assert cc.follower.ingest(name, _handles.get(name)) == 0
+    assert _eventlog.stats(name)["total_events"] == total
+    assert _controller_state(name)["active_turn_id"] == "turn_1"
+    for key in keys:
+        cc.follower._deliver_digest(name, _handles.get(name), key, 60.0)
+    second = _drain()
+    assert len(second) == 2
+    assert _handles.supervision_of(_handles.get(name))["last_seq_delivered"] == dict.fromkeys(keys, total)
+    assert all("codex is busy inside the calls above" in event["summary"] for event in second)
+    # Both followers start at 1, with no new events to distinguish the heartbeat.
+    events = first + second
+    assert {event["cursor_progress_update"] for event in events} == {1}
+    assert len({(event["delegation_id"], event["type"]) for event in events}) == 4
+    for event in events:
+        key = event["session_key"]
+        assert key in keys
+        assert event["delegation_id"].startswith(
+            f"{name}#codex-progress-1@{cc._progress.subscriber_suffix(key)}@turn_1@"
+        )
+        assert event["summary"].startswith(f"codex session '{name}' — progress update 1")
+        assert "cursor" not in event["summary"]
+    assert "status: cancelled" in cb.codex_stop(name)
+    _deliveries()
+
+
+@pytest.mark.parametrize("backend", ["cursor", "codex"])
+@pytest.mark.parametrize("record", [
+    {"kind": "tool_use", "tool": "shell", "title": "x" * 400},
+    {"kind": "tool_result", "output": "x" * 400},
+    {"kind": "reasoning", "text": "x" * 400},
+    {"kind": "content", "delta": "x" * 400},
+    {"kind": "lifecycle", "event": "failed", "error": "x" * 400},
+], ids=["tool", "result", "reasoning", "content", "lifecycle"])
+def test_digest_text_uses_backend_tools(backend, record):
+    text = _render.digest_text(
+        name="Digest text", n=1, status="running", elapsed_s=30, last_activity_s=1,
+        files=[], plan=[{"content": "p" * 400, "status": "in_progress"}],
+        pending_tools=[{"title": "t" * 400, "pending_s": 10}],
+        events=[{**record, "seq": i} for i in range(8)], new_count=8,
+        **({"backend": backend} if backend == "codex" else {}),
+    )
+    assert text.startswith(f"{backend} session 'Digest text' — progress update 1")
+    assert text.count("full text via " + backend + "_events") >= 3
+    assert f"more — {backend}_events('Digest text')" in text
+    other = "cursor" if backend == "codex" else "codex"
+    assert other not in text
+
+
 def test_restart_projection_comes_from_controller_record(codex_env, monkeypatch):
     repo = codex_env
     name = "Projection survives"
@@ -832,10 +904,19 @@ def test_restart_projection_comes_from_controller_record(codex_env, monkeypatch)
 # ---------------------------------------------------------------------------
 
 _ORPHANING_PARENT = r"""
-import os, subprocess, sys, time
+import os, subprocess, sys
+from pathlib import Path
 # Behaves like an app-server whose tool shell outlives it: fork a descendant
 # that leaves the process group AND session (setsid), then exit 0 on stdin EOF.
-child = subprocess.Popen([sys.executable, "-c", "import os, time; os.setsid(); time.sleep(120)"])
+# A separate pipe lets the test stop the child after it has been reparented.
+# It also expires if the test process dies before sending the stop byte.
+child = subprocess.Popen([sys.executable, "-c", '''
+import os, select, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+os.setsid()
+select.select([fd], [], [], 120)
+os.close(fd)
+''', str(Path(__file__).with_suffix(".stop"))])
 sys.stdout.write('{"method": "fake/child", "params": {"pid": %d}}\n' % child.pid)
 sys.stdout.flush()
 sys.stdin.read()
@@ -860,13 +941,21 @@ def _own_session(pid):
     return int(fields[2]) == pid and int(fields[3]) == pid
 
 
-def _orphaning_bin(tmp_path):
+@pytest.fixture
+def orphaning_bin(tmp_path):
     script = tmp_path / "orphaning_parent.py"
     script.write_text(_ORPHANING_PARENT)
     wrapper = tmp_path / "fake_codex"
     wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script}\n")
     wrapper.chmod(0o755)
-    return str(wrapper)
+    pipe = script.with_suffix(".stop")
+    os.mkfifo(pipe)
+    fd = os.open(pipe, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        yield str(wrapper), fd
+    finally:
+        os.write(fd, b"stop")
+        os.close(fd)
 
 
 def _wait_child_pid(seen, timeout=5):
@@ -886,12 +975,13 @@ _needs_user_systemd = pytest.mark.skipif(
 
 
 @_needs_user_systemd
-def test_owned_scope_stops_setsid_descendant_after_clean_parent_exit(tmp_path):
+def test_owned_scope_stops_setsid_descendant_after_clean_parent_exit(orphaning_bin):
     import plugins.ghost_cursor.codex_protocol as proto
 
     seen = []
     unit = proto.new_unit_name()
-    srv = proto.AppServer(_orphaning_bin(tmp_path), on_notification=seen.append, unit=unit)
+    bin_path, _ = orphaning_bin
+    srv = proto.AppServer(bin_path, on_notification=seen.append, unit=unit)
     try:
         child_pid = _wait_child_pid(seen)
         assert _proc_state(child_pid) in ("R", "S")
@@ -907,22 +997,27 @@ def test_owned_scope_stops_setsid_descendant_after_clean_parent_exit(tmp_path):
         proto.stop_unit(unit, 2.0)
 
 
-def test_uncontained_child_close_fails_closed(tmp_path):
+def test_uncontained_child_close_fails_closed(orphaning_bin):
     """Without an owned scope, close() must report that cleanup is unproven —
     a setsid descendant really does survive the process-group kill."""
     import plugins.ghost_cursor.codex_protocol as proto
 
     seen = []
-    srv = proto.AppServer(_orphaning_bin(tmp_path), on_notification=seen.append, unit=None)
-    child_pid = _wait_child_pid(seen)
+    bin_path, stop_fd = orphaning_bin
+    srv = proto.AppServer(bin_path, on_notification=seen.append, unit=None)
+    child_pid = None
     try:
+        child_pid = _wait_child_pid(seen)
         assert _wait(lambda: _own_session(child_pid), timeout=5)
         proven = srv.close(grace_s=0.5)
         assert srv.returncode() == 0 and srv.alive() is False
         assert proven is False  # fail closed
         assert _proc_state(child_pid) in ("R", "S")  # the escaped descendant is still running
     finally:
-        os.kill(child_pid, 9)
+        srv.close(grace_s=0.5)
+        os.write(stop_fd, b"stop")
+        if child_pid is not None:
+            assert _wait(lambda: _dead(child_pid), timeout=5), "fixture child did not exit after stop"
 
 
 def test_unproven_cleanup_retains_intent_and_claim(codex_env, monkeypatch, tmp_path):
