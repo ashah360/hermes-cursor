@@ -14,6 +14,9 @@ keyed by words in the prompt:
 * ``lostresponse`` — the turn runs and streams normally but the turn/start
   REPLY is delayed 2s (client-side timeout => ambiguous outcome).
   With ``silent`` too: no reply and no turn at all.
+* ``rejectturn`` — turn/start answers a JSON-RPC error (definitive rejection).
+* ``dieonstart`` — the process exits on turn/start before replying.
+* env ``FAKE_CODEX_STRICT_RESUME=1`` — thread/resume of an unknown id errors.
 
 Invoked as ``fake_codex_app_server.py app-server`` (the controller appends
 the ``app-server`` subcommand). ``FAKE_CODEX_EVENT_LOG`` (optional) gets
@@ -166,6 +169,8 @@ def handle(msg):
         notify("thread/started", {"thread": {"id": tid}})
     elif method == "thread/resume":
         tid = params.get("threadId")
+        if tid not in _threads and os.environ.get("FAKE_CODEX_STRICT_RESUME"):
+            send({"id": rid, "error": {"code": -32600, "message": f"thread not found: {tid}"}}); return
         if tid not in _threads:
             # Threads persist on disk in real codex; a fresh fake accepts any id.
             _threads[tid] = {}
@@ -182,6 +187,13 @@ def handle(msg):
             ctl = {"turn_id": turn_id, "interrupt": threading.Event(), "steers": []}
             _active[tid] = ctl
         prompt = " ".join(i.get("text", "") for i in params.get("input", []) if i.get("type") == "text")
+        if "rejectturn" in prompt:
+            with _lock:
+                _active.pop(tid, None)
+            send({"id": rid, "error": {"code": -32600, "message": "turn rejected by provider (test)"}}); return
+        if "dieonstart" in prompt:
+            sys.stdout.flush()
+            os._exit(1)
         reply = {"id": rid, "result": {"turn": {"id": turn_id, "status": "inProgress", "items": [], "error": None}}}
         if "lostresponse" in prompt:
             if "silent" in prompt:

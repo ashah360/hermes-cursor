@@ -242,19 +242,23 @@ def codex_send_message(session: str, message: str, update_interval_s: Optional[f
             return (f"the turn {active} in {name} just changed ({resp.get('turn_id') or 'no active turn'}); NOT "
                     "re-sending automatically — check codex_status and send again.")
         if resp.get("error") == "no_active_turn":
-            pass  # the turn finished between status and steer: fall through to a new turn
-        else:
-            return f"steer failed: {resp.get('error')}"
+            # The turn finished between status and steer. Never turn a steer
+            # into a fresh dispatch on the caller's behalf.
+            return (f"the active turn {active} in {name} finished before this message could be appended; "
+                    "NOT re-sending it as a new turn — the completion is delivering. Send again to start a new turn.")
+        return f"steer failed: {resp.get('error')}"
 
     # Atomic worktree reservation (shared with Cursor local dispatch): the
     # check and the claim write are one flock'd section. The controller
     # re-asserts the same claim (same session ref) before turn/start and
     # holds it through an ambiguous outcome until the turn settles.
-    claim, holder = _guard.reserve(repo, "codex", ref, _codex.claims_dir())
+    intent_id = f"intent-{uuid.uuid4().hex[:12]}"
+    # Owner = this dispatch's intent id: a concurrent send to the SAME session
+    # is another owner and is refused here; it can never release this claim.
+    claim, holder = _guard.reserve(repo, "codex", ref, _codex.claims_dir(), intent_id)
     if claim is None:
         return _render.repo_busy(_guard.describe(holder), repo).replace("two cursor runs", "two agents")
     prompt_seq = (_eventlog.stats(name) or {}).get("total_events", 0)
-    intent_id = f"intent-{uuid.uuid4().hex[:12]}"
     _handles.record(name, pending_intent_id=intent_id, task=str(message)[:200])
     resp = _codex.request("start", session=ref, cwd=repo, model=str(entry.get("model") or ""),
                           effort=entry.get("effort"), prompt=str(message), intent_id=intent_id)
@@ -267,7 +271,7 @@ def codex_send_message(session: str, message: str, update_interval_s: Optional[f
                     "The provider may be running the turn; the worktree stays reserved and the intent "
                     f"{intent_id} stays recorded. If the turn starts, it is adopted and its result auto-delivers. "
                     f"Check {STATUS}; if nothing appears, {STOP} clears the intent.")
-        _guard.release(repo, ref, _codex.claims_dir())
+        _guard.release(repo, ref, _codex.claims_dir(), intent_id)  # only THIS dispatch's claim
         _handles.record(name, pending_intent_id=None)
         if err == "worktree_busy":
             return _render.repo_busy(_guard.describe(resp.get("claim")), repo)
@@ -372,11 +376,17 @@ def codex_stop(session: str, **_: Any) -> str:
     if not resp.get("ok"):
         return f"codex interrupt failed for {name}: {resp.get('error')}"
     turn_id = str(resp.get("turn_id") or "")
+    if resp.get("status") == "unresolved":
+        return (f"no turn was ever observed for the pending dispatch in '{name}', and it could NOT be proven idle: "
+                f"{resp.get('reason')}. The intent and the worktree reservation stay in place; retry {STOP} once the "
+                "other sessions finish, or inspect the worktree.")
     if resp.get("intent_cleared"):
+        _codex.follower.ingest(name, _handles.get(name) or {})
         _handles.record(name, status="failed", pending_intent_id=None,
-                        status_note="unresolved dispatch intent cleared by codex_stop; no turn was observed")
+                        status_note="unresolved dispatch intent cleared by codex_stop after proving quiescence")
         return (f"no active turn in '{name}'; cleared the unresolved dispatch intent {resp['intent_cleared']} and "
-                "released the worktree. Inspect the worktree before sending again — the provider never reported a turn.")
+                f"released the worktree after proving nothing runs ({resp.get('proof')}). Inspect the worktree "
+                "before sending again — the provider never reported a turn.")
     if not turn_id:
         entry = _handles.get(name) or {}
         return _render.stop_text(name=name, status=str(entry.get("status") or "idle"), elapsed_s=entry.get("duration_s"),

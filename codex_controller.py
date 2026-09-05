@@ -200,14 +200,14 @@ class Controller:
     def _claim_locked(self, cwd: str):
         return _flocked(self.claims_dir / f"{claim_key(cwd)}.lock")
 
-    def write_claim(self, cwd: str, session: str, turn_id: str) -> None:
-        """Assert (or refresh) this session's claim; caller holds the flock or
-        accepts a same-session overwrite."""
+    def write_claim(self, cwd: str, session: str, turn_id: str, owner: str = "") -> None:
+        """Assert (or refresh) the claim for ``owner`` (the dispatch intent id).
+        Caller holds the flock. Only the same owner is ever overwritten."""
         pid = os.getpid()
-        prior = self._read_claim(cwd)
+        prior = self._read_claim(cwd) or {}
         data = {"cwd": os.path.realpath(cwd), "session": session, "turn_id": turn_id, "backend": "codex",
-                "holder_pid": pid, "holder_birth": _pid_birth(pid),
-                "claimed_at": (prior or {}).get("claimed_at") if (prior or {}).get("session") == session else _now()}
+                "owner": owner or prior.get("owner") or "", "holder_pid": pid, "holder_birth": _pid_birth(pid),
+                "claimed_at": prior.get("claimed_at") if prior.get("owner") == (owner or prior.get("owner")) else _now()}
         path = self._claim_path(cwd)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), "utf-8")
@@ -221,11 +221,17 @@ class Controller:
         except Exception:
             return None
 
-    def clear_claim(self, cwd: str, session: str) -> None:
+    def clear_claim(self, cwd: str, session: str, owner: str = "") -> bool:
+        """Remove the claim only when it belongs to ``session`` AND ``owner``
+        (when given): a losing request can never remove the winner's claim."""
         with self._claim_locked(cwd):
             data = self._read_claim(cwd)
-            if data is not None and data.get("session") == session:
-                self._claim_path(cwd).unlink(missing_ok=True)
+            if data is None or data.get("session") != session:
+                return False
+            if owner and str(data.get("owner") or "") not in ("", owner):
+                return False
+            self._claim_path(cwd).unlink(missing_ok=True)
+            return True
 
     @staticmethod
     def _claim_live(data: Dict[str, Any]) -> bool:
@@ -246,10 +252,12 @@ class Controller:
             pass
         return data.get("holder_birth") in (None, _pid_birth(pid))
 
-    def other_claim(self, cwd: str, session: str) -> Optional[Dict[str, Any]]:
-        """A LIVE claim by a different session (any backend). Caller holds the flock."""
+    def other_claim(self, cwd: str, owner: str) -> Optional[Dict[str, Any]]:
+        """A LIVE claim by a different owner (any backend, any session — a
+        second dispatch on the SAME session is also another owner). Caller
+        holds the flock."""
         data = self._read_claim(cwd)
-        if data is None or data.get("session") == session:
+        if data is None or str(data.get("owner") or "") == owner:
             return None
         if not self._claim_live(data):
             return None
@@ -338,10 +346,10 @@ class Controller:
             # Reserve the worktree and persist the dispatch intent BEFORE any
             # wire call. Both stay in place until the outcome is known.
             with self._claim_locked(state["cwd"]):
-                claim = self.other_claim(state["cwd"], session)
+                claim = self.other_claim(state["cwd"], intent_id)
                 if claim is not None:
                     return {"ok": False, "error": "worktree_busy", "claim": claim}
-                self.write_claim(state["cwd"], session, "pending")
+                self.write_claim(state["cwd"], session, "pending", owner=intent_id)
             state["pending_intent"] = {"intent_id": intent_id, "prompt_sha1": hashlib.sha1(prompt.encode()).hexdigest(),
                                        "prompt_head": prompt[:200], "at": _now()}
             self.save(state)
@@ -389,19 +397,15 @@ class Controller:
                 # Timeout / closed pipe AFTER turn/start went out: the provider
                 # may have accepted the turn. Keep the claim and the intent;
                 # a turn/started notification for this thread adopts the turn
-                # (_on_notify); codex_stop clears an intent nothing arrives for.
-                state["pending_intent"]["ambiguous"] = True
-                state["pending_intent"]["error"] = str(exc)
-                state["last_error"] = str(exc)
-                self.save(state)
-                self.append_event(session, proto.lifecycle("dispatch.ambiguous", intent_id=intent_id, error=str(exc),
-                                                           thread_id=thread_id))
-                return {"ok": False, "error": "ambiguous_dispatch", "detail": str(exc), "thread_id": thread_id,
-                        "pending_intent": state["pending_intent"]}
+                # (_on_notify); codex_stop reconciles an intent nothing
+                # arrives for.
+                return self._mark_ambiguous(state, intent_id, thread_id, str(exc))
             turn = res.get("turn") or {}
             turn_id = str(turn.get("id") or "")
             if not turn_id:
-                return self._fail_intent(state, "turn/start returned no turn id")
+                # A success reply without a turn id: the provider accepted
+                # SOMETHING we cannot name. Ambiguous, not a rejection.
+                return self._mark_ambiguous(state, intent_id, thread_id, "turn/start succeeded without a turn id")
             if state.get("active_turn_id") == turn_id:
                 # turn/started already adopted it (reply raced the notification).
                 return {"ok": True, "thread_id": thread_id, "turn_id": turn_id, "model": state["model"],
@@ -409,6 +413,29 @@ class Controller:
             self._activate_turn(state, turn_id, intent_id, prompt)
             return {"ok": True, "thread_id": thread_id, "turn_id": turn_id, "model": state["model"],
                     "effort": state.get("effort"), "resumed": len(state["turns"]) > 1}
+
+    def _fail_intent(self, state: Dict[str, Any], error: str) -> Dict[str, Any]:
+        """Definitive rejection (the provider answered, or nothing was sent):
+        drop the intent and this owner's worktree claim."""
+        pending = state.get("pending_intent") or {}
+        state["pending_intent"] = None
+        state["last_error"] = error
+        state["status"] = state.get("status") if state.get("turns") else "failed"
+        self.save(state)
+        self.clear_claim(state["cwd"], state["session"], owner=str(pending.get("intent_id") or ""))
+        self.append_event(state["session"], proto.lifecycle("dispatch.failed", error=error,
+                                                            intent_id=pending.get("intent_id")))
+        return {"ok": False, "error": error, "definitive": True}
+
+    def _mark_ambiguous(self, state: Dict[str, Any], intent_id: str, thread_id: str, error: str) -> Dict[str, Any]:
+        state["pending_intent"]["ambiguous"] = True
+        state["pending_intent"]["error"] = error
+        state["last_error"] = error
+        self.save(state)
+        self.append_event(state["session"], proto.lifecycle("dispatch.ambiguous", intent_id=intent_id, error=error,
+                                                            thread_id=thread_id))
+        return {"ok": False, "error": "ambiguous_dispatch", "detail": error, "thread_id": thread_id,
+                "pending_intent": state["pending_intent"]}
 
     def _activate_turn(self, state: Dict[str, Any], turn_id: str, intent_id: str, prompt: str) -> None:
         """The turn exists on the provider: record it, clear the intent, bind the claim."""
@@ -421,7 +448,7 @@ class Controller:
         state["last_activity_at"] = _now()
         self.save(state)
         with self._claim_locked(state["cwd"]):
-            self.write_claim(state["cwd"], session, turn_id)
+            self.write_claim(state["cwd"], session, turn_id, owner=intent_id)
         self._last_activity = time.monotonic()
         self.append_event(session, proto.lifecycle("dispatch.accepted", turn_id=turn_id, thread_id=state.get("thread_id"),
                                                    model=state.get("model"), effort=state.get("effort"), intent_id=intent_id))
@@ -458,14 +485,7 @@ class Controller:
             if not active:
                 pending = state.get("pending_intent")
                 if pending:
-                    state["pending_intent"] = None
-                    state["status"] = "unknown"
-                    self.save(state)
-                    self.clear_claim(state["cwd"], session)
-                    self.append_event(session, proto.lifecycle(
-                        "intent.cleared", intent_id=pending.get("intent_id"),
-                        note="unresolved dispatch intent cleared by an explicit stop; no turn was observed for it"))
-                    return {"ok": True, "turn_id": "", "status": "unknown", "intent_cleared": pending.get("intent_id")}
+                    return self._reconcile_pending(state, pending)
                 return {"ok": True, "turn_id": "", "status": state.get("status") or "idle"}
             try:
                 self.server().request("turn/interrupt", {"threadId": state["thread_id"], "turnId": active}, timeout=30)
@@ -473,6 +493,46 @@ class Controller:
                 return {"ok": False, "error": str(exc), "turn_id": active}
             self.append_event(session, proto.lifecycle("interrupt_requested", turn_id=active))
             return {"ok": True, "turn_id": active, "status": "running"}
+
+    def _reconcile_pending(self, state: Dict[str, Any], pending: Dict[str, Any]) -> Dict[str, Any]:
+        """Explicit stop on an unresolved dispatch intent.
+
+        "No observed turn" is not proof that nothing runs. The claim and the
+        intent are released only once the controller can PROVE quiescence:
+        the app-server child it owns is dead (never started or already gone),
+        or it is the only session on that child and the child is torn down
+        here (bounded, full process group). If another session has an active
+        turn on the shared child, nothing is killed and the intent stays
+        unresolved — reported honestly.
+        """
+        session = state["session"]
+        srv = self._server
+        proof = ""
+        if srv is None or not srv.alive():
+            proof = "app-server child is not running"
+        else:
+            others = [s for s in self._active_sessions() if s != session]
+            if others:
+                return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
+                        "reason": ("cannot prove the lost dispatch is not executing: the shared codex app-server "
+                                   f"still serves active turns for {len(others)} other session(s); the intent and the "
+                                   "worktree claim stay in place")}
+            with self._lock:
+                app, self._server = self._server, None
+            app.close(grace_s=5.0)
+            if app.alive():
+                self._server = app
+                return {"ok": True, "turn_id": "", "status": "unresolved", "pending_intent": pending,
+                        "reason": "codex app-server did not exit within the bound; intent and claim stay in place"}
+            proof = f"app-server child (pid {app.pid}) terminated by the controller"
+        state["pending_intent"] = None
+        state["status"] = "unknown"
+        self.save(state)
+        self.clear_claim(state["cwd"], session, owner=str(pending.get("intent_id") or ""))
+        self.append_event(session, proto.lifecycle(
+            "intent.cleared", intent_id=pending.get("intent_id"), proof=proof,
+            note="unresolved dispatch intent cleared by an explicit stop after proving quiescence"))
+        return {"ok": True, "turn_id": "", "status": "unknown", "intent_cleared": pending.get("intent_id"), "proof": proof}
 
     def op_status(self, req: Dict[str, Any]) -> Dict[str, Any]:
         state = self.load(str(req.get("session") or ""))
@@ -692,7 +752,7 @@ class Controller:
             "files": files, "started_at": (turn_state or {}).get("started_at"), "finished_at": _now(),
             "delivered": False, "model": state.get("model"),
         })
-        self.clear_claim(state["cwd"], state["session"])
+        self.clear_claim(state["cwd"], state["session"], owner=str((turn_state or {}).get("intent_id") or ""))
 
     def _on_request(self, msg: Dict[str, Any]) -> None:
         method = str(msg.get("method") or "")

@@ -86,15 +86,24 @@ def _worker_lease_held(canonical: str) -> bool:
     return bool(record is not None and record.leases)
 
 
+def _profile_id() -> str:
+    from . import codex_client as _codex
+
+    return _codex.profile_id()
+
+
 def claim_live(claim: Dict[str, Any]) -> bool:
     if not isinstance(claim, dict):
         return False
     if _holder_alive(claim):
         return True
     if str(claim.get("backend") or "") == "cursor":
-        entry = _handles.get(str(claim.get("session") or ""))
-        if entry is not None and str(entry.get("status") or "") == "running":
-            return True
+        # The running-handle check is meaningful only for THIS profile's
+        # handle table; another profile's claim falls back to lease evidence.
+        if str(claim.get("profile") or "") == _profile_id():
+            entry = _handles.get(str(claim.get("session") or ""))
+            if entry is not None and str(entry.get("status") or "") == "running":
+                return True
         return _worker_lease_held(str(claim.get("cwd") or ""))
     return False
 
@@ -171,20 +180,22 @@ def cursor_writer(repo: str) -> Optional[str]:
 
 
 def reserve(
-    repo: str, backend: str, session: str, claims_dir: str, **extra: Any
+    repo: str, backend: str, session: str, claims_dir: str, owner: str, **extra: Any
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Atomically reserve ``repo``'s canonical worktree for ``session``.
+    """Atomically reserve ``repo``'s canonical worktree for one dispatch.
 
+    ``owner`` identifies the RUN (a dispatch intent id), not just the session:
+    a second send to the same session is another owner and is refused while
+    the first is live, so a loser can never overwrite or release a winner.
     Returns ``(claim, None)`` when reserved (or re-asserted by the same
-    session), ``(None, holder)`` when another live writer holds it —
-    ``holder`` names the backend and session. Check and write happen under
-    the worktree flock.
+    owner), ``(None, holder)`` when another live writer holds it. Check and
+    write happen under the worktree flock.
     """
     canonical = _workers.canonical_repo_path(repo)
     path, lock_path = _paths(canonical, claims_dir)
     with _locked(lock_path):
         existing = _read(path)
-        if existing is not None and str(existing.get("session")) != str(session) and claim_live(existing):
+        if existing is not None and str(existing.get("owner") or "") != str(owner) and claim_live(existing):
             return None, existing
         if backend == "codex":
             other = cursor_writer(canonical)
@@ -192,20 +203,24 @@ def reserve(
                 return None, {"backend": "cursor", "session": other, "cwd": canonical}
         pid = os.getpid()
         claim = {
-            "cwd": canonical, "backend": backend, "session": str(session), "holder_pid": pid,
-            "holder_birth": _pid_birth(pid), "claimed_at": round(time.time(), 3), **extra,
+            "cwd": canonical, "backend": backend, "session": str(session), "owner": str(owner),
+            "profile": _profile_id(), "holder_pid": pid, "holder_birth": _pid_birth(pid),
+            "claimed_at": round(time.time(), 3), **extra,
         }
         _write(path, claim)
         return claim, None
 
 
-def release(repo: str, session: str, claims_dir: str) -> bool:
-    """Drop ``session``'s claim on the worktree. True when a claim was removed."""
+def release(repo: str, session: str, claims_dir: str, owner: str) -> bool:
+    """Drop ``owner``'s claim on the worktree. True when a claim was removed;
+    another owner's claim (same session or not) is never touched."""
     canonical = _workers.canonical_repo_path(repo)
     path, lock_path = _paths(canonical, claims_dir)
     with _locked(lock_path):
         existing = _read(path)
         if existing is None or str(existing.get("session")) != str(session):
+            return False
+        if str(existing.get("owner") or "") != str(owner):
             return False
         try:
             os.unlink(path)

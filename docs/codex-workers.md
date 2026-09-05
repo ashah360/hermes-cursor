@@ -50,12 +50,23 @@ worker behavior. Full authoritative scope: the plan in
   pid alive; cursor claim = gateway pid alive, or the handle still
   `running`, or the worktree's Cursor worker holds a run lease. Cursor cloud
   VMs have no local worktree and are never blocked.
-- **Ambiguous dispatch.** A JSON-RPC error on `turn/start` is a definitive
-  rejection (intent and claim dropped). A transport failure after the request
-  went out (timeout, closed pipe) is ambiguous: the intent (`ambiguous: true`)
-  and the claim are retained, a later `turn/started` for the thread adopts
-  the turn, and further sends are refused until `codex_stop` clears the
-  intent explicitly. No automatic re-send.
+- **Ambiguous dispatch.** A JSON-RPC error answered by the provider on
+  `turn/start` is a definitive rejection (intent and claim dropped). A
+  transport failure after the request went out (timeout, closed pipe — the
+  locally synthesized `code -1` error included) or a success reply without a
+  turn id is ambiguous: the intent (`ambiguous: true`) and the claim are
+  retained, a later `turn/started` for the thread adopts the turn, and
+  further sends are refused. `codex_stop` clears the intent only after the
+  controller proves quiescence — its app-server child is dead, or it is the
+  only session on that child and the child is torn down (bounded). If other
+  sessions are active on the shared child, stop reports `unresolved` and
+  keeps intent and claim. No automatic re-send. A steer that races a
+  finishing turn returns without starting a new turn.
+- **Claim ownership** is per dispatch: the claim carries `owner` (the
+  dispatch intent id for Codex; `cursor:<profile>:<session>:<dispatch>` for
+  Cursor) and `profile`. `reserve` refuses any live claim with another owner
+  — including a second send to the same session — and `release` only removes
+  the caller's own owner, so a losing request can never free a winner.
 - **Profiles.** The controller is machine-global; handles are per Hermes
   profile. Controller session ids are `<profile-id>:<title>`
   (`codex_client.session_ref`), so equal titles in two profiles never

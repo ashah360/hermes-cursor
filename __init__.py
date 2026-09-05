@@ -88,6 +88,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cloud_runner as _cloud
@@ -1128,12 +1129,17 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
 # Dispatch plumbing behind cursor_send_message
 # ---------------------------------------------------------------------------
 
-def _release_worktree(repo: str, session_name: str) -> None:
-    """Drop this session's worktree reservation. Never raises."""
+def _release_worktree(repo: str, session_name: str, owner: str) -> None:
+    """Drop ONE dispatch's worktree reservation (by owner). Never raises."""
     try:
-        _guard.release(repo, session_name, _codex_client.claims_dir())
+        _guard.release(repo, session_name, _codex_client.claims_dir(), owner)
     except Exception:
         logger.debug("worktree release failed for %s", session_name, exc_info=True)
+
+
+def _cursor_owner(session_name: str) -> str:
+    """Claim owner for one Cursor dispatch: backend + profile + session + dispatch."""
+    return f"cursor:{_codex_client.profile_id()}:{session_name}:{uuid.uuid4().hex[:12]}"
 
 
 def _dispatch_run(
@@ -1145,6 +1151,7 @@ def _dispatch_run(
     inactivity_timeout_s: float,
     max_wall_s: float,
     runtime: str = "local",
+    claim_owner: str = "",
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -1167,16 +1174,16 @@ def _dispatch_run(
         # The worktree reservation taken in _send_to_session is released by
         # jobs._finalize once the run is observed terminal (local only).
         writer_release=(
-            (lambda: _release_worktree(str(workdir), session_name))
-            if runtime != "cloud" and session_name else None
+            (lambda: _release_worktree(str(workdir), session_name, claim_owner))
+            if claim_owner and session_name else None
         ),
     )
     if job is None:
         # Same-repo concurrency guard: two cursor agents on one working tree
         # corrupt it. Surface the existing run's handle so the caller can
         # steer/inspect it instead. (Different repos run in parallel.)
-        if runtime != "cloud" and session_name and existing.session_name != session_name:
-            _release_worktree(str(workdir), session_name)
+        if claim_owner and session_name:
+            _release_worktree(str(workdir), session_name, claim_owner)
         existing.session_event.wait(timeout=10)  # give a usable handle
         return {
             "success": False,
@@ -1389,8 +1396,10 @@ def _send_to_session(
     # when the run is observed terminal. A live Codex claim (or another
     # Cursor writer's claim) rejects this send the same way the in-process
     # same-repo guard does.
+    owner = ""
     if runtime == "local" and os.path.isdir(repo):
-        claim, holder = _guard.reserve(repo, "cursor", name, _codex_client.claims_dir())
+        owner = _cursor_owner(name)
+        claim, holder = _guard.reserve(repo, "cursor", name, _codex_client.claims_dir(), owner)
         if claim is None:
             return {
                 "success": False,
@@ -1411,6 +1420,7 @@ def _send_to_session(
         inactivity_timeout_s=_resolve_inactivity_timeout(inactivity_timeout_s),
         max_wall_s=_resolve_max_wall(max_wall_s),
         runtime=runtime,
+        claim_owner=owner,
     )
     result.setdefault("session", name)
     # A follow-up bounced off the agent's live run (409 agent_busy): the

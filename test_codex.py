@@ -104,6 +104,12 @@ def _settled(name):
     return lambda: not _controller_state(name).get("active_turn_id")
 
 
+def _gw_log(name):
+    """The gateway-side event log after pulling the controller's new events."""
+    cc.follower.ingest(name, _handles.get(name) or {})
+    return (_eventlog.read_events(name, offset=0, limit=500) or {}).get("events") or []
+
+
 def _deliveries():
     """Run follower passes until the controller has no undelivered completions."""
     for _ in range(50):
@@ -458,7 +464,7 @@ def test_concurrent_cross_backend_admission_admits_exactly_one(codex_env, monkey
         claim = guard.current(str(repo), cc.claims_dir())
         assert claim["backend"] == "cursor" and claim["session"] == "Cursor racer"
         # Cursor's reservation is released by the job on terminal; released here by the stubbed path.
-        plugin._release_worktree(str(repo), "Cursor racer")
+        plugin._release_worktree(str(repo), "Cursor racer", claim["owner"])
     else:
         assert results["cursor"]["status"] == "rejected" and "codex writer" in results["cursor"]["reason"]
         assert dispatched == []
@@ -532,23 +538,165 @@ def test_lost_turn_start_reply_is_ambiguous_and_adopted_not_duplicated(codex_env
     assert not _controller_state(name).get("pending_intent")
 
 
-def test_lost_reply_with_no_turn_requires_explicit_stop(codex_env, monkeypatch):
+def test_lost_reply_with_no_turn_releases_only_after_proven_quiescence(codex_env, monkeypatch, tmp_path):
     repo = codex_env
     monkeypatch.setenv(cc.TURN_START_TIMEOUT_ENV, "0.5")
     name = "Silent provider"
     cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    # Another session keeps an active turn on the SAME app-server child.
+    other_repo = _git_repo(tmp_path / "other")
+    cb.codex_create_session(title="Busy neighbour", repo=str(other_repo), model="test-model")
+    assert "turn turn_1" in cb.codex_send_message("Busy neighbour", "hang here")
     out = cb.codex_send_message(name, "lostresponse silent")
     assert "AMBIGUOUS" in out
     assert "unresolved dispatch intent" in cb.codex_send_message(name, "again")
     status = cb.codex_status(name)
-    assert "dispatch pending (outcome unknown)" in status and "codex_stop clears it" in status
-    assert guard.current(str(repo), cc.claims_dir())["session"] == cc.session_ref(name)
+    assert "dispatch pending (outcome unknown)" in status and "codex_stop" in status
+    claim_before = guard.current(str(repo), cc.claims_dir())
+    assert claim_before["session"] == cc.session_ref(name)
+    # Stop cannot prove the lost dispatch is idle while the shared child serves another turn:
+    # intent and claim MUST stay; nothing is killed.
     stop = cb.codex_stop(name)
-    assert "cleared the unresolved dispatch intent" in stop
+    assert "could NOT be proven idle" in stop and "other session" in stop
+    assert guard.current(str(repo), cc.claims_dir()) == claim_before
+    assert _controller_state(name)["pending_intent"]
+    assert _controller_state("Busy neighbour")["active_turn_id"] == "turn_1"  # neighbour untouched
+    # Free the neighbour; now the controller can tear down its own child and prove quiescence.
+    assert "status: cancelled" in cb.codex_stop("Busy neighbour")
+    stop = cb.codex_stop(name)
+    assert "cleared the unresolved dispatch intent" in stop and "terminated by the controller" in stop
     assert guard.current(str(repo), cc.claims_dir()) is None
-    assert "turn turn_" in cb.codex_send_message(name, "after clearing")
+    log = _eventlog.read_events(name, offset=0, limit=100)["events"]
+    cleared = [e for e in log if e.get("event") == "intent.cleared"]
+    assert cleared and "terminated" in cleared[0]["proof"]
+    assert "turn turn_" in cb.codex_send_message(name, "after clearing")  # fresh child, fresh turn
     assert _wait(_settled(name))
     _deliveries()
+
+
+def test_app_server_death_before_turn_start_reply_is_ambiguous(codex_env, monkeypatch):
+    """A pipe closed mid-request is a synthesized transport error, not a provider
+    rejection: intent + claim stay until the dead child proves quiescence."""
+    repo = codex_env
+    name = "Died on start"
+    cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    out = cb.codex_send_message(name, "dieonstart")
+    assert "AMBIGUOUS" in out and "app-server" in out
+    assert guard.current(str(repo), cc.claims_dir())["session"] == cc.session_ref(name)
+    assert _controller_state(name)["pending_intent"]["ambiguous"] is True
+    log = _gw_log(name)
+    assert any(e.get("event") == "dispatch.ambiguous" for e in log)
+    assert not any(e.get("event") == "dispatch.failed" for e in log)
+    stop = cb.codex_stop(name)
+    assert "cleared the unresolved dispatch intent" in stop and "not running" in stop
+    assert guard.current(str(repo), cc.claims_dir()) is None
+
+
+def test_definitive_provider_rejections_release_intent_and_claim(codex_env, monkeypatch):
+    repo = codex_env
+    monkeypatch.setenv("FAKE_CODEX_STRICT_RESUME", "1")
+    monkeypatch.setattr(cc, "_plugin_config", lambda key: ["FAKE_CODEX_STRICT_RESUME"] if key == "codex_env_allow" else None)
+    name = "Rejected"
+    cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    # turn/start answered with a JSON-RPC error: definitive.
+    out = cb.codex_send_message(name, "rejectturn please")
+    assert "codex dispatch failed" in out and "turn rejected by provider" in out
+    assert guard.current(str(repo), cc.claims_dir()) is None
+    state = _controller_state(name)
+    assert not state.get("pending_intent") and not state.get("active_turn_id")
+    log = _gw_log(name)
+    assert any(e.get("event") == "dispatch.failed" and "rejected" in e.get("error", "") for e in log)
+    # thread/resume of a thread the provider no longer knows: definitive, no turn sent.
+    state_path = cc.state_dir() / "sessions" / (cc.session_ref(name).replace(" ", "_").replace(":", "_") + ".json")
+    st = json.loads(state_path.read_text())
+    st["thread_id"] = "thr_missing"
+    state_path.write_text(json.dumps(st))
+    out = cb.codex_send_message(name, "resume me")
+    assert "thread/resume failed for thr_missing" in out
+    assert guard.current(str(repo), cc.claims_dir()) is None
+    assert not _controller_state(name).get("pending_intent")
+    # The session stays usable once the recorded thread is dropped.
+    st = json.loads(state_path.read_text())
+    st.pop("thread_id")
+    state_path.write_text(json.dumps(st))
+    assert "on thread thr_2 (new thread)" in cb.codex_send_message(name, "fresh")
+    assert _wait(_settled(name))
+    _deliveries()
+
+
+def test_steer_after_turn_finished_never_starts_a_new_turn(codex_env, monkeypatch):
+    repo = codex_env
+    name = "Stale steer"
+    cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    assert "turn turn_1" in cb.codex_send_message(name, "quick one")
+    # Make the send observe an ACTIVE turn while the controller has already finished it.
+    real_request = cc.request
+
+    def stale_status(op, timeout=90.0, **fields):
+        resp = real_request(op, timeout=timeout, **fields)
+        if op == "status" and resp.get("ok"):
+            resp["state"] = {**resp["state"], "active_turn_id": "turn_1", "pending_intent": None}
+        return resp
+
+    assert _wait(_settled(name))
+    monkeypatch.setattr(cc, "request", stale_status)
+    out = cb.codex_send_message(name, "follow-up")
+    assert "finished before this message could be appended" in out and "NOT re-sending" in out
+    monkeypatch.setattr(cc, "request", real_request)
+    assert [t["turn_id"] for t in _controller_state(name)["turns"]] == ["turn_1"]
+    _deliveries()
+
+
+def test_same_session_concurrent_sends_admit_one_and_loser_cannot_release(codex_env):
+    import threading
+
+    repo = codex_env
+    name = "Same session race"
+    cb.codex_create_session(title=name, repo=str(repo), model="test-model")
+    assert cc.ensure_controller() in ("detached", "systemd", "running")
+    barrier = threading.Barrier(2)
+    results = [None, None]
+
+    def send(i):
+        barrier.wait()
+        results[i] = cb.codex_send_message(name, "slow same session")
+
+    threads = [threading.Thread(target=send, args=(i,)) for i in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    winners = [r for r in results if "codex turn turn_1" in r]
+    losers = [r for r in results if r not in winners]
+    assert len(winners) == 1 and len(losers) == 1, results
+    assert "already running" in losers[0] or "steered the ACTIVE turn" in losers[0]
+    claim = guard.current(str(repo), cc.claims_dir())
+    assert claim is not None and claim["session"] == cc.session_ref(name)
+    assert claim["owner"] == _controller_state(name)["turns"][0]["intent_id"]
+    # The loser's release attempt (its own intent id) cannot remove the winner's claim.
+    assert guard.release(str(repo), cc.session_ref(name), cc.claims_dir(), "intent-loser") is False
+    assert guard.current(str(repo), cc.claims_dir()) == claim
+    assert [t["turn_id"] for t in _controller_state(name)["turns"]] == ["turn_1"]
+    assert _wait(_settled(name))
+    _deliveries()
+    assert guard.current(str(repo), cc.claims_dir()) is None
+
+
+def test_same_title_cursor_claims_are_profile_scoped(codex_env, monkeypatch, tmp_path):
+    repo = codex_env
+    claims = cc.claims_dir()
+    claim_a, busy = guard.reserve(str(repo), "cursor", "Fix login", claims, "cursor:a:Fix login:1")
+    assert claim_a is not None and busy is None and claim_a["profile"] == cc.profile_id()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home_b"))
+    (tmp_path / "home_b" / "state").mkdir(parents=True)
+    assert cc.profile_id() != claim_a["profile"]
+    owner_b = f"cursor:{cc.profile_id()}:Fix login:2"
+    claim_b, busy = guard.reserve(str(repo), "cursor", "Fix login", claims, owner_b)
+    assert claim_b is None and busy["owner"] == "cursor:a:Fix login:1"  # same title, other profile: refused
+    assert guard.release(str(repo), "Fix login", claims, owner_b) is False  # and cannot release A's claim
+    assert guard.current(str(repo), claims)["owner"] == "cursor:a:Fix login:1"
+    assert guard.release(str(repo), "Fix login", claims, "cursor:a:Fix login:1") is True
+    assert guard.current(str(repo), claims) is None
 
 
 # ---------------------------------------------------------------------------

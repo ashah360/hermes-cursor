@@ -139,7 +139,7 @@ class AppServer:
             waiters = list(self._pending.values())
             self._pending.clear()
         for q in waiters:
-            q.put({"error": {"code": -1, "message": "app-server closed"}})
+            q.put({"_transport": True, "error": {"code": -1, "message": "app-server closed"}})
 
     # -- wire ----------------------------------------------------------------
 
@@ -166,6 +166,10 @@ class AppServer:
             with self._lock:
                 self._pending.pop(rid, None)
             raise ProtocolError(f"codex app-server {method!r} timed out after {timeout:g}s")
+        if msg.get("_transport"):
+            # Synthesized locally when the pipe closed: NOT a provider answer.
+            # Callers must treat it as an ambiguous transport outcome.
+            raise ProtocolError(f"codex app-server {method!r}: {(msg.get('error') or {}).get('message')}")
         if "error" in msg and msg["error"] is not None:
             err = msg["error"] or {}
             raise RpcError(err.get("code"), str(err.get("message") or "unknown error"), err.get("data"))
@@ -210,7 +214,7 @@ class AppServer:
                 waiters = list(self._pending.values())
                 self._pending.clear()
             for q in waiters:
-                q.put({"error": {"code": -1, "message": f"app-server exited (code {code})"}})
+                q.put({"_transport": True, "error": {"code": -1, "message": f"app-server exited (code {code})"}})
             if self._on_exit is not None:
                 try:
                     self._on_exit(code)
