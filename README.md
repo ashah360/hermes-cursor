@@ -171,8 +171,19 @@ Each argument may contain these placeholders:
 | `{session}` | The session title |
 | `{repo}` | The working directory of the run |
 | `{url}` | The session's URL in Cursor's Agents UI |
+| `{user_id}` | The gateway user id of whoever requested the run; empty when there is none |
 
 The command runs as the gateway's user on the gateway host. It inherits the gateway's environment, including `CURSOR_API_KEY`, and is started directly, never through a shell. Hermes Cursor does not wait for it: if the command is missing or fails, a warning is logged and the run continues unaffected.
+
+By default the command runs for every run, whoever asked for it. To limit it to particular people, list their gateway user ids in `on_run_start_users`:
+
+```yaml
+plugins:
+  ghost_cursor:
+    on_run_start_users: ["U123", "local"]
+```
+
+The command then runs only for runs requested by a listed user. A run with no requesting user, such as one started from the local CLI or a scheduled job, matches the entry `local`, so this example covers one Slack user plus local runs. Ids must be strings, so quote numeric ones. If the value is not a list of strings, the command does not run for anyone and a warning is logged.
 
 ## What survives a restart
 
