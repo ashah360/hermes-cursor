@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -795,6 +796,7 @@ class TestDataRootIsolation:
         )
         assert argv[:4] == ["/usr/bin/agent", "worker", "start", "--name"]
         assert "--worker-dir" in argv and "/repo" in argv
+        assert ("--connect-workspace" in argv) == sys.platform.startswith("linux")
         assert "--management-addr" in argv
         assert argv[argv.index("--management-addr") + 1] == "127.0.0.1:42700"
         assert env["CURSOR_DATA_DIR"] == "/state/data/w-name"
