@@ -65,6 +65,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -618,6 +619,8 @@ def _spawn_command(
     if data_dir:
         env["CURSOR_DATA_DIR"] = str(data_dir)
     argv = [cli, "worker", "start", "--name", name, "--worker-dir", str(repo_path)]
+    if sys.platform.startswith("linux"):
+        argv.append("--connect-workspace")
     if management_addr:
         argv += ["--management-addr", str(management_addr)]
     return argv, env
