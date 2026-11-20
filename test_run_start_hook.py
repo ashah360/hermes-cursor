@@ -1,8 +1,11 @@
 """Tests for the optional ``plugins.ghost_cursor.on_run_start`` hook: the
-config read, the argv substitution + launch, and the ``cloud.session``
-call site in ``_run_attempt``. The launcher (``subprocess.Popen``) is
-faked everywhere except the one test that proves the reap path."""
+config read, the argv substitution + launch, the ``on_run_start_users``
+filter with the requesting user captured at dispatch, and the
+``cloud.session`` call site in ``_run_attempt``. The launcher
+(``subprocess.Popen``) is faked everywhere except the one test that proves
+the reap path."""
 
+import contextvars
 import logging
 import sys
 import threading
@@ -16,6 +19,8 @@ from plugins.ghost_cursor import eventlog as gc_eventlog
 from plugins.ghost_cursor import handles as gc_handles
 from plugins.ghost_cursor import jobs as gc_jobs
 from plugins.ghost_cursor import supervisor as gc_supervisor
+
+_UNSET = object()
 
 EXAMPLE = [
     "rex", "window", "new", "-s", "work", "{session}", "--focus=false",
@@ -34,7 +39,7 @@ def clean_state(monkeypatch):
     gc_eventlog._reset_for_tests()
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def raw_config(monkeypatch):
     """The dict ``hermes_cli.config.read_raw_config()`` yields. In a Hermes
     tree only that reader is patched; standalone, where Hermes core is not
@@ -79,13 +84,34 @@ def popen_calls(monkeypatch):
     return calls
 
 
-def _job(name="Fix webhook retries"):
+@pytest.fixture
+def session_user(monkeypatch):
+    """Stand in for ``gateway.session_context``: the returned ContextVar
+    backs ``get_session_env("HERMES_SESSION_USER_ID")``."""
+    var = contextvars.ContextVar("HERMES_SESSION_USER_ID", default="")
+
+    def get_session_env(name, default=""):
+        assert name == "HERMES_SESSION_USER_ID"
+        return var.get() or default
+
+    try:
+        import gateway  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    module = types.ModuleType("gateway.session_context")
+    module.get_session_env = get_session_env
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+    return var
+
+
+def _job(name="Fix webhook retries", user_id=""):
     return gc_jobs.CursorJob(
         job_id="job-1",
         task="do the thing",
         repo="/srv/repo",
         inactivity_timeout_s=600.0,
         session_name=name,
+        user_id=user_id,
         cursor_session_id="bc-123",
         latest_run_id="run-9",
         agents_ui_url="https://cursor.com/agents/bc-123",
@@ -157,15 +183,25 @@ class TestLaunchRunStartHook:
     def test_substitutes_placeholders_per_element(self, monkeypatch, popen_calls):
         monkeypatch.setattr(gc, "_configured_on_run_start", lambda: [
             "open", "{agent_id}", "{run_id}", "{session}", "{repo}", "{url}",
-            "--title={session} ({agent_id}/{run_id})",
+            "{user_id}", "--title={session} ({agent_id}/{run_id})",
         ])
-        gc._launch_run_start_hook(_job(), "/srv/repo")
+        gc._launch_run_start_hook(_job(user_id="U123"), "/srv/repo")
         (argv, _kwargs), = popen_calls
         assert argv == [
             "open", "bc-123", "run-9", "Fix webhook retries", "/srv/repo",
-            "https://cursor.com/agents/bc-123",
+            "https://cursor.com/agents/bc-123", "U123",
             "--title=Fix webhook retries (bc-123/run-9)",
         ]
+
+    def test_user_id_placeholder_is_empty_without_a_requesting_user(
+        self, monkeypatch, popen_calls
+    ):
+        monkeypatch.setattr(
+            gc, "_configured_on_run_start", lambda: ["open", "--user={user_id}"]
+        )
+        gc._launch_run_start_hook(_job(), "/srv/repo")
+        (argv, _kwargs), = popen_calls
+        assert argv == ["open", "--user="]
 
     def test_readme_example(self, monkeypatch, popen_calls):
         monkeypatch.setattr(gc, "_configured_on_run_start", lambda: EXAMPLE)
@@ -254,6 +290,149 @@ class TestLaunchRunStartHook:
         (proc,) = spawned
         assert proc.returncode == 3
         assert "exited with code 3" in caplog.text
+
+
+class TestRunStartUsers:
+    def _fired(self, raw_config, popen_calls, users, user_id):
+        section = {"on_run_start": ["open", "{user_id}"]}
+        if users is not _UNSET:
+            section["on_run_start_users"] = users
+        raw_config["plugins"] = {"ghost_cursor": section}
+        del popen_calls[:]
+        gc._launch_run_start_hook(_job(user_id=user_id), "/srv/repo")
+        return len(popen_calls)
+
+    @pytest.mark.parametrize("users", [_UNSET, None, []])
+    @pytest.mark.parametrize("user_id", ["U123", "U999", ""])
+    def test_unset_or_empty_fires_for_everyone(
+        self, raw_config, popen_calls, caplog, users, user_id
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert self._fired(raw_config, popen_calls, users, user_id) == 1
+        assert caplog.records == []
+
+    def test_set_and_matching_fires(self, raw_config, popen_calls):
+        assert self._fired(raw_config, popen_calls, ["U123"], "U123") == 1
+        assert self._fired(raw_config, popen_calls, ["U999", "U123"], "U123") == 1
+
+    def test_set_and_not_matching_does_not_fire(
+        self, raw_config, popen_calls, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert self._fired(raw_config, popen_calls, ["U123"], "U999") == 0
+            assert self._fired(raw_config, popen_calls, ["U123"], "U12") == 0
+            assert self._fired(raw_config, popen_calls, ["U123"], "u123") == 0
+        assert caplog.records == []
+
+    def test_no_requesting_user_matches_local_and_nothing_else(
+        self, raw_config, popen_calls
+    ):
+        assert self._fired(raw_config, popen_calls, ["local"], "") == 1
+        assert self._fired(raw_config, popen_calls, ["U123", "local"], "") == 1
+        assert self._fired(raw_config, popen_calls, ["U123", "local"], "U123") == 1
+        assert self._fired(raw_config, popen_calls, ["local"], "U123") == 0
+        assert self._fired(raw_config, popen_calls, ["U123"], "") == 0
+        assert self._fired(raw_config, popen_calls, [""], "") == 0
+        assert self._fired(raw_config, popen_calls, ["", "U123"], "") == 0
+
+    @pytest.mark.parametrize("users", [
+        "U123",
+        "local",
+        ["U123", 5],
+        [123456789],
+        ["U123", None],
+        [["U123"]],
+        {"U123": True},
+        "",
+        0,
+        False,
+        True,
+    ])
+    @pytest.mark.parametrize("user_id", ["U123", "U999", ""])
+    def test_malformed_disables_the_hook_with_a_warning(
+        self, raw_config, popen_calls, caplog, users, user_id
+    ):
+        with caplog.at_level(logging.WARNING):
+            assert self._fired(raw_config, popen_calls, users, user_id) == 0
+        (record,) = caplog.records
+        assert record.levelno == logging.WARNING
+        assert "on_run_start_users" in record.getMessage()
+
+    def test_unreadable_users_disables_the_hook_with_a_warning(
+        self, monkeypatch, popen_calls, caplog
+    ):
+        def boom():
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(gc, "_configured_on_run_start", lambda: ["open"])
+        monkeypatch.setattr(
+            sys.modules["hermes_cli.config"], "read_raw_config", boom
+        )
+        with caplog.at_level(logging.WARNING):
+            gc._launch_run_start_hook(_job(user_id="U123"), "/srv/repo")
+        assert popen_calls == []
+        assert "on_run_start_users" in caplog.text
+
+    def test_users_are_not_consulted_when_the_hook_is_off(
+        self, raw_config, popen_calls, caplog
+    ):
+        raw_config["plugins"] = {"ghost_cursor": {"on_run_start_users": "oops"}}
+        with caplog.at_level(logging.WARNING):
+            gc._launch_run_start_hook(_job(user_id="U123"), "/srv/repo")
+        assert popen_calls == []
+        assert caplog.records == []
+
+
+class TestRequestingUser:
+    def test_reads_the_gateway_user_id(self, session_user):
+        assert gc._resolve_session_user_id() == ""
+        session_user.set("U123")
+        assert gc._resolve_session_user_id() == "U123"
+
+    def test_empty_when_the_gateway_context_is_unavailable(
+        self, session_user, monkeypatch
+    ):
+        def boom(name, default=""):
+            raise RuntimeError("no session context")
+
+        session_user.set("U123")
+        monkeypatch.setattr(
+            sys.modules["gateway.session_context"], "get_session_env", boom
+        )
+        assert gc._resolve_session_user_id() == ""
+
+    def test_dispatch_captures_the_user_on_the_calling_thread(
+        self, clean_state, session_user, raw_config, popen_calls, monkeypatch,
+        tmp_path,
+    ):
+        seen = {}
+
+        def runner(job):
+            seen["thread"] = threading.current_thread()
+            gc._run_attempt(job, job.repo)
+            return {"success": True, "session_id": job.cursor_session_id}
+
+        raw_config["plugins"] = {"ghost_cursor": {
+            "on_run_start": ["open", "{user_id}"],
+            "on_run_start_users": ["U123"],
+        }}
+        monkeypatch.setattr(gc, "_execute_cursor_run", runner)
+        monkeypatch.setattr(gc, "_await_handle", lambda job: {})
+        monkeypatch.setattr(gc_cloud, "run_cloud", _sessions("run-1"))
+        session_user.set("U123")
+        gc_jobs.registry._reset_for_tests()
+        try:
+            gc._dispatch_run(
+                "do the thing", str(tmp_path), "Fix webhook retries", None,
+                None, 600.0, 0.0, runtime="cloud",
+            )
+            (job,) = gc_jobs.registry.list_jobs()
+            assert job.done_event.wait(30)
+        finally:
+            gc_jobs.registry._reset_for_tests()
+        assert seen["thread"] is not threading.current_thread()
+        assert job.user_id == "U123"
+        assert [argv for argv, _kwargs in popen_calls] == [["open", "U123"]]
 
 
 class TestRunStartCallSite:

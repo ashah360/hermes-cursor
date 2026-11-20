@@ -505,6 +505,20 @@ def _resolve_session_key() -> str:
         return ""
 
 
+def _resolve_session_user_id() -> str:
+    """Gateway user id of the caller requesting a run (empty = CLI/cron).
+
+    Captured on the dispatching thread like :func:`_resolve_session_key` —
+    the worker thread won't carry the contextvars.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env("HERMES_SESSION_USER_ID") or "")
+    except Exception:
+        return ""
+
+
 def _configured_model() -> Optional[str]:
     """The ``plugins.ghost_cursor.model`` config.yaml value, if set."""
     try:
@@ -582,7 +596,41 @@ def _configured_on_run_start() -> Optional[List[str]]:
     return list(val)
 
 
-_RUN_START_PLACEHOLDER = re.compile(r"\{(agent_id|run_id|session|repo|url)\}")
+def _on_run_start_user_allowed(user_id: str) -> bool:
+    """Whether ``plugins.ghost_cursor.on_run_start_users`` lets the hook
+    fire for a run requested by ``user_id``.
+
+    Unset or an empty list allows every run. A run with no requesting user
+    matches the entry ``local``. An unreadable or malformed value allows
+    no run at all.
+    """
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        val = cfg_get(
+            read_raw_config(), "plugins", "ghost_cursor", "on_run_start_users"
+        )
+    except Exception as exc:
+        logger.warning(
+            "ghost_cursor: plugins.ghost_cursor.on_run_start_users could not "
+            "be read (%s: %s) — run-start hook disabled",
+            type(exc).__name__, exc,
+        )
+        return False
+    if val is None or val == []:
+        return True
+    if not isinstance(val, list) or not all(isinstance(u, str) for u in val):
+        logger.warning(
+            "ghost_cursor: plugins.ghost_cursor.on_run_start_users must be a "
+            "list of strings (quote numeric ids) — run-start hook disabled"
+        )
+        return False
+    return (user_id or "local") in val
+
+
+_RUN_START_PLACEHOLDER = re.compile(
+    r"\{(agent_id|run_id|session|repo|url|user_id)\}"
+)
 
 
 def _launch_run_start_hook(job: "_jobs.CursorJob", workdir: str) -> None:
@@ -590,7 +638,7 @@ def _launch_run_start_hook(job: "_jobs.CursorJob", workdir: str) -> None:
     just started. Never waits on the command and never raises."""
     try:
         template = _configured_on_run_start()
-        if not template:
+        if not template or not _on_run_start_user_allowed(job.user_id):
             return
         values = {
             "agent_id": job.cursor_session_id,
@@ -598,6 +646,7 @@ def _launch_run_start_hook(job: "_jobs.CursorJob", workdir: str) -> None:
             "session": job.session_name or job.cursor_session_id,
             "repo": str(workdir),
             "url": job.agents_ui_url,
+            "user_id": job.user_id,
         }
         argv = [
             _RUN_START_PLACEHOLDER.sub(lambda match: values[match.group(1)], arg)
@@ -1220,6 +1269,7 @@ def _dispatch_run(
         max_wall_s=float(max_wall_s),
         session_name=session_name,
         session_key=_resolve_session_key(),
+        user_id=_resolve_session_user_id(),
         requested_session_id=(str(session_id).strip() or None) if session_id else None,
         requested_model=model,
         runtime=runtime,
