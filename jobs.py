@@ -144,6 +144,7 @@ class CursorJob:
     # Empty only for direct registry use in tests.
     session_name: str = ""
     session_key: str = ""
+    user_id: str = ""
     requested_session_id: Optional[str] = None
     requested_model: Optional[str] = None
     deliver: bool = False             # armed by the dispatching tool (see module doc)
@@ -452,6 +453,7 @@ class CursorJobRegistry:
         max_wall_s: float = 0.0,
         session_name: str = "",
         session_key: str = "",
+        user_id: str = "",
         requested_session_id: Optional[str] = None,
         requested_model: Optional[str] = None,
         runtime: str = "local",
@@ -472,6 +474,7 @@ class CursorJobRegistry:
             max_wall_s=max_wall_s,
             session_name=session_name or "",
             session_key=session_key or "",
+            user_id=user_id or "",
             requested_session_id=requested_session_id,
             requested_model=requested_model,
             runtime=runtime or "local",
