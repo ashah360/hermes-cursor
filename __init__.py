@@ -87,6 +87,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -558,6 +561,75 @@ def _resolve_max_wall(explicit: Optional[float]) -> float:
     return configured if configured is not None else _cloud.DEFAULT_MAX_WALL_S
 
 
+def _configured_on_run_start() -> Optional[List[str]]:
+    """The ``plugins.ghost_cursor.on_run_start`` config.yaml argv, if set."""
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        val = cfg_get(
+            read_raw_config(), "plugins", "ghost_cursor", "on_run_start"
+        )
+    except Exception:
+        return None
+    if not val:
+        return None
+    if not isinstance(val, list) or not all(isinstance(arg, str) for arg in val):
+        logger.warning(
+            "ghost_cursor: plugins.ghost_cursor.on_run_start must be a list "
+            "of strings — run-start hook disabled"
+        )
+        return None
+    return list(val)
+
+
+_RUN_START_PLACEHOLDER = re.compile(r"\{(agent_id|run_id|session|repo|url)\}")
+
+
+def _launch_run_start_hook(job: "_jobs.CursorJob", workdir: str) -> None:
+    """Launch the configured ``on_run_start`` command for the run ``job``
+    just started. Never waits on the command and never raises."""
+    try:
+        template = _configured_on_run_start()
+        if not template:
+            return
+        values = {
+            "agent_id": job.cursor_session_id,
+            "run_id": job.latest_run_id,
+            "session": job.session_name or job.cursor_session_id,
+            "repo": str(workdir),
+            "url": job.agents_ui_url,
+        }
+        argv = [
+            _RUN_START_PLACEHOLDER.sub(lambda match: values[match.group(1)], arg)
+            for arg in template
+        ]
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=_workers._spawn_env(),
+        )
+
+        def _reap() -> None:
+            code = proc.wait()
+            if code != 0:
+                logger.warning(
+                    "ghost_cursor: on_run_start command %r exited with code %s",
+                    argv[0], code,
+                )
+
+        threading.Thread(
+            target=_reap, name="ghost-cursor-on-run-start", daemon=True
+        ).start()
+    except Exception as exc:
+        logger.warning(
+            "ghost_cursor: on_run_start hook failed (%s: %s)",
+            type(exc).__name__, exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Session-handle resolution (name-or-UUID → canonical name)
 # ---------------------------------------------------------------------------
@@ -899,7 +971,9 @@ def _run_attempt(
             job.last_event_at = time.time()
             if key == "cloud.session":
                 sid = str(obj.get("agentId") or "")
+                run_id = str(obj.get("run_id") or "")
                 with job._lock:
+                    run_started = bool(run_id) and run_id != job.latest_run_id
                     job.cursor_session_id = sid
                     job.resumed = bool(obj.get("resumed"))
                     job.model = str(obj.get("model") or "")
@@ -909,9 +983,7 @@ def _run_attempt(
                     # a retry attempt on the same job overwrites it; a
                     # LATER run in the session never can (immutable per
                     # job, unlike the handle's latest_run_id).
-                    job.latest_run_id = (
-                        str(obj.get("run_id") or "") or job.latest_run_id
-                    )
+                    job.latest_run_id = run_id or job.latest_run_id
                 # Supervision phase: the agent exists and events flow
                 # (RFC §1 — the durable record a reconciler re-attaches to).
                 _supervisor.mark_streaming(job.session_name or sid)
@@ -936,9 +1008,11 @@ def _run_attempt(
                     agents_ui_url=str(obj.get("agents_ui_url") or "") or None,
                     repo_url=str(obj.get("repo_url") or "") or None,
                     starting_ref=str(obj.get("starting_ref") or "") or None,
-                    latest_run_id=str(obj.get("run_id") or "") or None,
+                    latest_run_id=run_id or None,
                 )
                 job.session_event.set()
+                if run_started:
+                    _launch_run_start_hook(job, workdir)
             elif key == "cloud.error" and obj.get("run_status") == "error":
                 state["terminal_error"] = True
                 state["retryable"] = obj.get("retryable")
