@@ -43,7 +43,8 @@ jobs:
           cp ghost_cursor/test_rest_client.py hermes-agent/tests/plugins/test_ghost_cursor_rest_client.py
           # conftest MUST keep the name `conftest.py` or pytest won't auto-load its fixtures
           cp ghost_cursor/conftest.py hermes-agent/tests/plugins/conftest.py
-          cp -r ghost_cursor/fixtures hermes-agent/tests/plugins/fixtures 2>/dev/null || true
+          mkdir -p hermes-agent/tests/plugins/fixtures
+          cp -r ghost_cursor/fixtures/. hermes-agent/tests/plugins/fixtures/
           # drop the stray copies the *.py glob pulled into the plugin dir
           rm -f hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py \
                 hermes-agent/plugins/ghost_cursor/test_workers.py \
